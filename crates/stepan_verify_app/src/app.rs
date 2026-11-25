@@ -1008,11 +1008,11 @@ fn update_card(p: &Palette, theme: &gpui_kit::component::Theme, cx: &mut Context
     use crate::update::{self, State};
     let (title, sub, action): (String, String, Option<&'static str>) = match update::state(cx) {
         State::Available(r) => (
-            format!("Доступен Stepan {}", r.version),
-            format!("у тебя {}", update::VERSION),
+            format!("Stepan {}", r.version),
+            format!("обновление · у тебя {}", update::VERSION),
             Some(if update::running_bundle().is_some() && r.zip.is_some() { "Обновить" } else { "Скачать" }),
         ),
-        State::Installing(r) => (format!("Ставлю Stepan {}…", r.version), "перезапущусь сам".into(), None),
+        State::Installing(r) => (format!("Stepan {}", r.version), "ставлю, перезапущусь сам".into(), None),
         _ => return None,
     };
     Some(

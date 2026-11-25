@@ -95,7 +95,12 @@ pub fn check(cx: &mut App) {
                 Ok(_) => State::UpToDate,
                 Err(err) => State::Failed(format!("{err:#}")),
             };
+            let available = matches!(next, State::Available(_));
             set(next, cx);
+            // Debug hook: STEPAN_VERIFY_UPDATE_NOW=1 presses «Обновить» itself.
+            if available && std::env::var_os("STEPAN_VERIFY_UPDATE_NOW").is_some() {
+                install(cx);
+            }
         });
     })
     .detach();

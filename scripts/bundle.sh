@@ -14,13 +14,14 @@ cd "$(dirname "$0")/.."
 
 TARGET="${1:-}"
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+OUT="${CARGO_TARGET_DIR:-target}"
 if [ -n "$TARGET" ]; then
   cargo build --release -p stepan_verify_app --target "$TARGET"
-  BIN="target/$TARGET/release/stepan_verify"
+  BIN="$OUT/$TARGET/release/stepan_verify"
   case "$TARGET" in aarch64*) ARCH=arm64 ;; *) ARCH=x86_64 ;; esac
 else
   cargo build --release -p stepan_verify_app
-  BIN="target/release/stepan_verify"
+  BIN="$OUT/release/stepan_verify"
   case "$(uname -m)" in arm64) ARCH=arm64 ;; *) ARCH=x86_64 ;; esac
 fi
 
