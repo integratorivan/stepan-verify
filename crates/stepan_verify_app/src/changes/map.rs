@@ -321,6 +321,8 @@ pub struct Graph {
     pub notes: HashMap<(usize, usize), String>,
     /// Frames: every node belongs to exactly one.
     pub groups: Vec<MapGroup>,
+    /// Node keys left off the canvas («Только новое» hides what you reviewed).
+    pub hidden: HashSet<String>,
 }
 
 pub fn normalize(s: &str) -> String {
@@ -538,7 +540,7 @@ pub fn build(code: &CodeChanges, removed_edges: &[EdgeRef], dtos: &[Dto], featur
         }
     }
     let groups = group_nodes(&mut nodes, &keys, features);
-    Graph { nodes, edges, dtos: map_dtos, notes, groups }
+    Graph { nodes, edges, dtos: map_dtos, notes, groups, hidden: HashSet::new() }
 }
 
 /// Put every node into one frame: the report's features first (in order,
@@ -612,7 +614,7 @@ fn group_nodes(nodes: &mut [MapNode], keys: &HashMap<String, usize>, features: &
 impl Graph {
     pub fn node_visible(&self, i: usize, mode: Mode) -> bool {
         let n = &self.nodes[i];
-        let real = status_visible(n.status, mode);
+        let real = status_visible(n.status, mode) && !self.hidden.contains(&n.key);
         // A made-up node shows only where something links to it.
         real && (!n.implicit || self.edges.iter().any(|e| (e.from == i || e.to == i) && self.edge_visible(e, mode)))
     }
