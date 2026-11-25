@@ -5,6 +5,7 @@ mod board;
 mod dashboard;
 mod distill;
 mod docs;
+mod flows;
 mod format;
 mod icons;
 mod live_card;

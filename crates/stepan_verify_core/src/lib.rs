@@ -6,6 +6,7 @@ pub mod cli;
 pub mod config;
 pub mod docs;
 pub mod events;
+pub mod flows;
 pub mod home;
 pub mod sessions;
 pub mod skills;

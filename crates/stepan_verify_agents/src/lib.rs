@@ -138,12 +138,21 @@ pub(crate) fn docs_dir() -> PathBuf {
     stepan_verify_home().join("docs")
 }
 
-/// `STEPAN_VERIFY_DOCS` for the agent process unless the spec sets its own.
+/// `STEPAN_VERIFY_DOCS` for the agent process unless the spec sets its own, and
+/// `STEPAN_VERIFY_FLOWS` — the project's user-flow map, the shared product
+/// vocabulary — when the project has one.
 pub(crate) fn docs_env(cmd: &mut std::process::Command, spec: &SessionSpec) {
     if !spec.env.iter().any(|(k, _)| k == "STEPAN_VERIFY_DOCS") {
         cmd.env("STEPAN_VERIFY_DOCS", docs_dir());
     }
+    let flows = spec.cwd.join(FLOWS_FILE);
+    if flows.is_file() && !spec.env.iter().any(|(k, _)| k == "STEPAN_VERIFY_FLOWS") {
+        cmd.env("STEPAN_VERIFY_FLOWS", flows);
+    }
 }
+
+/// The project's flow map, relative to its root (same as `stepan_verify_core::flows::FILE`).
+pub const FLOWS_FILE: &str = ".stepan_verify/flows.yaml";
 
 /// Sessions working on a board task (`STEPAN_VERIFY_TASK` in their env) may run
 /// `stepan_verify task …` without asking and write the board in the stepan_verify home.

@@ -28,6 +28,7 @@ use crate::{
 pub enum Page {
     Dashboard,
     Tasks,
+    Flows,
     Docs,
     Skills,
     Settings,
@@ -53,6 +54,10 @@ pub struct Launch {
     preview: Option<PathBuf>,
     /// `--doc <rel>`: open «Документы» on this document (path inside docs/).
     doc: Option<String>,
+    /// `--project <dir>`: the project «Флоу» opens on.
+    project: Option<PathBuf>,
+    /// `--build-flows`: start the flow-map agent for that project right away.
+    build_flows: bool,
 }
 
 impl Launch {
@@ -74,6 +79,8 @@ impl Launch {
                 "--changes" => launch.changes = true,
                 "--autopilot" => launch.autopilot = true,
                 "--preview" => launch.preview = args.next().map(|p| std::fs::canonicalize(&p).unwrap_or_else(|_| p.into())),
+                "--build-flows" => launch.build_flows = true,
+                "--project" => launch.project = args.next().map(|p| std::fs::canonicalize(&p).unwrap_or_else(|_| p.into())),
                 "--doc" => {
                     launch.doc = args.next();
                     launch.page = Some(Page::Docs);
@@ -81,6 +88,7 @@ impl Launch {
                 "--page" => {
                     launch.page = match args.next().as_deref() {
                         Some("tasks") => Some(Page::Tasks),
+                        Some("flows") => Some(Page::Flows),
                         Some("docs") => Some(Page::Docs),
                         Some("skills") => Some(Page::Skills),
                         Some("settings") => Some(Page::Settings),
@@ -131,6 +139,7 @@ pub struct AppView {
     pub autopilot: bool,
     pub skills: Vec<String>,
     docs: Entity<DocsView>,
+    flows: Entity<crate::flows::FlowsView>,
     skills_view: Entity<crate::skills::SkillsView>,
     /// Text and code font pickers on the settings page, made on first visit.
     pub(crate) font_pickers: Option<[Entity<crate::settings_page::FontPicker>; 2]>,
@@ -182,6 +191,18 @@ impl AppView {
             crate::skills::SkillsEvent::OpenFile(path) => this.open_preview(path.clone(), None, window, cx),
         })
         .detach();
+        let flows = cx.new(|cx| crate::flows::FlowsView::new(home.clone(), launch.project.clone(), window, cx));
+        cx.subscribe_in(&flows, window, |this, _, event: &crate::flows::FlowsEvent, window, cx| match event {
+            crate::flows::FlowsEvent::OpenSession(id) => {
+                if let Some(summary) = this.sessions.iter().find(|s| &s.id == id).cloned() {
+                    this.open_session(&summary, window, cx);
+                }
+            }
+        })
+        .detach();
+        if launch.build_flows {
+            flows.update(cx, |f, cx| f.build(cx));
+        }
         cx.set_global(crate::preview::Opener(cx.entity().downgrade()));
         let mut this = Self {
             tasks: BoardTask::load_all(&home.tasks()),
@@ -194,6 +215,7 @@ impl AppView {
             sessions: Vec::new(),
             sessions_loading: true,
             docs,
+            flows,
             font_pickers: None,
             skills_view,
             open_sessions: Vec::new(),
@@ -240,6 +262,7 @@ impl AppView {
                 for picker in this.pickers.iter().filter_map(|p| p.upgrade()) {
                     picker.update(cx, |p, cx| p.set_projects(dirs.clone(), cx));
                 }
+                this.flows.update(cx, |f, cx| f.set_projects(dirs.clone(), cx));
                 this.run_launch_options(window, cx);
                 cx.notify();
             })
@@ -639,7 +662,7 @@ impl AppView {
             .count()
     }
 
-    fn nav_item(&self, label: &'static str, icon: IconName, page: Page, count: Option<(String, bool)>, cx: &mut Context<Self>) -> impl IntoElement {
+    fn nav_item(&self, label: &'static str, icon: impl Into<Icon>, page: Page, count: Option<(String, bool)>, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let p = Palette::of(&theme);
         let active = self.page == page;
@@ -854,6 +877,7 @@ impl AppView {
                     .child(Self::nav_label("Рабочее", None, &p, &theme))
                     .child(self.nav_item("Дашборд", IconName::LayoutDashboard, Page::Dashboard, None, cx))
                     .child(self.nav_item("Задачи", IconName::Inbox, Page::Tasks, tasks_count, cx))
+                    .child(self.nav_item("Флоу", Icon::empty().path("icons/route.svg"), Page::Flows, None, cx))
                     .child(self.nav_item("Документы", IconName::FileText, Page::Docs, (docs > 0).then(|| (docs.to_string(), false)), cx))
                     .child(self.nav_item("Скиллы", IconName::BookOpen, Page::Skills, (skills > 0).then(|| (skills.to_string(), false)), cx))
                     .child(self.nav_item("Настройки", IconName::Settings2, Page::Settings, None, cx)),
@@ -942,6 +966,7 @@ impl Render for AppView {
             Page::Dashboard => dashboard::render(self, window, cx).into_any_element(),
             Page::Tasks => crate::board::render(self, window, cx).into_any_element(),
             Page::Docs => self.docs.clone().into_any_element(),
+            Page::Flows => self.flows.clone().into_any_element(),
             Page::Skills => self.skills_view.clone().into_any_element(),
             Page::Settings => {
                 crate::settings_page::ensure_pickers(self, window, cx);

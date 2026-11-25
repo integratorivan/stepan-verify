@@ -4,7 +4,7 @@
 //! (`~/.stepan_verify/state/changes/<session>/runs/<n>/`), so the map keeps its history:
 //! you can step through iterations and see which decisions the agent took.
 
-mod canvas;
+pub(crate) mod canvas;
 mod map;
 pub mod media;
 mod runs;
@@ -30,7 +30,8 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use stepan_verify_agents::{AgentEvent, AgentHandle, ItemKind, Mode, Provider, SessionSpec};
-use serde::Deserialize;
+use stepan_verify_core::flows::{self as flowmap, FlowMap, FlowProposal, Freshness, Touched};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     format::ago,
@@ -104,6 +105,60 @@ pub struct Report {
     pub features: Vec<Feature>,
     /// Tests and the entries they verify.
     pub tests: Vec<TestRef>,
+    /// The project's user flows this session went through, and changes to the flow map.
+    pub flows: ReportFlows,
+}
+
+/// `flows` of a report: which steps of `.stepan_verify/flows.yaml` the session
+/// touched, and what the reviewer proposes to change in the map.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ReportFlows {
+    pub touched: Vec<Touched>,
+    pub proposal: FlowProposal,
+}
+
+/// How well something is proven, on the ladder «сказано → указана строка →
+/// запущено → воспроизведено» (claimed → pointed → ran → reproduced).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct Evidence {
+    pub level: String,
+    /// What backs it: `file:line`, a command, a test, a screenshot path.
+    #[serde(rename = "ref", alias = "reference")]
+    pub reference: String,
+}
+
+impl Evidence {
+    /// Rank on the ladder: 0 none, 1 claimed … 4 reproduced.
+    pub fn rank(&self) -> u8 {
+        evidence_rank(&self.level)
+    }
+}
+
+pub fn evidence_rank(level: &str) -> u8 {
+    match level.trim().to_lowercase().as_str() {
+        "reproduced" | "воспроизведено" => 4,
+        "ran" | "run" | "запущено" => 3,
+        "pointed" | "line" | "указана строка" => 2,
+        "claimed" | "said" | "сказано" => 1,
+        _ => 0,
+    }
+}
+
+/// What another family's agent found when it tried to prove a risk.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct VerifyResult {
+    /// confirmed | refuted | inconclusive | error
+    pub verdict: String,
+    pub level: String,
+    pub command: String,
+    pub output: String,
+    pub reason: String,
+    /// Who checked: «Codex · GPT-6.2-Sol».
+    pub by: String,
+    pub at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// A group on the canvas: «эти штуки делают функционал X», «эти помогают».
@@ -117,6 +172,8 @@ pub struct Feature {
     pub kind: String,
     /// Entry ids/names in this group.
     pub nodes: Vec<String>,
+    /// What proves the group works.
+    pub evidence: Evidence,
 }
 
 /// A test and what it checks.
@@ -318,6 +375,7 @@ pub struct Risk {
     pub detail: String,
     pub fix: String,
     pub nodes: Vec<String>,
+    pub evidence: Evidence,
 }
 
 #[derive(Deserialize)]
@@ -337,6 +395,7 @@ struct RiskObj {
     fix: String,
     nodes: Vec<String>,
     node: Option<String>,
+    evidence: Evidence,
 }
 
 impl From<RiskRepr> for Risk {
@@ -358,7 +417,7 @@ impl From<RiskRepr> for Risk {
             RiskRepr::Obj(o) => {
                 let mut nodes = o.nodes;
                 nodes.extend(o.node);
-                Risk { id: o.id, severity: o.severity, title: o.title, detail: o.detail, fix: o.fix, nodes }
+                Risk { id: o.id, severity: o.severity, title: o.title, detail: o.detail, fix: o.fix, nodes, evidence: o.evidence }
             }
         }
     }
@@ -370,6 +429,7 @@ pub struct Check {
     pub id: String,
     pub title: String,
     pub how: String,
+    pub evidence: Evidence,
 }
 
 #[derive(Deserialize)]
@@ -383,6 +443,8 @@ enum CheckRepr {
         title: String,
         #[serde(default)]
         how: String,
+        #[serde(default)]
+        evidence: Evidence,
     },
 }
 
@@ -390,7 +452,7 @@ impl From<CheckRepr> for Check {
     fn from(r: CheckRepr) -> Self {
         match r {
             CheckRepr::Text(title) => Check { title, ..Default::default() },
-            CheckRepr::Obj { id, title, how } => Check { id, title, how },
+            CheckRepr::Obj { id, title, how, evidence } => Check { id, title, how, evidence },
         }
     }
 }
@@ -421,6 +483,18 @@ pub enum ChangesEvent {
     Return(String),
     /// «Принять».
     Accept,
+}
+
+/// Another family's agent trying to prove (or refute) one risk.
+struct VerifyJob {
+    run: usize,
+    risk: String,
+    started: Instant,
+    by: String,
+    steps: Vec<String>,
+    out: PathBuf,
+    handle: AgentHandle,
+    _events: Task<()>,
 }
 
 struct Running {
@@ -483,7 +557,17 @@ pub struct ChangesView {
     dragged: bool,
     /// Canvas viewport on screen, written while painting.
     viewport: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The project's `.stepan_verify/flows.yaml`, if it has one.
+    flow_map: Option<FlowMap>,
+    /// A step of a touched flow you clicked: its entities light up on the canvas.
+    flow_focus: Option<(String, String)>,
+    /// Risk checks by another agent family, per run number → risk key.
+    verify: std::collections::HashMap<usize, std::collections::HashMap<String, VerifyResult>>,
+    verifying: Option<VerifyJob>,
+    /// Risks waiting for «Проверить все»: (run, risk key).
+    verify_queue: Vec<(usize, String)>,
     _ticker: Task<()>,
+    _verify_ticker: Task<()>,
 }
 
 impl EventEmitter<ChangesEvent> for ChangesView {}
@@ -522,7 +606,13 @@ impl ChangesView {
             touched: false,
             dragged: false,
             viewport: Rc::new(Cell::new(None)),
+            flow_map: None,
+            flow_focus: None,
+            verify: Default::default(),
+            verifying: None,
+            verify_queue: Vec::new(),
             _ticker: Task::ready(()),
+            _verify_ticker: Task::ready(()),
         };
         media::observe(cx);
         this.reload(None);
@@ -535,6 +625,14 @@ impl ChangesView {
                 Ok("batch") => this.launch(RunKind::Batch, cx),
                 _ => {}
             }
+            // Debug hook: STEPAN_VERIFY_VERIFY_RISKS=all checks every risk of the shown run.
+            if std::env::var("STEPAN_VERIFY_VERIFY_RISKS").as_deref() == Ok("all") {
+                if let Some((n, keys)) = this.selected.and_then(|i| this.runs.get(i)).and_then(|r| Some((r.n, r.ok()?.risks.iter().enumerate().map(|(i, x)| risk_key(i, x)).collect::<Vec<_>>()))) {
+                    for k in keys {
+                        this.verify_risk(n, k, cx);
+                    }
+                }
+            }
         }
         this
     }
@@ -542,6 +640,11 @@ impl ChangesView {
     /// Reread runs from disk; select `select` (a run number) or the newest good one.
     fn reload(&mut self, select: Option<usize>) {
         self.runs = runs::load_all(&self.out);
+        self.flow_map = FlowMap::load(&self.input.cwd).ok().flatten();
+        for run in &self.runs {
+            let checks = fs::read_to_string(run.dir.join("verify.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+            self.verify.insert(run.n, checks);
+        }
         for run in &self.runs {
             if !self.git_patches.contains_key(&run.n) {
                 if let Ok(text) = fs::read_to_string(run.dir.join("git.patch")) {
@@ -627,11 +730,17 @@ impl ChangesView {
             edits: 0,
             reviewer: reviewer.clone(),
             error: None,
+            cwd: Some(self.input.cwd.clone()),
         };
         let written = match (kind, &base) {
             (RunKind::Batch, Some((_, base_dir, base_meta))) => self.write_batch_context(&dir, base_dir, base_meta),
             _ => self.write_full_context(&dir),
         };
+        // The flow map as it is now: the reviewer reads it and proposes changes.
+        let flows_file = flowmap::path(&self.input.cwd);
+        if flows_file.exists() {
+            let _ = fs::copy(&flows_file, dir.join("flows.yaml"));
+        }
         match written {
             Ok(edits) => meta.edits = edits,
             Err(err) => meta.error = Some(format!("Не удалось подготовить контекст: {err:#}")),
@@ -868,6 +977,23 @@ impl ChangesView {
         cx.notify();
     }
 
+    /// World width the frames pack into: the canvas at 100%.
+    fn layout_target(&self) -> f32 {
+        layout_width(self.viewport.get().map_or(1200., |b| f32::from(b.size.width)))
+    }
+
+    /// Back to the readable start: 100% on the main feature.
+    fn readable(&mut self, g: &Graph, cx: &mut Context<Self>) {
+        if let Some(b) = self.viewport.get() {
+            let size = (f32::from(b.size.width), f32::from(b.size.height));
+            let c = map::canvas_layout(g, self.mode, layout_width(size.0));
+            self.view = canvas::View::readable((c.width, c.height), map::main_frame(g, &c).map(|f| (f.x, f.y)), size);
+            self.fit_size = size;
+            self.touched = false;
+            cx.notify();
+        }
+    }
+
     fn fit(&mut self, world: (f32, f32), cx: &mut Context<Self>) {
         if let Some(b) = self.viewport.get() {
             self.fit_size = (f32::from(b.size.width), f32::from(b.size.height));
@@ -875,6 +1001,182 @@ impl ChangesView {
             self.touched = false;
             cx.notify();
         }
+    }
+
+    // -------------------------------------------------------------- flows
+
+    /// Steps of the project's flows this session went through: what the
+    /// reviewer said, plus what the diff and the map's entities show.
+    fn touched(&self, g: &Graph, r: &Report) -> Vec<Touched> {
+        let det = match &self.flow_map {
+            Some(map) => {
+                let files: Vec<String> = self.patches().into_iter().map(|(f, _)| f).collect();
+                let entities: Vec<String> = g
+                    .nodes
+                    .iter()
+                    .filter(|n| !n.implicit && n.status != NodeStatus::Context)
+                    .flat_map(|n| [n.name.clone(), n.entity.clone()])
+                    .filter(|s| !s.trim().is_empty())
+                    .collect();
+                map.touched(&files, &entities)
+            }
+            None => Vec::new(),
+        };
+        let known = |t: &Touched| {
+            self.flow_map.as_ref().is_some_and(|m| m.feature(&t.feature).is_some()) || r.flows.proposal.upsert.iter().any(|f| f.id == t.feature)
+        };
+        merge_touched(&r.flows.touched, &det).into_iter().filter(known).collect()
+    }
+
+    /// A feature by id: the map first, else a proposed one.
+    fn flow_feature<'a>(&'a self, r: &'a Report, id: &str) -> Option<&'a flowmap::Feature> {
+        self.flow_map.as_ref().and_then(|m| m.feature(id)).or_else(|| r.flows.proposal.upsert.iter().find(|f| f.id == id))
+    }
+
+    /// Id of the selected run's proposal for accept / reject bookkeeping.
+    fn proposal_id(&self) -> Option<String> {
+        self.selected.and_then(|i| self.runs.get(i)).map(|run| format!("{}#{}", self.input.key, run.n))
+    }
+
+    fn decide_proposal(&mut self, accept: bool, cx: &mut Context<Self>) {
+        let (Some(id), Some(r)) = (self.proposal_id(), self.report().cloned()) else { return };
+        let home = stepan_verify_core::Home::locate();
+        let cwd = self.input.cwd.clone();
+        if accept {
+            let mut map = self.flow_map.clone().unwrap_or_else(|| FlowMap {
+                version: 1,
+                project: cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                ..Default::default()
+            });
+            map.apply(&r.flows.proposal);
+            if let Err(err) = map.save(&cwd) {
+                eprintln!("stepan_verify: flows: save: {err:#}");
+                return;
+            }
+            self.flow_map = Some(map);
+        }
+        let mut decisions = flowmap::Decisions::load(&home, &cwd);
+        if accept {
+            decisions.accepted.insert(id);
+        } else {
+            decisions.rejected.insert(id);
+        }
+        let _ = decisions.save(&home, &cwd);
+        cx.notify();
+    }
+
+    // -------------------------------------------------------------- verify
+
+    /// Ask an agent of the other family to prove or refute a risk by running something.
+    fn verify_risk(&mut self, run_n: usize, key: String, cx: &mut Context<Self>) {
+        if self.verifying.is_some() {
+            if !self.verify_queue.contains(&(run_n, key.clone())) {
+                self.verify_queue.push((run_n, key));
+            }
+            cx.notify();
+            return;
+        }
+        let Some(run) = self.runs.iter().find(|r| r.n == run_n) else { return };
+        let Some(report) = run.ok() else { return };
+        let Some((i, risk)) = report.risks.iter().enumerate().find(|(i, r)| risk_key(*i, r) == key) else { return };
+        let other = other_family(self.input.provider);
+        let config = crate::settings::config(cx).changes.clone();
+        let model = match other {
+            Provider::Claude => Some(config.model.clone()),
+            Provider::Codex => Some(config.codex_model.clone()).filter(|m| !m.is_empty()),
+        };
+        let by = reviewer_name(other, model.as_deref());
+        let vdir = run.dir.join("verify");
+        let _ = fs::create_dir_all(&vdir);
+        let out = vdir.join(format!("{}.json", sanitize(&key)));
+        let _ = fs::remove_file(&out);
+        let prompt = prompt_verify(&run.dir, &out, i, risk, self.input.provider);
+        let spec = SessionSpec {
+            provider: other,
+            native_id: None,
+            transcript: None,
+            cwd: self.input.cwd.clone(),
+            mode: Mode::FullAccess,
+            image_cache: Some(stepan_verify_core::Home::locate().state().join("images")),
+            env: vec![("STEPAN_VERIFY_VERIFY_OUT".into(), out.display().to_string())],
+            model,
+            instructions: None,
+        };
+        let (handle, events) = stepan_verify_agents::open(spec);
+        handle.send(prompt);
+        let pump = cx.spawn(async move |this, cx| {
+            while let Ok(event) = events.recv().await {
+                let done = matches!(event, AgentEvent::TurnCompleted { .. } | AgentEvent::Exited);
+                let alive = this.update(cx, |this, cx| {
+                    this.on_verify_event(event, cx);
+                    cx.notify();
+                });
+                if alive.is_err() || done {
+                    break;
+                }
+            }
+        });
+        self.verifying = Some(VerifyJob { run: run_n, risk: key, started: Instant::now(), by, steps: Vec::new(), out, handle, _events: pump });
+        self._verify_ticker = cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let going = this.update(cx, |this, cx| {
+                cx.notify();
+                this.verifying.is_some()
+            });
+            if !matches!(going, Ok(true)) {
+                break;
+            }
+        });
+        cx.notify();
+    }
+
+    fn on_verify_event(&mut self, event: AgentEvent, cx: &mut Context<Self>) {
+        let Some(job) = &mut self.verifying else { return };
+        match event {
+            AgentEvent::Upsert(item) if item.kind == ItemKind::Tool && !item.title.is_empty() => {
+                let step = humanize_step(&item.title, job.out.parent().unwrap_or(&job.out));
+                if job.steps.last() != Some(&step) {
+                    job.steps.push(step);
+                }
+            }
+            AgentEvent::TurnCompleted { error } => self.finish_verify(error, cx),
+            AgentEvent::Exited => self.finish_verify(Some("Проверяющий завершился".into()), cx),
+            AgentEvent::Error(err) => self.finish_verify(Some(err), cx),
+            _ => {}
+        }
+    }
+
+    fn finish_verify(&mut self, error: Option<String>, cx: &mut Context<Self>) {
+        let Some(job) = self.verifying.take() else { return };
+        let mut result = fs::read_to_string(&job.out)
+            .ok()
+            .and_then(|t| serde_json::from_str::<VerifyResult>(&t).ok())
+            .unwrap_or_else(|| VerifyResult {
+                verdict: "error".into(),
+                reason: error.unwrap_or_else(|| "Проверяющий не записал результат".into()),
+                ..Default::default()
+            });
+        result.verdict = result.verdict.trim().to_lowercase();
+        result.by = job.by.clone();
+        result.at = Some(chrono::Utc::now());
+        let checks = self.verify.entry(job.run).or_default();
+        checks.insert(job.risk.clone(), result);
+        if let Some(run) = self.runs.iter().find(|r| r.n == job.run) {
+            let _ = fs::write(run.dir.join("verify.json"), serde_json::to_string_pretty(checks).unwrap_or_default());
+        }
+        if !self.verify_queue.is_empty() {
+            let (run, key) = self.verify_queue.remove(0);
+            self.verify_risk(run, key, cx);
+        }
+        cx.notify();
+    }
+
+    fn cancel_verify(&mut self, cx: &mut Context<Self>) {
+        self.verify_queue.clear();
+        if let Some(job) = &self.verifying {
+            job.handle.interrupt();
+        }
+        self.finish_verify(Some("Проверка остановлена".into()), cx);
     }
 
     fn remark_text(&self, graph: &Graph, note: &str) -> String {
@@ -902,6 +1204,73 @@ impl ChangesView {
     }
 }
 
+/// Union of touched steps by (feature, path), first-seen order kept.
+pub fn merge_touched(a: &[Touched], b: &[Touched]) -> Vec<Touched> {
+    let mut out: Vec<Touched> = Vec::new();
+    for t in a.iter().chain(b) {
+        if t.feature.trim().is_empty() {
+            continue;
+        }
+        match out.iter_mut().find(|x| x.feature == t.feature && x.path == t.path) {
+            Some(x) => {
+                for s in &t.steps {
+                    if !x.steps.contains(s) {
+                        x.steps.push(s.clone());
+                    }
+                }
+            }
+            None => out.push(t.clone()),
+        }
+    }
+    out
+}
+
+/// Stable key of a risk in a run: its id, else its position.
+pub fn risk_key(i: usize, r: &Risk) -> String {
+    if r.id.trim().is_empty() { format!("r{}", i + 1) } else { r.id.trim().to_owned() }
+}
+
+fn sanitize(s: &str) -> String {
+    s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
+}
+
+/// Claude sessions are double-checked by Codex and the other way round.
+pub fn other_family(p: Provider) -> Provider {
+    match p {
+        Provider::Claude => Provider::Codex,
+        Provider::Codex => Provider::Claude,
+    }
+}
+
+fn prompt_verify(run: &Path, out: &Path, i: usize, risk: &Risk, author: Provider) -> String {
+    let nodes = if risk.nodes.is_empty() { String::new() } else { format!("\nЗатронутые узлы: {}", risk.nodes.join(", ")) };
+    format!(
+        "[stepan_verify verify] Ты — независимый проверяющий. Ревьюер-агент ({author}) нашёл риск в изменениях сессии. Твоя задача — подтвердить или опровергнуть его ЗАПУСКОМ, а не рассуждением.\n\n\
+         Риск #{n}: {title}\nКогда и почему: {detail}\nКак поправить (по мнению ревьюера): {fix}{nodes}\n\n\
+         Контекст сессии: {run}/context.md, диффы: {run}/git.patch и {run}/session.patch, отчёт ревьюера: {run}/report.json. Текущая папка — проект.\n\n\
+         Как: найди самую дешёвую команду, которая показывает, есть проблема или нет (тест, скрипт, `node -e`, curl к локальному серверу, сборка, типизация), запусти её и посмотри вывод. \
+         Если для эксперимента нужно менять код — сделай `git worktree add` во временной папке и удали его после; рабочее дерево проекта не трогай. Ничего не коммить, не пушить. \
+         Останови всё, что запустил. Уложись примерно в 5 минут.\n\n\
+         Запиши результат в {out} — JSON: {{\"verdict\": \"confirmed|refuted|inconclusive\", \"level\": \"reproduced|ran|pointed|claimed\", \"command\": \"что запускал\", \"output\": \"ключевые строки вывода, до 40\", \"reason\": \"одна-две фразы по-русски: почему такой вердикт\"}}. \
+         confirmed — только если запуск показал проблему; refuted — если запуск показал, что её нет; иначе inconclusive (и честно напиши, чего не хватило). Когда записал — ответь одним словом: готово.",
+        author = match author {
+            Provider::Claude => "Claude",
+            Provider::Codex => "Codex",
+        },
+        n = i + 1,
+        title = risk.title,
+        detail = if risk.detail.is_empty() { "—" } else { &risk.detail },
+        fix = if risk.fix.is_empty() { "—" } else { &risk.fix },
+        run = run.display(),
+        out = out.display(),
+    )
+}
+
+/// Frames pack into rows as wide as the canvas at 100%, minus its margins.
+fn layout_width(viewport_w: f32) -> f32 {
+    (viewport_w - canvas::FIT_MARGIN * 2.).max(560.)
+}
+
 /// The pr-before-after skill, wherever it is installed: the shared stepan_verify folder
 /// first, then Claude's and the generic agents' skill folders.
 fn find_skill() -> Option<PathBuf> {
@@ -925,13 +1294,29 @@ const SCHEMA: &str = "{\"title\": \"заголовок изменений\", \"s
  \"dtos\": [{\"id\": \"joker_props\", \"name\": \"JokerPickDialogProps\", \"kind\": \"props|args|response|request|event|state|type\", \"file\": \"путь\", \
 \"status\": \"added|changed|removed|context\", \"note\": \"что это за данные\", \"fields\": [{\"name\": \"flyToHub\", \"type\": \"boolean?\", \"status\": \"added|changed|removed|context\", \"note\": \"зачем\"}], \
 \"used_by\": [\"id узла\"]}],\n\
- \"features\": [{\"id\": \"f1\", \"title\": \"функционал простыми словами\", \"summary\": \"что он даёт пользователю\", \"kind\": \"feature|helper|infra|tests\", \"nodes\": [\"id\"]}],\n\
+ \"features\": [{\"id\": \"f1\", \"title\": \"функционал простыми словами\", \"summary\": \"что он даёт пользователю\", \"kind\": \"feature|helper|infra|tests\", \"nodes\": [\"id\"], \"evidence\": {\"level\": \"claimed|pointed|ran|reproduced\", \"ref\": \"что доказывает: тест, команда, file:line, скриншот\"}}],\n\
  \"tests\": [{\"id\": \"t1\", \"title\": \"что проверяет\", \"file\": \"путь\", \"verifies\": [\"id узла\"], \"kind\": \"unit|e2e|snapshot|manual\", \"status\": \"added|changed|existing\", \"result\": \"pass|fail|not_run\"}],\n\
  \"removed_edges\": [[\"id откуда\", \"id куда\"]],\n\
  \"ui\": [{\"title\": \"экран/элемент\", \"before\": null, \"after\": \"путь\", \"note\": \"что поменялось\"}],\n\
- \"risks\": [{\"id\": \"r1\", \"severity\": \"high|mid|low\", \"title\": \"что может сломаться\", \"detail\": \"когда и почему\", \"fix\": \"как поправить\", \"nodes\": [\"id\"]}],\n\
- \"check\": [{\"id\": \"c1\", \"title\": \"что проверить руками\", \"how\": \"как именно\"}],\n\
- \"decisions\": [{\"title\": \"решение агента\", \"why\": \"почему так (по его словам или по коду)\", \"nodes\": [\"id\"], \"at\": \"когда в сессии\"}]}";
+ \"risks\": [{\"id\": \"r1\", \"severity\": \"high|mid|low\", \"title\": \"что может сломаться\", \"detail\": \"когда и почему\", \"fix\": \"как поправить\", \"nodes\": [\"id\"], \"evidence\": {\"level\": \"claimed|pointed|ran|reproduced\", \"ref\": \"file:line или команда с выводом\"}}],\n\
+ \"check\": [{\"id\": \"c1\", \"title\": \"что проверить руками\", \"how\": \"как именно\", \"evidence\": {\"level\": \"…\", \"ref\": \"…\"}}],\n\
+ \"decisions\": [{\"title\": \"решение агента\", \"why\": \"почему так (по его словам или по коду)\", \"nodes\": [\"id\"], \"at\": \"когда в сессии\"}],\n\
+ \"flows\": {\"touched\": [{\"feature\": \"id фичи из flows.yaml\", \"path\": \"id пути\", \"steps\": [\"id шага\"]}], \
+\"proposal\": {\"areas\": [{\"id\": \"…\", \"title\": \"…\"}], \"upsert\": [{\"id\": \"area.feature\", \"title\": \"как назвал бы пользователь\", \"area\": \"id\", \"summary\": \"…\", \"aliases\": [], \
+\"paths\": [{\"id\": \"…\", \"title\": \"…\", \"steps\": [{\"id\": \"…\", \"screen\": \"где пользователь\", \"action\": \"что делает\", \"result\": \"что видит\", \"entities\": [\"имена из code\"], \"files\": [\"путь\"]}]}], \
+\"proofs\": [{\"kind\": \"test|screenshot|video|cli|manual\", \"title\": \"…\", \"reference\": \"путь или команда\", \"covers\": [\"id шага\"], \"at\": \"ISO-время, если проверено сейчас\"}]}], \
+\"remove\": [\"id фичи\"], \"notes\": [\"+ новая фича «…»\", \"~ шаг «…» теперь …\"]}}}";
+
+const FLOW_RULES: &str = "Флоу пользователя: если есть $OUT/flows.yaml — это карта флоу проекта (фичи → пути пользователя шагами «экран → действие → результат» → доказательства). \
+В `flows.touched` отметь, какие шаги каких путей задела сессия (id из flows.yaml). В `flows.proposal` предложи правки карты: новые фичи и шаги, которые появились, изменившиеся шаги \
+(upsert — фича целиком, с сохранёнными id), удалённые фичи (remove), новые доказательства (proofs: тест, скриншот, видео, CLI-сценарий — только реально существующие). \
+`notes` — по строке на правку для человека; каждая заметка о правке шага или фичи ОБЯЗАНА сопровождаться этой фичей в `upsert` (скопируй её из flows.yaml целиком и поменяй) — заметки без upsert в карту не попадут. Если flows.yaml нет — предложи в `proposal.upsert` фичи, которые затронула сессия (это станет началом карты). \
+Пиши словами пользователя, а не кода: «Выбор карты Джокера», а не JokerPickDialog. Если сессия флоу не меняла — оставь `proposal` пустым.";
+
+const EVIDENCE_RULES: &str = "Доказанность: у каждого риска, проверки и группы `features` поле `evidence` — уровень по лестнице: \
+`claimed` (только сказано, словами агента или твоими), `pointed` (указана строка/файл, где это видно), `ran` (запускали команду или тест и видели вывод — в `ref` команда и итог), \
+`reproduced` (воспроизвели в работающем приложении: скриншот, видео, сценарий). Не завышай: если ничего не запускали — максимум `pointed`. \
+Если группе нечем доказать — `evidence` с пустым level, это сигнал человеку.";
 
 const MAP_RULES: &str = "Карта — главное в отчёте: приложение само рисует граф из `code`. Для каждой записи выпиши `uses` (что она вызывает, рендерит, использует — id других записей или имена), \
 у удалённых — какими были. Связи, которые сессия убрала у оставшихся записей, перечисли в `removed_edges`. Неизменённый код рядом (кто вызывает новое, что использует изменённое) — в `code.context`, 3–10 узлов. \
@@ -973,6 +1358,8 @@ fn prompt_full(out: &Path) -> String {
 добавь 0–3 такие в `diagrams` (было/стало, если это изменение, иначе одна). Не рисуй схему ради схемы.\n\
          4. UI: скриншоты из context.md — как «Стало». «Было» — только если это дёшево и честно, иначе null. Никогда не подделывай «Было».\n\
          5. Решения: 3–7 главных решений агента за сессию (`decisions`) — что выбрал и почему, к каким узлам.\n\
+         5а. {FLOW_RULES}\n\
+         5б. {EVIDENCE_RULES}\n\
          {renderer}\n\
          6. Запиши $OUT/report.json строго по схеме (валидный JSON, пути к картинкам абсолютные или относительно $OUT):\n{SCHEMA}\n\n\
          Ограничения: ничего не меняй в проекте и не коммить; пиши только в $OUT; не оставляй запущенных серверов; уложись примерно в 5 минут. \
@@ -991,6 +1378,8 @@ fn prompt_batch(out: &Path) -> String {
          2. Обнови карту: сохрани id и записи из base.json, добавь новые узлы, поменяй статус/описание/связи затронутых, перенеси откаты. {MAP_RULES}\n\
          3. `decisions` — ТОЛЬКО решения из этой порции: что агент выбрал и почему, к каким узлам; `at` — момент в сессии.\n\
          4. title/summary/риски/проверки обнови под итог на сейчас. Поля flow/structure/diagrams/ui скопируй из base.json как есть (схемы не перерисовывай).\n\
+         4а. {FLOW_RULES} В батче `flows.touched` — шаги, задетые за всю сессию (объедини с base.json), `proposal` — все предложения сессии на сейчас (объедини с base.json).\n\
+         4б. {EVIDENCE_RULES}\n\
          5. Запиши ПОЛНЫЙ обновлённый $OUT/report.json по той же схеме:\n{SCHEMA}\n\n\
          Ничего не меняй в проекте, пиши только в $OUT, уложись в 2–3 минуты. Когда записал — ответь: готово.",
         out = out.display(),
@@ -1167,6 +1556,43 @@ fn status_label(s: NodeStatus) -> &'static str {
     }
 }
 
+/// How well a canvas group is proven: the reviewer's word for it, raised by
+/// tests that verify its entries (a passing one counts as «запущено»).
+fn group_rank(r: &Report, g: &Graph, gi: usize) -> u8 {
+    let gr = &g.groups[gi];
+    let stated = r.features.iter().find(|f| !f.id.is_empty() && map::normalize(&f.id) == gr.key).map_or(0, |f| f.evidence.rank());
+    let tests = gr
+        .nodes
+        .iter()
+        .flat_map(|&i| g.tests_of(i))
+        .map(|t| match g.nodes[t].test.as_ref().map(|x| x.result.as_str()) {
+            Some("pass" | "passed" | "ok") => 3,
+            _ => 2,
+        })
+        .max()
+        .unwrap_or(0);
+    stated.max(tests)
+}
+
+/// Badge for a level on the proof ladder.
+fn evidence_badge(rank: u8, p: &Palette) -> (&'static str, Tone) {
+    match rank {
+        4 => ("воспроизведено", p.green),
+        3 => ("запущено", p.blue),
+        2 => ("указана строка", Tone { solid: p.faint, soft: p.surface2, text: p.muted }),
+        1 => ("только сказано", p.amber),
+        _ => ("нет доказательства", p.red),
+    }
+}
+
+fn freshness_badge(f: Freshness, p: &Palette) -> (&'static str, Tone) {
+    match f {
+        Freshness::Fresh => ("доказано", p.green),
+        Freshness::Stale => ("доказательство устарело", p.amber),
+        Freshness::Missing => ("не доказано", p.red),
+    }
+}
+
 fn severity_badge(sev: &str, p: &Palette) -> Option<(&'static str, Tone)> {
     match sev {
         "high" => Some(("ВЫСОКИЙ", p.red)),
@@ -1221,8 +1647,10 @@ impl Render for ChangesView {
             if self.fit_key.as_deref() != Some(key.as_str()) || (resized && !self.touched) {
                 match size {
                     Some(size) => {
-                        let c = map::canvas_layout(g, self.mode);
-                        self.view = canvas::View::fit((c.width, c.height), size);
+                        let c = map::canvas_layout(g, self.mode, layout_width(size.0));
+                        // Open readable (100%) on the main feature, not shrunk to fit everything.
+                        let focus = map::main_frame(g, &c).map(|b| (b.x, b.y));
+                        self.view = canvas::View::readable((c.width, c.height), focus, size);
                         self.fit_key = Some(key);
                         self.fit_size = size;
                         self.touched = false;
@@ -1487,7 +1915,8 @@ impl ChangesView {
                         .child(format!("Батч #{} собирается · {} · {}", run.n, run.model, run.steps.last().cloned().unwrap_or_else(|| "читает новые ходы".into()))),
                 )
             })
-            // The canvas first: it is what you look at; the summary and numbers follow.
+            // Which user flows the session went through, then the canvas of what changed.
+            .child(self.render_flows(g, r, p, theme, cx))
             .child(self.render_map_section(g, r, &fresh, canvas_h, p, theme, cx))
             .when(!r.summary.is_empty(), |this| {
                 this.child(
@@ -1518,6 +1947,207 @@ impl ChangesView {
                         .gap(px(12.))
                         .child(ui::section_title("Интерфейс", None, p, theme).child(ui::mono("было → стало", theme).text_color(p.faint)))
                         .children(r.ui.iter().enumerate().map(|(i, u)| self.render_ui_pair(i, u, &dir, p))),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// «Затронутые флоу»: user flows of the project the session went through,
+    /// touched steps lit, how well each is proven; and the reviewer's proposal
+    /// for the flow map with «Принять» / «Отклонить».
+    fn render_flows(&self, g: &Graph, r: &Report, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let touched = self.touched(g, r);
+        let proposal = &r.flows.proposal;
+        let mono = theme.mono_font_family.clone();
+        if self.flow_map.is_none() && proposal.is_empty() {
+            return h_flex()
+                .gap(px(8.))
+                .px(px(12.))
+                .py(px(7.))
+                .rounded(px(8.))
+                .border_1()
+                .border_dashed()
+                .border_color(p.border_strong)
+                .text_size(px(12.5))
+                .text_color(p.muted)
+                .child(Icon::empty().path("icons/route.svg").small().text_color(p.faint))
+                .child("Карты флоу нет — построить на экране «Флоу»: тогда здесь будет видно, какие пути пользователя задела сессия")
+                .into_any_element();
+        }
+        // Session proof: tests of this report and before/after scenes of this session.
+        let scenes: usize = media::load_all(&self.input.key).iter().filter_map(|m| m.manifest.as_ref()?.as_ref().ok()).map(|m| m.items.len()).sum();
+        let lit_step = self.flow_focus.clone();
+        let cards = touched.iter().enumerate().filter_map(|(ti, t)| {
+            let f = self.flow_feature(r, &t.feature)?;
+            let path = f.paths.iter().find(|x| x.id == t.path).or(f.paths.first())?;
+            let freshness = f.freshness(&self.input.cwd);
+            // Entities of the touched steps, for the session's own tests.
+            let step_entities: Vec<String> = path.steps.iter().filter(|s| t.steps.contains(&s.id)).flat_map(|s| s.entities.iter().map(|e| map::normalize(e))).collect();
+            let session_tests = r.tests.iter().filter(|x| x.verifies.iter().any(|v| step_entities.contains(&map::normalize(v)))).count();
+            let (fl, ft) = freshness_badge(freshness, p);
+            let fid = f.id.clone();
+            Some(
+                v_flex()
+                    .id(SharedString::from(format!("flow-{ti}")))
+                    .flex_shrink_0()
+                    .min_w(px(320.))
+                    .max_w(px(640.))
+                    .p(px(12.))
+                    .gap(px(9.))
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(ui::mix(p.accent.solid, p.border, 0.35))
+                    .bg(p.surface)
+                    .shadow(ui::card_shadow())
+                    .child(
+                        h_flex()
+                            .gap(px(8.))
+                            .child(div().min_w_0().truncate().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(p.ink).child(f.title.clone()))
+                            .child(ui::badge(fl, ft))
+                            .child(div().flex_1())
+                            .child(ui::mono(path.title.clone(), theme).truncate().text_color(p.faint)),
+                    )
+                    .child(
+                        h_flex().flex_wrap().gap(px(6.)).items_center().children(path.steps.iter().enumerate().flat_map(|(si, step)| {
+                            let hit = t.steps.contains(&step.id);
+                            let focused = lit_step.as_ref().is_some_and(|(ff, ss)| *ff == fid && *ss == step.id);
+                            let (ff, ss) = (fid.clone(), step.id.clone());
+                            let chip = v_flex()
+                                .id(SharedString::from(format!("flow-{ti}-step-{si}")))
+                                .max_w(px(200.))
+                                .px(px(9.))
+                                .py(px(5.))
+                                .rounded(px(7.))
+                                .border_1()
+                                .cursor_pointer()
+                                .map(|d| match (hit, focused) {
+                                    (_, true) => d.border_color(p.ink).bg(if hit { p.amber.soft } else { p.surface2 }),
+                                    (true, false) => d.border_color(ui::mix(p.amber.solid, p.border, 0.55)).bg(p.amber.soft),
+                                    (false, false) => d.border_color(p.border).bg(p.surface2).opacity(0.75),
+                                })
+                                .hover(|d| d.border_color(p.border_strong))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let key = (ff.clone(), ss.clone());
+                                    this.flow_focus = if this.flow_focus.as_ref() == Some(&key) { None } else { Some(key) };
+                                    cx.notify();
+                                }))
+                                .child(div().truncate().font_family(mono.clone()).text_size(px(10.)).text_color(if hit { p.amber.text } else { p.faint }).child(step.screen.clone()))
+                                .child(div().line_clamp(2).text_size(px(12.)).line_height(px(16.)).text_color(if hit { p.ink } else { p.muted }).child(step.action.clone()));
+                            let arrow = (si > 0).then(|| div().text_size(px(12.)).text_color(p.faint).child("→").into_any_element());
+                            arrow.into_iter().chain(std::iter::once(chip.into_any_element()))
+                        })),
+                    )
+                    .child(
+                        h_flex()
+                            .gap(px(10.))
+                            .text_size(px(11.5))
+                            .text_color(p.muted)
+                            .child(format!("задето шагов: {} из {}", t.steps.len(), path.steps.len()))
+                            .when(session_tests > 0 || scenes > 0, |d| {
+                                let mut parts = Vec::new();
+                                if session_tests > 0 {
+                                    parts.push(format!("тестов: {session_tests}"));
+                                }
+                                if scenes > 0 {
+                                    parts.push(format!("кадров было → стало: {scenes}"));
+                                }
+                                d.child(div().text_color(p.green.text).child(format!("доказательства сессии · {}", parts.join(" · "))))
+                            })
+                            .when(session_tests == 0 && scenes == 0 && freshness != Freshness::Fresh, |d| {
+                                d.child(div().text_color(p.amber.text).child("сессия это ничем не проверила"))
+                            }),
+                    ),
+            )
+        });
+        let cards: Vec<_> = cards.collect();
+        let decided = self.proposal_id().map(|id| {
+            let d = flowmap::Decisions::load(&stepan_verify_core::Home::locate(), &self.input.cwd);
+            (d.accepted.contains(&id), d.rejected.contains(&id))
+        });
+        let notes: Vec<String> = if proposal.notes.is_empty() {
+            proposal
+                .upsert
+                .iter()
+                .map(|f| {
+                    let known = self.flow_map.as_ref().is_some_and(|m| m.feature(&f.id).is_some());
+                    format!("{} {}", if known { "~" } else { "+" }, f.title)
+                })
+                .chain(proposal.remove.iter().map(|id| format!("− {id}")))
+                .collect()
+        } else {
+            proposal.notes.clone()
+        };
+        v_flex()
+            .gap(px(10.))
+            .child(
+                ui::section_title("Затронутые флоу", Some(cards.len().to_string()), p, theme)
+                    .child(ui::mono("клик по шагу — подсветит его сущности на канвасе", theme).text_color(p.faint)),
+            )
+            .map(|this| {
+                if cards.is_empty() {
+                    this.child(div().text_size(px(12.5)).text_color(p.muted).child(if self.flow_map.is_some() {
+                        "Сессия не задела флоу из карты проекта"
+                    } else {
+                        "Карты флоу пока нет — ниже то, что ревьюер предлагает в неё записать"
+                    }))
+                } else {
+                    this.child(div().id("flows-scroll").overflow_x_scroll().child(h_flex().gap(px(12.)).items_start().pb(px(4.)).children(cards)))
+                }
+            })
+            .when(proposal.is_empty() && !proposal.notes.is_empty(), |this| {
+                this.child(
+                    v_flex()
+                        .gap(px(4.))
+                        .px(px(12.))
+                        .py(px(8.))
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_dashed()
+                        .border_color(p.border_strong)
+                        .child(ui::eyebrow("Ревьюер о карте флоу · правки целиком не прислал, применять нечего", p, theme))
+                        .children(proposal.notes.iter().take(8).map(|n| div().text_size(px(12.5)).text_color(p.fg).child(n.clone()))),
+                )
+            })
+            .when(!proposal.is_empty(), |this| {
+                let (accepted, rejected) = decided.unwrap_or((false, false));
+                this.child(
+                    v_flex()
+                        .gap(px(8.))
+                        .p(px(12.))
+                        .rounded(px(10.))
+                        .border_1()
+                        .border_color(if accepted { ui::mix(p.green.solid, p.border, 0.4) } else { ui::mix(p.blue.solid, p.border, 0.4) })
+                        .bg(if accepted { p.green.soft } else { ui::mix(p.blue.soft, p.surface, 0.5) })
+                        .child(
+                            h_flex()
+                                .gap(px(8.))
+                                .child(Icon::empty().path("icons/route.svg").small().text_color(p.blue.solid))
+                                .child(div().flex_1().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).text_color(p.ink).child("Предложения к карте флоу"))
+                                .map(|d| {
+                                    if accepted {
+                                        d.child(ui::badge("принято в карту", p.green))
+                                    } else if rejected {
+                                        d.child(ui::badge("отклонено", Tone { solid: p.faint, soft: p.surface2, text: p.muted }))
+                                    } else {
+                                        d.child(
+                                            PressButton::new("flows-reject")
+                                                .small()
+                                                .label("Отклонить")
+                                                .on_click(cx.listener(|this, _, _, cx| this.decide_proposal(false, cx))),
+                                        )
+                                        .child(
+                                            PressButton::new("flows-accept")
+                                                .small()
+                                                .primary()
+                                                .icon(IconName::Check)
+                                                .label("Принять в карту")
+                                                .tooltip(format!("Записать в {}", flowmap::FILE))
+                                                .on_click(cx.listener(|this, _, _, cx| this.decide_proposal(true, cx))),
+                                        )
+                                    }
+                                }),
+                        )
+                        .children(notes.into_iter().take(12).map(|n| div().text_size(px(12.5)).line_height(px(18.)).text_color(p.fg).child(n))),
                 )
             })
             .into_any_element()
@@ -1625,7 +2255,7 @@ impl ChangesView {
     fn render_map(&self, g: &Graph, r: &Report, fresh: &HashSet<String>, height: f32, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         use map::NODE_W;
         let mode = self.mode;
-        let cv = map::canvas_layout(g, mode);
+        let cv = map::canvas_layout(g, mode, self.layout_target());
         let v = self.view;
         let z = v.zoom;
         let sx = move |x: f32| v.x + x * z;
@@ -1652,7 +2282,27 @@ impl ChangesView {
             .and_then(|k| g.dto_index(k));
         let focus = self.hovered.clone().or(selected.clone());
         let focus_ix = if dto_focus.is_some() { None } else { focus.as_ref().and_then(|k| g.index(k)) };
+        // A step of a touched flow you clicked: its entities and files.
+        let flow_lit: Option<HashSet<usize>> = self.flow_focus.as_ref().and_then(|(fid, sid)| {
+            let f = self.flow_feature(r, fid)?;
+            let step = f.paths.iter().flat_map(|x| &x.steps).find(|s| s.id == *sid)?;
+            let names: Vec<String> = step.entities.iter().map(|e| map::normalize(e)).collect();
+            let hits: HashSet<usize> = g
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| {
+                    names.contains(&map::normalize(&n.name))
+                        || names.contains(&map::normalize(&n.entity))
+                        || names.contains(&n.key)
+                        || (!n.file.is_empty() && step.files.iter().any(|f| f.ends_with(&n.file) || n.file.ends_with(f.as_str())))
+                })
+                .map(|(i, _)| i)
+                .collect();
+            Some(hits)
+        });
         let lit: Option<HashSet<usize>> = match (dto_focus, focus_ix, group_focus) {
+            (None, None, _) if flow_lit.is_some() => flow_lit.clone(),
             (Some(d), _, _) => Some(g.dtos[d].users.iter().copied().collect()),
             (None, Some(f), _) => {
                 let mut s: HashSet<usize> = g.edges.iter().filter(|e| (e.from == f || e.to == f) && g.edge_visible(e, mode)).flat_map(|e| [e.from, e.to]).collect();
@@ -1704,7 +2354,8 @@ impl ChangesView {
                 _ => base,
             };
             lines.push((curve, color, if hot { 2.2 } else { 1.4 }, dashed));
-            if let Some(d) = e.via.filter(|&d| g.dtos[d].visible(mode) && text) {
+            // DTO labels: at a readable zoom, or on the link you point at.
+            if let Some(d) = e.via.filter(|&d| g.dtos[d].visible(mode) && text && (z >= 0.95 || hot)) {
                 labels.push((map::curve_mid(&curve), d, hot, any_focus && !hot));
             }
         }
@@ -1841,7 +2492,21 @@ impl ChangesView {
                                             .text_size(px(zl(10.)))
                                             .text_color(tone.map_or(p.muted, |t| t.text))
                                             .child(format!("{} · {count}", gr.kind.label())),
-                                    ),
+                                    )
+                                    .when(gr.kind == map::GroupKind::Feature, |d| {
+                                        let (label, tone) = evidence_badge(group_rank(r, g, gi), p);
+                                        d.child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .px(px(zl(5.)))
+                                                .rounded(px(zl(4.)))
+                                                .bg(tone.soft)
+                                                .text_size(px(zl(10.)))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(tone.text)
+                                                .child(label),
+                                        )
+                                    }),
                             )
                             .when(!gr.summary.is_empty(), |d| {
                                 d.child(div().text_size(px(zl(12.))).line_height(px(zl(16.))).line_clamp(2).text_color(p.muted).child(gr.summary.clone()))
@@ -1869,7 +2534,11 @@ impl ChangesView {
             let untested = has_tests && g.untested(i);
             let file = n.file.rsplit('/').next().unwrap_or_default().to_owned();
             let test_result = n.test.as_ref().map(|t| t.result.clone()).filter(|r| !r.is_empty());
-            div()
+            // At rest: role and the human name. Pointed at: grows over its
+            // neighbours with the code name, signature and file.
+            let expanded = text && self.hovered.as_deref() == Some(n.key.as_str()) && !self.drag.is_some_and(|d| d.moved);
+            let h = if expanded { map::node_height(n, mode).max(h) } else { h };
+            let el = div()
                 .id(SharedString::from(format!("node-{i}-{}", n.key)))
                 .absolute()
                 .left(px(sx(x)))
@@ -1963,10 +2632,10 @@ impl ChangesView {
                             .when(n.status == NodeStatus::Removed, |d| d.line_through())
                             .child(n.title().to_owned()),
                     )
-                    .when(map::shows_code_name(n), |d| {
+                    .when(expanded && map::shows_code_name(n), |d| {
                         d.child(div().mt(px(zl(-2.))).truncate().font_family(mono.clone()).text_size(px(zl(11.))).line_height(px(zl(map::NAME_LINE))).text_color(p.muted).child(n.name.clone()))
                     })
-                    .when(!sig.is_empty() && detail, |d| {
+                    .when(expanded && !sig.is_empty() && detail, |d| {
                         d.child(
                             div()
                                 .mt(px(zl(1.)))
@@ -1978,7 +2647,7 @@ impl ChangesView {
                                 .child(signature_text(&sig, p)),
                         )
                     })
-                    .when(detail, |d| {
+                    .when(expanded, |d| {
                         d.child(
                             h_flex()
                                 .mt(px(zl(1.)))
@@ -1992,8 +2661,13 @@ impl ChangesView {
                         )
                     })
                 })
-
+                .when(expanded, |d| d.shadow(ui::popover_shadow()).border_color(p.border_strong));
+            (expanded, el.into_any_element())
         });
+        // The card you point at draws last: it grows over its neighbours.
+        let mut nodes: Vec<(bool, AnyElement)> = nodes.collect();
+        nodes.sort_by_key(|(expanded, _)| *expanded);
+        let nodes = nodes.into_iter().map(|(_, el)| el);
 
         // DTO labels on links: what travels along them.
         let pills = labels.into_iter().enumerate().map(|(li, ((mx, my), d, hot, dim))| {
@@ -2067,10 +2741,11 @@ impl ChangesView {
                     .font_family(mono.clone())
                     .text_size(px(11.5))
                     .text_color(p.fg)
-                    .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("100%").build(window, cx))
+                    .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("100% — к главному функционалу").build(window, cx))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        let f = 1. / this.view.zoom;
-                        this.zoom_center(f, cx);
+                        if let Some(g) = this.report().map(map::build_report) {
+                            this.readable(&g, cx);
+                        }
                     }))
                     .child(format!("{pct}%")),
             )
@@ -2407,32 +3082,167 @@ impl ChangesView {
             })))
     }
 
+    /// Risks with their proof level; each can be handed to an agent of the
+    /// other family to prove or refute by running something. Refuted ones
+    /// move to «Отброшено».
     fn render_risks(&self, g: &Graph, r: &Report, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let run_n = self.selected.and_then(|i| self.runs.get(i)).map(|run| run.n);
+        let results = run_n.and_then(|n| self.verify.get(&n)).cloned().unwrap_or_default();
+        let other = match other_family(self.input.provider) {
+            Provider::Claude => "Claude",
+            Provider::Codex => "Codex",
+        };
+        let mono = theme.mono_font_family.clone();
+        let keyed: Vec<(usize, String, &Risk)> = r.risks.iter().enumerate().map(|(i, risk)| (i, risk_key(i, risk), risk)).collect();
+        let refuted = |k: &str| results.get(k).is_some_and(|v| v.verdict == "refuted");
+        let open: Vec<&(usize, String, &Risk)> = keyed.iter().filter(|(_, k, _)| !refuted(k)).collect();
+        let dropped: Vec<&(usize, String, &Risk)> = keyed.iter().filter(|(_, k, _)| refuted(k)).collect();
+        let unchecked: Vec<String> = open.iter().filter(|(_, k, _)| !results.contains_key(k)).map(|(_, k, _)| k.clone()).collect();
+        let busy = self.verifying.as_ref().map(|j| (j.run, j.risk.clone(), j.started.elapsed().as_secs(), j.steps.last().cloned(), j.by.clone()));
+        let queued: HashSet<String> = self.verify_queue.iter().filter(|(n, _)| Some(*n) == run_n).map(|(_, k)| k.clone()).collect();
+        let row = |(i, key, risk): &(usize, String, &Risk), cx: &mut Context<Self>| {
+            let node = risk.nodes.first().map(|k| map::normalize(k)).or_else(|| g.nodes.iter().find(|n| !risk.id.is_empty() && n.risk_ids.contains(&risk.id)).map(|n| n.key.clone()));
+            let result = results.get(key).cloned();
+            let running = busy.as_ref().filter(|b| Some(b.0) == run_n && b.1 == *key).cloned();
+            let waiting = queued.contains(key);
+            let rank = result.as_ref().map_or(risk.evidence.rank(), |v| evidence_rank(&v.level).max(risk.evidence.rank()));
+            let (elabel, etone) = evidence_badge(rank, p);
+            let k = key.clone();
+            v_flex()
+                .px(px(14.))
+                .py(px(10.))
+                .gap(px(6.))
+                .when(*i > 0, |d| d.border_t_1().border_color(p.border))
+                .child(
+                    h_flex()
+                        .gap(px(10.))
+                        .items_start()
+                        .child(match severity_badge(&risk.severity, p) {
+                            Some((label, tone)) => ui::badge(label, tone).font_family(mono.clone()).text_size(px(10.)).into_any_element(),
+                            None => div().mt(px(1.)).child(Icon::new(IconName::TriangleAlert).small().text_color(p.amber.solid)).into_any_element(),
+                        })
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap(px(4.))
+                                .child(div().text_size(px(13.5)).line_height(px(19.)).text_color(p.fg).child(risk.title.clone()))
+                                .when(!risk.detail.is_empty(), |v| v.child(div().text_size(px(12.5)).text_color(p.muted).child(risk.detail.clone())))
+                                .child(
+                                    h_flex()
+                                        .gap(px(6.))
+                                        .flex_wrap()
+                                        .child(ui::badge(elabel, etone).text_size(px(10.5)))
+                                        .when(!risk.evidence.reference.is_empty() && result.is_none(), |d| {
+                                            d.child(div().max_w(px(260.)).truncate().font_family(mono.clone()).text_size(px(10.5)).text_color(p.faint).child(risk.evidence.reference.clone()))
+                                        })
+                                        .when_some(result.clone(), |d, v| {
+                                            let (label, tone) = match v.verdict.as_str() {
+                                                "confirmed" => ("подтверждён запуском", p.red),
+                                                "inconclusive" => ("не удалось доказать", p.amber),
+                                                _ => ("проверка не прошла", Tone { solid: p.faint, soft: p.surface2, text: p.muted }),
+                                            };
+                                            d.child(ui::badge(label, tone).text_size(px(10.5))).child(ui::mono(v.by.clone(), theme).text_size(px(10.5)).text_color(p.faint))
+                                        })
+                                        .when_some(node, |v, nk| v.child(self.node_chip(SharedString::from(format!("risk-{i}-node")), &nk, g, p, theme, cx))),
+                                ),
+                        )
+                        .map(|d| match (&running, waiting, &result) {
+                            (Some((_, _, secs, step, by)), _, _) => d.child(
+                                v_flex()
+                                    .flex_shrink_0()
+                                    .items_end()
+                                    .gap(px(2.))
+                                    .child(h_flex().gap(px(6.)).child(Spinner::new().xsmall().color(p.blue.solid)).child(div().text_size(px(11.5)).text_color(p.blue.text).child(format!("{} проверяет · {}:{:02}", by.split(" · ").next().unwrap_or(by), secs / 60, secs % 60))))
+                                    .when_some(step.clone(), |v, st| v.child(div().max_w(px(220.)).truncate().font_family(mono.clone()).text_size(px(10.5)).text_color(p.faint).child(st))),
+                            ),
+                            (None, true, _) => d.child(div().flex_shrink_0().font_family(mono.clone()).text_size(px(11.)).text_color(p.faint).child("в очереди")),
+                            (None, false, _) => d.child(
+                                PressButton::new(SharedString::from(format!("verify-{key}")))
+                                    .xsmall()
+                                    .icon(Icon::empty().path("icons/flask-conical.svg"))
+                                    .label(if result.is_some() { format!("Ещё раз · {other}") } else { format!("Проверить · {other}") })
+                                    .tooltip(format!("Агент {other} попробует подтвердить или опровергнуть риск запуском"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(n) = run_n {
+                                            this.verify_risk(n, k.clone(), cx);
+                                        }
+                                    })),
+                            ),
+                        }),
+                )
+                .when_some(result.filter(|v| !v.reason.is_empty() || !v.command.is_empty()), |d, v| {
+                    d.child(
+                        v_flex()
+                            .ml(px(36.))
+                            .gap(px(4.))
+                            .p(px(8.))
+                            .rounded(px(7.))
+                            .bg(p.surface2)
+                            .when(!v.reason.is_empty(), |x| x.child(div().text_size(px(12.5)).line_height(px(18.)).text_color(p.fg).child(v.reason.clone())))
+                            .when(!v.command.is_empty(), |x| x.child(div().font_family(mono.clone()).text_size(px(11.)).text_color(p.ink).child(format!("$ {}", v.command))))
+                            .when(!v.output.is_empty(), |x| {
+                                let out: String = v.output.lines().take(8).collect::<Vec<_>>().join("\n");
+                                x.child(div().font_family(mono.clone()).text_size(px(10.5)).line_height(px(14.)).text_color(p.muted).child(out))
+                            }),
+                    )
+                })
+        };
+        let rows: Vec<AnyElement> = open.iter().map(|x| row(x, cx).into_any_element()).collect();
+        let dropped_rows: Vec<AnyElement> = dropped
+            .iter()
+            .map(|(i, key, risk)| {
+                let v = results.get(key).cloned().unwrap_or_default();
+                v_flex()
+                    .px(px(14.))
+                    .py(px(8.))
+                    .gap(px(3.))
+                    .when(*i > 0, |d| d.border_t_1().border_color(p.border))
+                    .child(div().text_size(px(13.)).text_color(p.muted).line_through().child(risk.title.clone()))
+                    .child(div().text_size(px(12.)).text_color(p.fg).child(if v.reason.is_empty() { "Запуск показал, что проблемы нет".to_owned() } else { v.reason.clone() }))
+                    .child(ui::mono(format!("{} · {}", v.by, if v.command.is_empty() { String::new() } else { format!("$ {}", v.command) }), theme).truncate().text_size(px(10.5)).text_color(p.faint))
+                    .into_any_element()
+            })
+            .collect();
+        let can_all = !unchecked.is_empty() && self.verifying.as_ref().is_none_or(|j| Some(j.run) != run_n || !unchecked.contains(&j.risk)) && run_n.is_some();
         v_flex()
             .gap(px(10.))
-            .child(ui::section_title("Риски на карте", Some(r.risks.len().to_string()), p, theme))
-            .child(ui::card(p).overflow_hidden().when(r.risks.is_empty(), |c| c.child(div().p(px(14.)).text_size(px(12.5)).text_color(p.faint).child("Ревьюер рисков не нашёл"))).children(r.risks.iter().enumerate().map(|(i, risk)| {
-                let node = risk.nodes.first().map(|k| map::normalize(k)).or_else(|| g.nodes.iter().find(|n| !risk.id.is_empty() && n.risk_ids.contains(&risk.id)).map(|n| n.key.clone()));
-                h_flex()
-                    .px(px(14.))
-                    .py(px(10.))
-                    .gap(px(10.))
-                    .items_start()
-                    .when(i > 0, |d| d.border_t_1().border_color(p.border))
-                    .child(match severity_badge(&risk.severity, p) {
-                        Some((label, tone)) => ui::badge(label, tone).font_family(theme.mono_font_family.clone()).text_size(px(10.)).into_any_element(),
-                        None => div().mt(px(1.)).child(Icon::new(IconName::TriangleAlert).small().text_color(p.amber.solid)).into_any_element(),
+            .child(
+                ui::section_title("Риски на карте", Some(open.len().to_string()), p, theme)
+                    .when(can_all, |d| {
+                        let list = unchecked.clone();
+                        d.child(
+                            PressButton::new("verify-all")
+                                .xsmall()
+                                .icon(Icon::empty().path("icons/flask-conical.svg"))
+                                .label(format!("Проверить все · {other}"))
+                                .tooltip("По очереди, каждый риск — запуском, агентом другой семьи")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let Some(n) = run_n else { return };
+                                    for k in &list {
+                                        this.verify_risk(n, k.clone(), cx);
+                                    }
+                                })),
+                        )
                     })
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap(px(4.))
-                            .child(div().text_size(px(13.5)).line_height(px(19.)).text_color(p.fg).child(risk.title.clone()))
-                            .when(!risk.detail.is_empty(), |v| v.child(div().text_size(px(12.5)).text_color(p.muted).child(risk.detail.clone())))
-                            .when_some(node, |v, k| v.child(h_flex().child(self.node_chip(SharedString::from(format!("risk-{i}-node")), &k, g, p, theme, cx)))),
-                    )
-            })))
+                    .when(self.verifying.is_some(), |d| {
+                        d.child(PressButton::new("verify-stop").xsmall().ghost().label("Остановить").on_click(cx.listener(|this, _, _, cx| this.cancel_verify(cx))))
+                    }),
+            )
+            .child(
+                ui::card(p)
+                    .overflow_hidden()
+                    .when(open.is_empty(), |c| c.child(div().p(px(14.)).text_size(px(12.5)).text_color(p.faint).child(if dropped.is_empty() { "Ревьюер рисков не нашёл" } else { "Все риски опровергнуты проверкой" })))
+                    .children(rows),
+            )
+            .when(!dropped_rows.is_empty(), |this| {
+                this.child(
+                    v_flex()
+                        .gap(px(6.))
+                        .child(ui::eyebrow(format!("Отброшено · {}", dropped_rows.len()), p, theme))
+                        .child(ui::card(p).overflow_hidden().opacity(0.85).children(dropped_rows)),
+                )
+            })
     }
 
     fn render_diagram(&self, key: String, d: &Diagram, dir: &Path, p: &Palette, theme: &Theme) -> impl IntoElement {
@@ -2643,10 +3453,48 @@ impl ChangesView {
                 )
                 .when_some(status_tone(n.status, p).filter(|_| n.status != NodeStatus::Context), |d, t| d.child(ui::badge(status_label(n.status), t)))
         };
+        // «Что доказывает»: the reviewer's evidence, tests, linked checks, this session's before/after.
+        let report = self.report();
+        let feature = report.and_then(|r| r.features.iter().find(|f| !f.id.is_empty() && map::normalize(&f.id) == gr.key));
+        let rank = report.map_or(0, |r| group_rank(r, g, gi));
+        let linked_checks: Vec<Check> = report
+            .map(|r| {
+                r.check
+                    .iter()
+                    .filter(|c| !c.id.is_empty() && members.iter().any(|&i| g.nodes[i].check_ids.contains(&c.id)))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let scenes: usize = media::load_all(&self.input.key).iter().filter_map(|m| m.manifest.as_ref()?.as_ref().ok()).map(|m| m.items.len()).sum();
+        let (elabel, etone) = evidence_badge(rank, p);
+        let proof = v_flex()
+            .gap(px(6.))
+            .child(h_flex().gap(px(8.)).child(label("Что доказывает")).child(ui::badge(elabel, etone)))
+            .when_some(feature.filter(|f| !f.evidence.reference.is_empty()), |d, f| {
+                d.child(div().font_family(theme.mono_font_family.clone()).text_size(px(11.5)).text_color(p.fg).child(f.evidence.reference.clone()))
+            })
+            .children(linked_checks.iter().map(|c| {
+                let (l, t) = evidence_badge(c.evidence.rank(), p);
+                h_flex().gap(px(6.)).child(ui::badge(l, t).text_size(px(10.))).child(div().flex_1().min_w_0().truncate().text_size(px(12.5)).text_color(p.fg).child(c.title.clone()))
+            }))
+            .when(scenes > 0, |d| d.child(div().text_size(px(12.5)).text_color(p.green.text).child(format!("Было → стало этой сессии: {scenes} кадр(ов) — ниже, в «Было → Стало»"))))
+            .when(rank == 0 && scenes == 0 && tests.is_empty(), |d| {
+                d.child(
+                    div()
+                        .p(px(10.))
+                        .rounded(px(8.))
+                        .bg(p.red.soft)
+                        .text_size(px(12.5))
+                        .text_color(p.red.text)
+                        .child("Нечем доказать: нет тестов, запусков и скриншотов. Попроси агента проверить это запуском или снять before/after."),
+                )
+            });
         v_flex()
             .gap(px(14.))
             .child(h_flex().gap(px(8.)).child(ui::chip(gr.kind.label(), p, theme)).child(ui::mono(format!("{} сущностей", members.len()), theme).text_color(p.faint)))
             .when(!gr.summary.is_empty(), |d| d.child(div().text_size(px(13.5)).line_height(px(20.)).text_color(p.fg).child(gr.summary.clone())))
+            .when(gr.kind == map::GroupKind::Feature, |d| d.child(proof))
             .child(v_flex().gap(px(2.)).child(label("Сущности")).children(members.iter().map(|&i| row(i, cx).into_any_element()).collect::<Vec<_>>()))
             .when(!tests.is_empty(), |d| d.child(v_flex().gap(px(2.)).child(label("Проверяют тесты")).children(tests.iter().map(|&i| row(i, cx).into_any_element()).collect::<Vec<_>>())))
             .when(!untested.is_empty(), |d| {
@@ -2957,7 +3805,11 @@ impl ChangesView {
                             .flex_1()
                             .gap(px(3.))
                             .child(div().text_size(px(13.5)).text_color(if on { p.muted } else { p.fg }).when(on, |d| d.line_through()).child(c.title.clone()))
-                            .when(!c.how.is_empty(), |v| v.child(div().text_size(px(12.)).text_color(p.muted).child(c.how.clone()))),
+                            .when(!c.how.is_empty(), |v| v.child(div().text_size(px(12.)).text_color(p.muted).child(c.how.clone())))
+                            .when(!c.evidence.level.is_empty(), |v| {
+                                let (l, t) = evidence_badge(c.evidence.rank(), p);
+                                v.child(h_flex().child(ui::badge(format!("агент: {l}"), t).text_size(px(10.))))
+                            }),
                     )
             }))
     }
@@ -3185,6 +4037,42 @@ mod tests {
         assert_eq!(themed_image(&light, true), dir.join("flow-dark.png"));
         assert_eq!(themed_image(&light, false), light);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[core::prelude::v1::test]
+    fn touched_merges_by_feature_and_path() {
+        let t = |f: &str, p: &str, steps: &[&str]| Touched { feature: f.into(), path: p.into(), steps: steps.iter().map(|s| s.to_string()).collect() };
+        let reviewer = vec![t("joker", "daily", &["pick"]), t("", "x", &["y"])];
+        let diff = vec![t("joker", "daily", &["open", "pick"]), t("auth", "login", &["submit"])];
+        let merged = merge_touched(&reviewer, &diff);
+        assert_eq!(merged, vec![t("joker", "daily", &["pick", "open"]), t("auth", "login", &["submit"])]);
+    }
+
+    #[core::prelude::v1::test]
+    fn evidence_flows_and_verify_parse() {
+        let r: Report = serde_json::from_str(
+            r#"{"risks":[{"id":"r1","title":"двойной вызов","evidence":{"level":"ran","ref":"npm test -- fly"}},"старый риск строкой"],
+                "check":[{"title":"проверь вход","evidence":{"level":"pointed"}},"строкой"],
+                "features":[{"id":"f1","title":"Полёт","evidence":{"level":"reproduced","reference":"media/1/fly.gif"}}],
+                "flows":{"touched":[{"feature":"rewards.joker","path":"daily","steps":["pick"]}],
+                         "proposal":{"upsert":[{"id":"rewards.joker","title":"Выбор Джокера","paths":[{"id":"daily","steps":[{"id":"pick","screen":"Диалог","action":"Выбрать"}]}]}],
+                                     "notes":["~ Выбор Джокера: новый шаг"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!((r.risks[0].evidence.rank(), r.risks[1].evidence.rank()), (3, 0));
+        assert_eq!(r.risks[0].evidence.reference, "npm test -- fly");
+        assert_eq!((r.check[0].evidence.rank(), r.check[1].evidence.rank()), (2, 0));
+        assert_eq!(r.features[0].evidence.rank(), 4);
+        assert_eq!(r.flows.touched[0].steps, vec!["pick".to_owned()]);
+        assert!(!r.flows.proposal.is_empty());
+        // Old reports: no flows, no evidence.
+        let old: Report = serde_json::from_str(r#"{"risks":["x"]}"#).unwrap();
+        assert!(old.flows.touched.is_empty() && old.flows.proposal.is_empty());
+        // Risk keys: id, else position.
+        assert_eq!((risk_key(0, &r.risks[0]), risk_key(1, &r.risks[1])), ("r1".to_owned(), "r2".to_owned()));
+        let v: VerifyResult = serde_json::from_str(r#"{"verdict":"Refuted","level":"ran","command":"node -e 1","reason":"нет"}"#).unwrap();
+        assert_eq!((evidence_rank(&v.level), v.command.as_str()), (3, "node -e 1"));
+        assert_eq!(other_family(Provider::Claude), Provider::Codex);
     }
 
     #[core::prelude::v1::test]

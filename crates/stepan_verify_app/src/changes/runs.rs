@@ -38,6 +38,8 @@ pub struct Meta {
     pub edits: usize,
     pub reviewer: String,
     pub error: Option<String>,
+    /// The project the run looked at (the flow map reads proposals per project).
+    pub cwd: Option<PathBuf>,
 }
 
 pub struct Run {

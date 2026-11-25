@@ -31,6 +31,17 @@ impl View {
         View { x: (view.0 - ww * zoom) / 2., y: FIT_TOP, zoom }
     }
 
+    /// The view to open on: 100%, readable. When the whole world fits it is
+    /// centered; otherwise `focus` (the main frame's top left) sits at the top left.
+    pub fn readable(world: (f32, f32), focus: Option<(f32, f32)>, view: (f32, f32)) -> View {
+        let fits = world.0 + FIT_MARGIN * 2. <= view.0 && world.1 + FIT_TOP + FIT_MARGIN <= view.1;
+        if fits {
+            return View { x: (view.0 - world.0) / 2., y: FIT_TOP, zoom: 1. };
+        }
+        let (fx, fy) = focus.unwrap_or((0., 0.));
+        View { x: FIT_MARGIN - fx, y: FIT_TOP - fy, zoom: 1. }
+    }
+
     /// Zoom by `factor` keeping the world point under `at` (screen, relative to the viewport) still.
     pub fn zoom_at(self, factor: f32, at: (f32, f32)) -> View {
         let zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
@@ -91,6 +102,17 @@ mod tests {
 
     fn close(a: f32, b: f32) -> bool {
         (a - b).abs() < 0.01
+    }
+
+    #[core::prelude::v1::test]
+    fn opens_readable_at_100_on_the_main_frame() {
+        // Everything fits: centered at 100%.
+        let v = View::readable((800., 300.), Some((0., 0.)), (1200., 800.));
+        assert!(close(v.zoom, 1.) && close(v.x, 200.) && close(v.y, FIT_TOP));
+        // Too big: 100% with the main frame at the top left, not shrunk to fit.
+        let v = View::readable((3000., 2000.), Some((400., 600.)), (1200., 800.));
+        assert!(close(v.zoom, 1.));
+        assert_eq!(v.screen((400., 600.)), (FIT_MARGIN, FIT_TOP));
     }
 
     #[core::prelude::v1::test]

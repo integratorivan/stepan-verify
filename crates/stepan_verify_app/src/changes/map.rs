@@ -735,7 +735,14 @@ pub fn sig_lines(n: &MapNode, mode: Mode) -> usize {
     if chars == 0 { 0 } else { lines_for(chars, SIG_CHARS, SIG_MAX_LINES) }
 }
 
-/// Card height: role row, title, code name, signature, file row.
+/// Card on the canvas at rest: role row and the human title only. The code
+/// name, signature and file show when you point at it (the card grows over
+/// its neighbours) and in the side panel.
+pub fn card_height(n: &MapNode) -> f32 {
+    8. + 15. + 4. + title_lines(n) as f32 * TITLE_LINE + 9.
+}
+
+/// Card height with everything: role row, title, code name, signature, file row.
 pub fn node_height(n: &MapNode, mode: Mode) -> f32 {
     let sig = sig_lines(n, mode);
     let name = if shows_code_name(n) { 2. + lines_for(n.name.chars().count(), NAME_CHARS, 1) as f32 * NAME_LINE } else { 0. };
@@ -848,7 +855,7 @@ fn layout_group(g: &Graph, members: &[usize], mode: Mode) -> (Vec<(usize, f32, f
         let mut y = 0.;
         for &li in col {
             let i = members[li];
-            let h = node_height(&g.nodes[i], mode);
+            let h = card_height(&g.nodes[i]);
             out.push((i, x, y, h));
             y += h + ROW_GAP;
         }
@@ -858,9 +865,11 @@ fn layout_group(g: &Graph, members: &[usize], mode: Mode) -> (Vec<(usize, f32, f
     (out, width, height)
 }
 
-/// The whole canvas: frames in columns by the links between them (users left,
-/// what they use right), tests last; cards laid out inside each frame.
-pub fn canvas_layout(g: &Graph, mode: Mode) -> Canvas {
+/// The whole canvas: frames packed in rows as wide as `target_w` (the view
+/// at 100%), so the map fills the screen instead of one long strip. Order:
+/// features first (callers before what they use), then helpers, infra,
+/// context, tests last.
+pub fn canvas_layout(g: &Graph, mode: Mode, target_w: f32) -> Canvas {
     let n = g.nodes.len();
     let mut boxes = vec![None; n];
     let mut frames: Vec<Option<GroupBox>> = vec![None; g.groups.len()];
@@ -874,7 +883,7 @@ pub fn canvas_layout(g: &Graph, mode: Mode) -> Canvas {
     if visible.is_empty() {
         return Canvas { boxes, groups: frames, width: 0., height: 0. };
     }
-    // Frame levels by links between frames; tests and context go last.
+    // Levels by links between frames: users before what they use.
     let local: HashMap<usize, usize> = visible.iter().enumerate().map(|(li, &gi)| (gi, li)).collect();
     let tail = |gi: usize| matches!(g.groups[gi].kind, GroupKind::Tests);
     let cross: Vec<(usize, usize)> = g
@@ -886,42 +895,48 @@ pub fn canvas_layout(g: &Graph, mode: Mode) -> Canvas {
             (a != b && !tail(a) && !tail(b)).then_some((*local.get(&a)?, *local.get(&b)?))
         })
         .collect();
-    let mut level = levels(visible.len(), &cross);
-    let max = level.iter().enumerate().filter(|(li, _)| !tail(visible[*li])).map(|(_, &l)| l).max().unwrap_or(0);
-    for (li, &gi) in visible.iter().enumerate() {
-        if tail(gi) {
-            level[li] = max + 1;
-        }
-    }
-    let cols = level.iter().max().map_or(1, |m| m + 1);
-    let mut columns: Vec<Vec<usize>> = vec![Vec::new(); cols];
-    for (li, &gi) in visible.iter().enumerate() {
-        columns[level[li]].push(gi);
-    }
-    for col in &mut columns {
-        col.sort_by_key(|&gi| (g.groups[gi].kind, gi));
-    }
-    let mut x = 0.;
-    let mut height: f32 = 0.;
-    for col in columns.iter().filter(|c| !c.is_empty()) {
-        let mut y = 0.;
-        let mut col_w: f32 = 0.;
-        for &gi in col {
-            let Some((cards, cw, ch)) = &content[gi] else { continue };
-            let w = (cw + GROUP_PAD * 2.).max(NODE_W + GROUP_PAD * 2.);
+    let level = levels(visible.len(), &cross);
+    let mut order: Vec<usize> = visible.clone();
+    order.sort_by_key(|&gi| (tail(gi), g.groups[gi].kind, level[local[&gi]], gi));
+    // Shelf packing: left to right, a new row when the next frame would pass the edge.
+    let sized: Vec<(usize, f32, f32, f32)> = order
+        .iter()
+        .map(|&gi| {
+            let (_, cw, ch) = content[gi].as_ref().unwrap();
+            // Room for the title next to its chips (kind, proof level), not just the cards.
+            let title_w = (g.groups[gi].title.chars().count() as f32 * 8.6 + 230.).min(620.);
+            let w = (cw + GROUP_PAD * 2.).max(NODE_W + GROUP_PAD * 2.).max(title_w);
             let head = group_head(&g.groups[gi], w);
-            let h = head + ch + GROUP_PAD;
-            frames[gi] = Some(GroupBox { x, y, w, h, head });
+            (gi, w, head, head + ch + GROUP_PAD)
+        })
+        .collect();
+    let limit = target_w.max(sized.iter().map(|s| s.1).fold(0., f32::max));
+    let (mut x, mut y, mut row_h, mut width): (f32, f32, f32, f32) = (0., 0., 0., 0.);
+    for (gi, w, head, h) in sized {
+        if x > 0. && x + w > limit {
+            x = 0.;
+            y += row_h + GROUP_GAP_Y;
+            row_h = 0.;
+        }
+        frames[gi] = Some(GroupBox { x, y, w, h, head });
+        if let Some((cards, _, _)) = &content[gi] {
             for &(i, cx, cy, chh) in cards {
                 boxes[i] = Some((x + GROUP_PAD + cx, y + head + cy, chh));
             }
-            y += h + GROUP_GAP_Y;
-            col_w = col_w.max(w);
         }
-        height = height.max(y - GROUP_GAP_Y);
-        x += col_w + GROUP_GAP_X;
+        width = width.max(x + w);
+        row_h = row_h.max(h);
+        x += w + GROUP_GAP_X;
     }
-    Canvas { boxes, groups: frames, width: x - GROUP_GAP_X, height }
+    Canvas { boxes, groups: frames, width, height: y + row_h }
+}
+
+/// The frame to open the canvas on: the first feature, else the first frame.
+pub fn main_frame(g: &Graph, c: &Canvas) -> Option<GroupBox> {
+    let first = |kind: Option<GroupKind>| {
+        g.groups.iter().enumerate().filter(|(_, gr)| kind.is_none_or(|k| gr.kind == k)).find_map(|(gi, _)| c.groups[gi])
+    };
+    first(Some(GroupKind::Feature)).or_else(|| first(None))
 }
 
 /// Width of a DTO label on a link.
@@ -1105,7 +1120,7 @@ mod tests {
         let r = report(&json);
         let g = build_report(&r);
         for mode in [Mode::Before, Mode::After, Mode::Diff] {
-            let c = canvas_layout(&g, mode);
+            let c = canvas_layout(&g, mode, 1200.);
             let frames: Vec<GroupBox> = c.groups.iter().flatten().copied().collect();
             for (i, a) in frames.iter().enumerate() {
                 for b in &frames[i + 1..] {
@@ -1126,16 +1141,40 @@ mod tests {
             }
             assert_eq!(c.boxes[g.index("e").unwrap()].is_some(), mode != Mode::After);
         }
-        let c = canvas_layout(&g, Mode::After);
-        let fx = |key: &str| c.groups[g.group_index(key).unwrap()].unwrap().x;
-        // The feature uses the helpers: helpers to the right; tests last.
-        assert!(fx("f") < fx("hp") && fx("hp") < fx("__tests"));
+        let c = canvas_layout(&g, Mode::After, 1200.);
+        let at = |key: &str| {
+            let b = c.groups[g.group_index(key).unwrap()].unwrap();
+            (b.y, b.x)
+        };
+        // Reading order: the feature, then the helpers it uses, tests last.
+        assert!(at("f") < at("hp") && at("hp") < at("__tests"));
         // Six helpers wrap into two columns of the frame.
         let xs: HashSet<i32> = ["h", "h2", "h3", "h4", "h5", "h6"].iter().map(|k| c.boxes[g.index(k).unwrap()].unwrap().0 as i32).collect();
         assert_eq!(xs.len(), 2);
         let a = &g.nodes[g.index("a").unwrap()];
         assert_eq!(sig_lines(a, Mode::After), SIG_MAX_LINES);
         assert!(node_height(a, Mode::After) > node_height(&g.nodes[g.index("c").unwrap()], Mode::After));
+        // At rest a card is just the role row and the title.
+        assert!(card_height(a) < node_height(a, Mode::After));
+        assert_eq!(c.boxes[g.index("a").unwrap()].unwrap().2, card_height(a));
+    }
+
+    #[core::prelude::v1::test]
+    fn frames_pack_into_rows_as_wide_as_the_view() {
+        // Six independent features: a narrow view wraps them into rows, a wide one keeps one row.
+        let features: Vec<String> = (0..6).map(|i| format!(r#"{{"id":"f{i}","title":"Фича {i}","nodes":["n{i}"]}}"#)).collect();
+        let nodes: Vec<String> = (0..6).map(|i| format!(r#"{{"id":"n{i}","name":"N{i}"}}"#)).collect();
+        let r = report(&format!(r#"{{"code":{{"added":[{}]}},"features":[{}]}}"#, nodes.join(","), features.join(",")));
+        let g = build_report(&r);
+        let narrow = canvas_layout(&g, Mode::After, 700.);
+        let rows: HashSet<i32> = narrow.groups.iter().flatten().map(|b| b.y as i32).collect();
+        assert!(rows.len() >= 3, "{rows:?}");
+        assert!(narrow.width <= 700. + 1.);
+        let wide = canvas_layout(&g, Mode::After, 4000.);
+        let rows: HashSet<i32> = wide.groups.iter().flatten().map(|b| b.y as i32).collect();
+        assert_eq!(rows.len(), 1);
+        // Opens on the first feature frame.
+        assert_eq!(main_frame(&g, &narrow), narrow.groups[0]);
     }
 
     #[core::prelude::v1::test]
