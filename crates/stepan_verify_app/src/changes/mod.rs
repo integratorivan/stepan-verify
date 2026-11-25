@@ -736,10 +736,11 @@ impl ChangesView {
             (RunKind::Batch, Some((_, base_dir, base_meta))) => self.write_batch_context(&dir, base_dir, base_meta),
             _ => self.write_full_context(&dir),
         };
-        // The flow map as it is now: the reviewer reads it and proposes changes.
-        let flows_file = flowmap::path(&self.input.cwd);
-        if flows_file.exists() {
-            let _ = fs::copy(&flows_file, dir.join("flows.yaml"));
+        // The flow map as it is now (compiled from the flow language): the reviewer reads it and proposes changes.
+        if let Ok(Some(map)) = FlowMap::load(&self.input.cwd) {
+            if let Ok(text) = serde_yaml::to_string(&map) {
+                let _ = fs::write(dir.join("flows.yaml"), text);
+            }
         }
         match written {
             Ok(edits) => meta.edits = edits,
@@ -2141,7 +2142,7 @@ impl ChangesView {
                                                 .primary()
                                                 .icon(IconName::Check)
                                                 .label("Принять в карту")
-                                                .tooltip(format!("Записать в {}", flowmap::FILE))
+                                                .tooltip(format!("Записать в {}", flowmap::DIR))
                                                 .on_click(cx.listener(|this, _, _, cx| this.decide_proposal(true, cx))),
                                         )
                                     }

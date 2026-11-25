@@ -358,7 +358,7 @@ fn render_edge(e: &Edge) -> String {
 }
 
 /// `test: path::name  covers: 1, 2  at: 2026-…  title: Текст`
-pub fn parse_proof(text: &str, d: &mut Diags, line: usize) -> Option<Proof> {
+fn parse_proof(text: &str, d: &mut Diags, line: usize) -> Option<Proof> {
     let Some((kind, rest)) = split_key(text) else {
         d.error(line, "доказательство пишется как «test: путь», «screenshot: путь», «video: …», «cli: команда» или «manual: что проверено»");
         return None;

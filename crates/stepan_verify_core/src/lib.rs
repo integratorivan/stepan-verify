@@ -6,6 +6,7 @@ pub mod cli;
 pub mod config;
 pub mod docs;
 pub mod events;
+pub mod flowdsl;
 pub mod flows;
 pub mod flowscan;
 pub mod flowsync;

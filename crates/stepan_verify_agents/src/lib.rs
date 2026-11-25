@@ -145,8 +145,9 @@ pub(crate) fn docs_env(cmd: &mut std::process::Command, spec: &SessionSpec) {
     if !spec.env.iter().any(|(k, _)| k == "STEPAN_VERIFY_DOCS") {
         cmd.env("STEPAN_VERIFY_DOCS", docs_dir());
     }
-    let flows = spec.cwd.join(FLOWS_FILE);
-    if flows.is_file() && !spec.env.iter().any(|(k, _)| k == "STEPAN_VERIFY_FLOWS") {
+    // The flow-language folder; an older single-file map until Stepan migrates it.
+    let flows = [spec.cwd.join(FLOWS_DIR), spec.cwd.join(FLOWS_FILE)].into_iter().find(|p| p.exists());
+    if let Some(flows) = flows.filter(|_| !spec.env.iter().any(|(k, _)| k == "STEPAN_VERIFY_FLOWS")) {
         cmd.env("STEPAN_VERIFY_FLOWS", flows);
     }
     // `stepan_verify memory …` from any session: the app's own binary on PATH,
@@ -168,7 +169,10 @@ pub(crate) fn docs_env(cmd: &mut std::process::Command, spec: &SessionSpec) {
     }
 }
 
-/// The project's flow map, relative to its root (same as `stepan_verify_core::flows::FILE`).
+/// The project's flow map folder (flow language), relative to its root
+/// (same as `stepan_verify_core::flows::DIR`).
+pub const FLOWS_DIR: &str = ".stepan_verify/flows";
+/// The older single-file map (`stepan_verify_core::flows::FILE`).
 pub const FLOWS_FILE: &str = ".stepan_verify/flows.yaml";
 
 /// Sessions working on a board task (`STEPAN_VERIFY_TASK` in their env) may run

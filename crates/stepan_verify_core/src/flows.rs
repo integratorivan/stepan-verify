@@ -1,9 +1,13 @@
 //! The project's user-flow map: which features exist, how a user reaches
-//! them, and what proves they work («что есть → как дойти → чем доказано»).
+//! them, and what proves they work («что есть → как дойти → чем доказано»),
+//! plus the navigation of the whole app (start → screens → transitions).
 //!
-//! Lives in the project repo at `.stepan_verify/flows.yaml`, so agents read it
-//! as the shared vocabulary for the product. Sessions propose changes to it
-//! ([`FlowProposal`]); you accept them and they are applied with [`FlowMap::apply`].
+//! Lives in the project repo as `.stepan_verify/flows/` — `app.yml` and
+//! `features/*.yml` in the flow language ([`crate::flowdsl`], `docs/FLOWS.md`),
+//! so agents and people read and edit it as the shared vocabulary for the
+//! product. Sessions propose changes ([`FlowProposal`]); you accept them and
+//! they are applied with [`FlowMap::apply`]. The older single
+//! `.stepan_verify/flows.yaml` is migrated on first load.
 
 use std::{
     collections::BTreeSet,
@@ -18,10 +22,44 @@ use serde::{Deserialize, Serialize};
 
 use crate::Home;
 
+/// The flows folder (flow language), relative to the repo root.
+pub const DIR: &str = crate::flowdsl::DIR;
+/// The pre-language single-file map; migrated to [`DIR`] on first load.
 pub const FILE: &str = ".stepan_verify/flows.yaml";
 
+/// The legacy single-file map. Prefer [`dir`] / [`exists`] / [`stamp`].
 pub fn path(repo: &Path) -> PathBuf {
     repo.join(FILE)
+}
+
+/// The flows folder of a repo.
+pub fn dir(repo: &Path) -> PathBuf {
+    repo.join(DIR)
+}
+
+/// The repo has a map (either form).
+pub fn exists(repo: &Path) -> bool {
+    dir(repo).is_dir() || path(repo).is_file()
+}
+
+/// Newest modification among the map's files: «the map changed on disk».
+pub fn stamp(repo: &Path) -> Option<SystemTime> {
+    let root = dir(repo);
+    let mut newest = modified(&path(repo));
+    let mut visit = |p: &Path| {
+        if let Some(m) = modified(p) {
+            newest = Some(newest.map_or(m, |n| n.max(m)));
+        }
+    };
+    for sub in [root.clone(), root.join(crate::flowdsl::FEATURES)] {
+        visit(&sub);
+        if let Ok(rd) = fs::read_dir(&sub) {
+            for e in rd.flatten() {
+                visit(&e.path());
+            }
+        }
+    }
+    newest
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -39,6 +77,128 @@ pub struct FlowMap {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub synced_commit: Option<String>,
     pub updated_at: Option<DateTime<Utc>>,
+    /// Navigation of the whole app: where it starts and how screens connect (`app.yml`).
+    #[serde(skip_serializing_if = "AppNav::is_empty")]
+    pub nav: AppNav,
+}
+
+/// The whole app as a graph: an explicit start, screens, transitions between them.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppNav {
+    /// The app's display name.
+    pub app: String,
+    /// The first screen: «Запуск».
+    pub start: String,
+    pub screens: Vec<Screen>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Screen {
+    pub name: String,
+    /// page | dialog | sheet | tab | panel | external.
+    pub kind: String,
+    pub route: String,
+    pub about: String,
+    pub edges: Vec<Edge>,
+}
+
+/// «Из этого экрана можно перейти туда, сделав вот это» (and the feature it belongs to).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Edge {
+    pub to: String,
+    pub action: String,
+    /// Feature title this transition belongs to, if any.
+    pub feature: String,
+}
+
+impl AppNav {
+    pub fn is_empty(&self) -> bool {
+        self.screens.is_empty() && self.start.is_empty()
+    }
+
+    pub fn screen(&self, name: &str) -> Option<&Screen> {
+        self.screens.iter().find(|s| s.name == name)
+    }
+
+    /// Transitions that lead into a screen: (from, edge).
+    pub fn incoming<'a>(&'a self, name: &'a str) -> impl Iterator<Item = (&'a Screen, &'a Edge)> + 'a {
+        self.screens.iter().flat_map(move |s| s.edges.iter().filter(move |e| e.to == name).map(move |e| (s, e)))
+    }
+
+    /// Screens by distance from the start (BFS levels), in declaration order
+    /// within a level; screens the start does not reach come last, one level each
+    /// group of unreachable roots.
+    pub fn levels(&self) -> Vec<Vec<usize>> {
+        let n = self.screens.len();
+        let index = |name: &str| self.screens.iter().position(|s| s.name == name);
+        let mut level = vec![usize::MAX; n];
+        let mut out: Vec<Vec<usize>> = Vec::new();
+        let mut roots: Vec<usize> = index(&self.start).into_iter().collect();
+        if roots.is_empty() && n > 0 {
+            roots.push(0);
+        }
+        loop {
+            let mut frontier: Vec<usize> = roots.drain(..).filter(|&i| level[i] == usize::MAX).collect();
+            let base = out.len();
+            let mut depth = 0;
+            while !frontier.is_empty() {
+                for &i in &frontier {
+                    level[i] = base + depth;
+                }
+                if out.len() <= base + depth {
+                    out.push(Vec::new());
+                }
+                out[base + depth].extend(frontier.iter().copied());
+                let mut next = Vec::new();
+                for &i in &frontier {
+                    for e in &self.screens[i].edges {
+                        if let Some(j) = index(&e.to) {
+                            if level[j] == usize::MAX && !next.contains(&j) && !frontier.contains(&j) {
+                                next.push(j);
+                            }
+                        }
+                    }
+                }
+                next.sort();
+                frontier = next;
+                depth += 1;
+            }
+            // Unreached screens: start again from the first of them.
+            match (0..n).find(|&i| level[i] == usize::MAX) {
+                Some(i) => roots.push(i),
+                None => break,
+            }
+        }
+        for l in &mut out {
+            l.sort();
+        }
+        out
+    }
+
+    /// Screens a feature goes through: its `starts_at`, every step screen and
+    /// the targets of edges tagged with its title.
+    pub fn feature_screens(&self, f: &Feature) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut add = |s: &str| {
+            if !s.is_empty() && !out.iter().any(|x| x == s) {
+                out.push(s.to_owned());
+            }
+        };
+        add(&f.starts_at);
+        for s in f.steps() {
+            add(&s.screen);
+        }
+        for s in &self.screens {
+            for e in s.edges.iter().filter(|e| e.feature == f.title) {
+                add(&s.name);
+                add(&e.to);
+            }
+        }
+        out
+    }
 }
 
 /// An entry point the map does not describe on purpose.
@@ -71,9 +231,12 @@ pub struct Feature {
     /// how the coverage check knows the feature accounts for them.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<String>,
-    /// `draft` while only inventoried (paths not described yet).
+    /// done | in_progress | planned | broken, or `draft` while only inventoried.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub status: String,
+    /// The screen (from the app navigation) the feature starts on.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub starts_at: String,
     pub paths: Vec<FlowPath>,
     pub proofs: Vec<Proof>,
 }
@@ -138,26 +301,37 @@ pub enum Freshness {
 }
 
 impl FlowMap {
-    /// The map of a repo; `None` when it has none yet.
+    /// The map of a repo; `None` when it has none yet. Reads the flow
+    /// language folder; an older `flows.yaml` is migrated into it once
+    /// (and kept as `flows.yaml.bak`). Syntax errors fail with file:line.
     pub fn load(repo: &Path) -> Result<Option<FlowMap>> {
+        if let Some((map, diags)) = crate::flowdsl::compile(repo)? {
+            if let Some(errors) = crate::flowdsl::errors_text(&diags) {
+                return Err(anyhow::anyhow!("карта флоу с ошибками ({}):\n{errors}", dir(repo).display()));
+            }
+            return Ok(Some(map));
+        }
         let p = path(repo);
         if !p.exists() {
             return Ok(None);
         }
         let text = fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
-        let map = serde_yaml::from_str(&text).with_context(|| format!("parse {}", p.display()))?;
-        Ok(Some(map))
+        let map: FlowMap = serde_yaml::from_str(&text).with_context(|| format!("parse {}", p.display()))?;
+        map.migrate(repo)?;
+        Ok(crate::flowdsl::compile(repo)?.map(|(m, _)| m).or(Some(map)))
     }
 
-    pub fn save(&self, repo: &Path) -> Result<()> {
-        let p = path(repo);
-        fs::create_dir_all(p.parent().unwrap_or(repo))?;
-        let header = "# Карта флоу проекта (stepan_verify): фичи → пути пользователя → доказательства.\n\
-                      # Агенты: читайте как общий словарь продукта; правки предлагайте через отчёт «Изменения».\n";
-        let tmp = p.with_extension("yaml.tmp");
-        fs::write(&tmp, format!("{header}{}", serde_yaml::to_string(self)?))?;
-        fs::rename(tmp, &p)?;
+    /// One-time move from `flows.yaml` to the flow language folder.
+    fn migrate(&self, repo: &Path) -> Result<()> {
+        crate::flowdsl::write(repo, self, true)?;
+        let old = path(repo);
+        fs::rename(&old, old.with_extension("yaml.bak")).with_context(|| format!("rename {}", old.display()))?;
         Ok(())
+    }
+
+    /// Write the map as flow files (only files whose meaning changed).
+    pub fn save(&self, repo: &Path) -> Result<()> {
+        crate::flowdsl::write(repo, self, false)
     }
 
     pub fn feature(&self, id: &str) -> Option<&Feature> {
@@ -590,7 +764,47 @@ features:
         map.features[0].proofs.clear();
         assert_eq!(map.features[0].freshness(&dir), Freshness::Missing);
         map.save(&dir).unwrap();
-        assert_eq!(FlowMap::load(&dir).unwrap().unwrap(), map);
+        // The flow language keeps meaning; ids become positions / title slugs.
+        let back = FlowMap::load(&dir).unwrap().unwrap();
+        assert_eq!(back.features[0].title, map.features[0].title);
+        assert_eq!(back.features[0].paths[0].title, "Из ежедневной карты");
+        let steps: Vec<&str> = back.features[0].steps().map(|s| s.action.as_str()).collect();
+        assert_eq!(steps, ["Нажать «Выбрать»", "Выбрать карту"]);
+        assert_eq!(back.areas[0].title, "Награды");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn migrates_old_yaml_into_flow_files() {
+        let dir = std::env::temp_dir().join(format!("sv-flows-mig-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".stepan_verify")).unwrap();
+        fs::write(path(&dir), serde_yaml::to_string(&sample()).unwrap()).unwrap();
+        let map = FlowMap::load(&dir).unwrap().unwrap();
+        assert_eq!(map.features.len(), 1);
+        assert!(!path(&dir).exists() && path(&dir).with_extension("yaml.bak").exists());
+        assert!(dir.join(DIR).join("features/rewards.joker.yml").exists());
+        assert!(stamp(&dir).is_some() && exists(&dir));
+        // Second load reads the folder.
+        assert_eq!(FlowMap::load(&dir).unwrap().unwrap().features[0].title, "Выбор карты Джокера");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn navigation_levels_from_start() {
+        let nav = AppNav {
+            app: "X".into(),
+            start: "Запуск".into(),
+            screens: vec![
+                Screen { name: "Вход".into(), edges: vec![Edge { to: "Дашборд".into(), ..Default::default() }], ..Default::default() },
+                Screen { name: "Запуск".into(), edges: vec![Edge { to: "Вход".into(), ..Default::default() }, Edge { to: "Дашборд".into(), ..Default::default() }], ..Default::default() },
+                Screen { name: "Дашборд".into(), edges: vec![Edge { to: "Сессия".into(), ..Default::default() }], ..Default::default() },
+                Screen { name: "Сессия".into(), ..Default::default() },
+                Screen { name: "Отладка".into(), ..Default::default() },
+            ],
+        };
+        // Start first; both «Вход» and «Дашборд» one step away; orphans last.
+        assert_eq!(nav.levels(), vec![vec![1], vec![0, 2], vec![3], vec![4]]);
+        assert_eq!(nav.incoming("Дашборд").count(), 2);
     }
 }
