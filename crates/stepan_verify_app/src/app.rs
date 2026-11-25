@@ -665,6 +665,9 @@ impl AppView {
 
     pub fn show(&mut self, page: Page, cx: &mut Context<Self>) {
         self.page = page;
+        if page != Page::Settings {
+            crate::corner::silence(cx);
+        }
         // The docs reader may hold a native web view: it must hide off-page.
         self.docs.update(cx, |d, cx| d.set_visible(page == Page::Docs, cx));
         if page == Page::Skills {

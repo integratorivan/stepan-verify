@@ -308,7 +308,8 @@ pub fn render(app: &AppView, _: &mut Window, cx: &mut Context<AppView>) -> impl 
                 .child(div().text_size(px(12.5)).text_color(p.muted).child(update_line)),
         );
 
-    div().id("settings").size_full().overflow_y_scroll().child(
+    let corner = crate::corner::render(app, &p, cx);
+    div().relative().size_full().child(div().id("settings").size_full().overflow_y_scroll().child(
         v_flex()
             .w_full()
             .max_w(px(940.))
@@ -394,7 +395,8 @@ pub fn render(app: &AppView, _: &mut Window, cx: &mut Context<AppView>) -> impl 
                     .child(ui::mono(format!("Хранится в {home}/config.toml"), &theme).min_w_0().truncate().text_size(px(11.)).text_color(p.faint))
                     .child(ui::mono(format!("Stepan {} · gpui-kit", env!("CARGO_PKG_VERSION")), &theme).flex_shrink_0().text_size(px(11.)).text_color(p.faint)),
             ),
-    )
+    ))
+    .children(corner)
 }
 
 fn tilde(path: &std::path::Path) -> String {

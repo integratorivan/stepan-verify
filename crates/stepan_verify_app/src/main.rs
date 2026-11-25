@@ -1,6 +1,7 @@
 mod app;
 mod attach;
 mod changes;
+mod corner;
 mod board;
 mod dashboard;
 mod distill;
@@ -85,6 +86,7 @@ fn main() {
         workspace::init(&home, cx);
         ui::apply_fonts(cx);
         zoom::init(cx);
+        corner::init(cx);
         update::init(cx);
         attach::init(cx);
         let options = WindowOptions {
