@@ -140,6 +140,8 @@ pub fn project_roots(sessions: &[SessionSummary]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     for s in sessions {
         let Some(cwd) = &s.cwd else { continue };
+        // A session in a worktree counts for its main checkout.
+        let cwd = &crate::worktree::project_root(cwd);
         let text = cwd.to_string_lossy();
         if text.starts_with("/private/") || text.starts_with("/tmp") || text.contains("/worktrees/") || text.contains("/.t3/") {
             continue;

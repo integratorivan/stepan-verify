@@ -466,9 +466,11 @@ fn snapshot(title: &str, entries: &[&Entry]) -> String {
 // ------------------------------------------------------------------ project
 
 /// The project an agent works in, as memory and docs name it: the folder name
-/// of the git root above `cwd` (or `cwd` itself); None for the home folder.
+/// of the git root above `cwd` (or `cwd` itself), the main checkout's for a
+/// linked worktree; None for the home folder.
 pub fn project_of(cwd: &Path) -> Option<String> {
-    let root = cwd.ancestors().find(|d| d.join(".git").exists()).unwrap_or(cwd);
+    let cwd = crate::worktree::project_root(cwd);
+    let root = cwd.ancestors().find(|d| d.join(".git").exists()).unwrap_or(&cwd);
     if dirs::home_dir().is_some_and(|h| h == root) {
         return None;
     }

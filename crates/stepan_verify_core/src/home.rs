@@ -17,6 +17,7 @@ use anyhow::Result;
 ///   memory/            what agents must remember: the user's corrections, don'ts,
 ///                      project facts (log.jsonl + snapshots, see `memory` module)
 ///   automations/       proactive triggers (schedules, watchers)
+///   worktrees/<project>/<task-id>/   a task's own git worktree (branch stepan/<task-id>)
 ///   state/             app-owned state (session links, event logs);
 ///     stepan.db        open tabs, session index, last transcripts (see `store`)
 /// ```
@@ -44,6 +45,8 @@ impl Home {
     pub fn state(&self) -> PathBuf { self.root.join("state") }
     /// Scratch output per session (before/after media and the like).
     pub fn tmp(&self) -> PathBuf { self.root.join("tmp") }
+    /// Separate checkouts of tasks: `worktrees/<project>/<task-id>` (see `worktree`).
+    pub fn worktrees(&self) -> PathBuf { self.root.join("worktrees") }
 
     /// Create the folder layout if missing. Never overwrites existing files.
     pub fn ensure(&self) -> Result<()> {

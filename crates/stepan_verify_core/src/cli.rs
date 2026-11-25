@@ -7,14 +7,14 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
 
-use crate::{Board, Home, NewTask, Task, TaskStatus};
+use crate::{Board, Home, NewTask, Task, TaskStatus, worktree::Isolation};
 
 pub const USAGE: &str = "\
 stepan_verify task — доска задач stepan_verify (~/.stepan_verify/tasks)
 
   stepan_verify task list [--ready] [--status STATUS] [--json]
   stepan_verify task show [ID]
-  stepan_verify task create TITLE [--body TEXT] [--cwd DIR] [--label k=v]... [--depends ID]... [--attach PATH]... [--inbox]
+  stepan_verify task create TITLE [--body TEXT] [--cwd DIR] [--label k=v]... [--depends ID]... [--attach PATH]... [--inbox] [--isolation worktree|here]
   stepan_verify task claim [ID | --ready [--label k=v]] [--by NAME] [--lease 1h]
   stepan_verify task renew [ID] [--by NAME] [--lease 1h]
   stepan_verify task log [ID] TEXT [--by NAME]
@@ -33,7 +33,7 @@ struct Args {
 
 impl Args {
     fn parse(raw: &[String]) -> Self {
-        const VALUED: [&str; 9] = ["--status", "--body", "--cwd", "--label", "--depends", "--attach", "--by", "--lease", "--json-unused"];
+        const VALUED: [&str; 10] = ["--status", "--body", "--cwd", "--label", "--depends", "--attach", "--by", "--lease", "--isolation", "--json-unused"];
         let mut positional = Vec::new();
         let mut flags = Vec::new();
         let mut it = raw.iter();
@@ -88,7 +88,7 @@ pub fn run(home: &Home, raw: &[String]) -> Result<String> {
             if args.has("--json") {
                 let rows: Vec<_> = shown
                     .iter()
-                    .map(|t| serde_json::json!({"id": t.id, "title": t.meta.title, "status": t.meta.status, "labels": t.meta.labels, "claimed_by": t.meta.claimed_by, "cwd": t.meta.cwd, "attachments": t.meta.attachments}))
+                    .map(|t| serde_json::json!({"id": t.id, "title": t.meta.title, "status": t.meta.status, "labels": t.meta.labels, "claimed_by": t.meta.claimed_by, "cwd": t.meta.cwd, "worktree": t.meta.worktree, "branch": t.meta.branch, "attachments": t.meta.attachments}))
                     .collect();
                 return Ok(serde_json::to_string_pretty(&rows)?);
             }
@@ -109,6 +109,12 @@ pub fn run(home: &Home, raw: &[String]) -> Result<String> {
         "create" | "add" => {
             let title = args.positional.first().context("нужен заголовок")?.clone();
             let cwd = args.value("--cwd").map(PathBuf::from).map(|p| p.canonicalize().unwrap_or(p));
+            let isolation = match args.value("--isolation").as_deref() {
+                None | Some("auto") => None,
+                Some("worktree") => Some(Isolation::Worktree),
+                Some("here") => Some(Isolation::Here),
+                Some(other) => bail!("--isolation: worktree, here или auto, а не `{other}`"),
+            };
             board.create(
                 NewTask {
                     title,
@@ -123,6 +129,7 @@ pub fn run(home: &Home, raw: &[String]) -> Result<String> {
                         .map(|p| p.canonicalize().unwrap_or(p))
                         .collect(),
                     status: if args.has("--inbox") { TaskStatus::Inbox } else { TaskStatus::Todo },
+                    isolation,
                 },
                 &by,
             )?
@@ -158,7 +165,12 @@ pub fn run(home: &Home, raw: &[String]) -> Result<String> {
         "help" | "--help" | "-h" => return Ok(USAGE.to_owned()),
         other => bail!("неизвестная команда `{other}`\n\n{USAGE}"),
     };
-    Ok(line(&task, &board.tasks()))
+    let mut out = line(&task, &board.tasks());
+    // The CLI never deletes a copy: removing it is the user's click in Stepan.
+    if let (true, Some(wt)) = (cmd == "done" || task.meta.status == TaskStatus::Done, &task.meta.worktree) {
+        out.push_str(&format!("\nОтдельная копия осталась: {} — удалить можно в Stepan, «Удалить копию»", wt.display()));
+    }
+    Ok(out)
 }
 
 fn env_task() -> Result<String> {
@@ -172,6 +184,9 @@ fn line(t: &Task, all: &[Task]) -> String {
     }
     if let Some(by) = &t.meta.claimed_by {
         parts.push(format!("взял: {by}"));
+    }
+    if let Some(branch) = t.meta.branch.as_ref().filter(|_| t.meta.worktree.is_some()) {
+        parts.push(format!("копия: {branch}"));
     }
     let deps = t.open_dependencies(all);
     if !deps.is_empty() {
@@ -232,6 +247,25 @@ mod tests {
         let show = run(&home, &s(&["show", &id])).unwrap();
         assert!(show.contains(&format!("{id}.files/shot.png")) && show.contains(&format!("{id}.files/shot-2.png")), "{show}");
         assert!(run(&home, &s(&["create", "x", "--attach", "/nope/missing.png"])).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn done_keeps_the_copy_and_says_so() {
+        let root = std::env::temp_dir().join(format!("stepan_verify-cli-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = Home { root: root.clone() };
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let out = run(&home, &s(&["create", "Правка", "--isolation", "worktree"])).unwrap();
+        let id = out.split_whitespace().next().unwrap().to_owned();
+        let board = Board::new(home.clone());
+        assert_eq!(board.get(&id).unwrap().meta.isolation, Some(Isolation::Worktree));
+        let copy = root.join("worktrees/p").join(&id);
+        board.set_worktree(&id, "me", Some(copy.clone()), Some(format!("stepan/{id}")), "").unwrap();
+        let out = run(&home, &s(&["status", &id, "done"])).unwrap();
+        assert!(out.contains("Отдельная копия осталась") && out.contains(&copy.display().to_string()), "{out}");
+        assert_eq!(board.get(&id).unwrap().meta.worktree, Some(copy));
+        assert!(run(&home, &s(&["create", "x", "--isolation", "maybe"])).is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -1,7 +1,8 @@
 use std::{path::PathBuf, time::Duration};
 
 use gpui_kit::component::{
-    ActiveTheme, IconName, Sizable as _, WindowExt as _,
+    ActiveTheme, IconName,
+    button::ButtonVariant, Sizable as _, WindowExt as _,
     notification::Notification,
     resizable::{h_resizable, resizable_panel},
     switch::Switch,
@@ -13,6 +14,7 @@ use gpui_kit::*;
 use crate::zoom::px;
 use crate::ui::PressButton;
 use stepan_verify_core::{Board, Home, Provider, SessionSummary, Task as BoardTask, TaskStatus};
+use stepan_verify_core::worktree::{self, Cleanup, Isolation};
 
 use crate::{
     dashboard,
@@ -146,6 +148,8 @@ pub struct AppView {
     pub selected_task: Option<String>,
     /// Pick up ready tasks automatically (up to the configured limit at once).
     pub autopilot: bool,
+    /// Tasks whose separate copy is being made; their session starts after.
+    pub(crate) preparing: std::collections::HashSet<String>,
     pub skills: Vec<String>,
     docs: Entity<DocsView>,
     flows: Entity<crate::flows::FlowsView>,
@@ -235,6 +239,7 @@ impl AppView {
             board: Board::new(home.clone()),
             selected_task: None,
             autopilot: false,
+            preparing: Default::default(),
             skills: home.list_skills(),
             home,
             page: Page::Dashboard,
@@ -464,24 +469,193 @@ impl AppView {
         self.reload_tasks(cx);
     }
 
-    /// Claim a task for an agent and start a session on it.
+    /// Claim a task for an agent and start a session on it — in a separate
+    /// copy of the project when the task asks for one or someone already
+    /// works in the project (see `worktree::resolve`).
     pub fn run_task(&mut self, id: &str, provider: Provider, window: &mut Window, cx: &mut Context<Self>) {
         let agent = provider.label().to_lowercase();
         let task = match self.board.claim(id, &agent, LEASE) {
             Ok(task) => task,
             Err(err) => return Self::toast_error(window, err, cx),
         };
+        self.reload_tasks(cx);
+        match worktree::resolve(&task, &self.tasks, &self.live_cwds(cx)) {
+            Isolation::Here => self.start_task_session(task, provider, window, cx),
+            Isolation::Worktree => self.prepare_worktree(task, provider, window, cx),
+        }
+    }
+
+    fn start_task_session(&mut self, task: BoardTask, provider: Provider, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.new(|cx| SessionView::start_task(provider, &task, window, cx));
         self.adopt(view, window, cx);
         window.push_notification(Notification::info(format!("{} взял задачу", provider.label())).title(task.meta.title.clone()), cx);
         self.reload_tasks(cx);
     }
 
+    /// Folders where agents work right now: open sessions here and live ones outside.
+    fn live_cwds(&self, cx: &App) -> Vec<PathBuf> {
+        let open = self.open_sessions.iter().map(|v| v.read(cx)).filter(|v| v.status != Status::Exited).map(|v| v.cwd().to_owned());
+        open.chain(self.external.iter().filter_map(|e| e.summary.cwd.clone())).collect()
+    }
+
+    /// Make the task's copy off the UI thread, then start its session there.
+    /// A failure never falls back to the main checkout: the task waits for you.
+    fn prepare_worktree(&mut self, task: BoardTask, provider: Provider, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(cwd) = task.meta.cwd.clone() else { return self.start_task_session(task, provider, window, cx) };
+        let (home, id) = (self.home.clone(), task.id.clone());
+        self.preparing.insert(id.clone());
+        window.push_notification(Notification::info("Готовлю отдельную копию проекта…").title(task.meta.title.clone()), cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let made = cx
+                .background_spawn({
+                    let id = id.clone();
+                    async move { worktree::create(&home, &cwd, &id) }
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| this.worktree_ready(&id, provider, made, window, cx)).ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn worktree_ready(&mut self, id: &str, provider: Provider, made: anyhow::Result<worktree::Created>, window: &mut Window, cx: &mut Context<Self>) {
+        self.preparing.remove(id);
+        let created = match made {
+            Ok(created) => created,
+            Err(err) => {
+                let question = format!("Не получилось сделать отдельную копию: {err:#}. Выбери «Здесь» в задаче или поправь причину — и верни в работу.");
+                if let Err(err) = self.board.block(id, "stepan_verify", &question) {
+                    eprintln!("stepan_verify: board: {err:#}");
+                }
+                window.push_notification(Notification::error(format!("Отдельная копия: {err:#}")), cx);
+                return self.reload_tasks(cx);
+            }
+        };
+        let text = format!("{} · {}", created.path.display(), created.notes.join(" · "));
+        let task = self.board.set_worktree(id, "stepan_verify", Some(created.path.clone()), Some(created.branch.clone()), &text);
+        if let Some(failed) = &created.setup_failed {
+            let _ = self.board.log(id, "stepan_verify", failed);
+            window.push_notification(Notification::warning(failed.clone()).title("Подготовка копии"), cx);
+        }
+        match task {
+            // You may have returned or closed the task while the copy was made.
+            Ok(task) if task.meta.status == TaskStatus::InProgress => self.start_task_session(task, provider, window, cx),
+            Ok(_) => self.reload_tasks(cx),
+            Err(err) => Self::toast_error(window, err, cx),
+        }
+    }
+
     pub fn set_task_status(&mut self, id: &str, status: TaskStatus, window: &mut Window, cx: &mut Context<Self>) {
-        if let Err(err) = self.board.set_status(id, "me", status) {
+        match self.board.set_status(id, "me", status) {
+            Ok(task) if status == TaskStatus::Done && task.meta.worktree.is_some() => self.offer_worktree_cleanup(id, true, window, cx),
+            Ok(_) => {}
+            Err(err) => Self::toast_error(window, err, cx),
+        }
+        self.reload_tasks(cx);
+    }
+
+    pub fn set_task_isolation(&mut self, id: &str, isolation: Option<Isolation>, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(err) = self.board.set_isolation(id, "me", isolation) {
             Self::toast_error(window, err, cx);
         }
         self.reload_tasks(cx);
+    }
+
+    /// See what removing the task's copy would lose, then ask. `done`: the
+    /// task was just accepted (quiet when the copy is already gone).
+    pub fn offer_worktree_cleanup(&mut self, id: &str, done: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(task) = self.board.get(id) else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            let state = cx
+                .background_spawn({
+                    let task = task.clone();
+                    async move { worktree::cleanup_state(&task) }
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| this.ask_cleanup(task, state, done, window, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Ask before removing: what goes depends on what the copy holds, and
+    /// with uncommitted changes «Оставить» is the safe answer.
+    fn ask_cleanup(&mut self, task: BoardTask, state: anyhow::Result<Cleanup>, done: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let path = task.meta.worktree.as_deref().map(|p| p.display().to_string()).unwrap_or_default();
+        let branch = task.meta.branch.clone().unwrap_or_default();
+        let lead = if done { "Задача принята. " } else { "" };
+        let (title, text, ok, force, delete_branch) = match state {
+            Err(err) => return Self::toast_error(window, err, cx),
+            Ok(Cleanup::Gone) => {
+                let _ = self.board.set_worktree(&task.id, "me", None, task.meta.branch.clone(), "копии уже нет на диске");
+                if !done {
+                    window.push_notification(Notification::info("Копии уже нет на диске"), cx);
+                }
+                return self.reload_tasks(cx);
+            }
+            Ok(Cleanup::Clean) => (
+                "Удалить копию?",
+                format!("{lead}В копии нет несохранённых правок, ветка {branch} влита или пустая. Удалим папку {path} и ветку."),
+                "Удалить копию",
+                false,
+                true,
+            ),
+            Ok(Cleanup::Unmerged(n)) => (
+                "Удалить копию, ветку оставить?",
+                format!("{lead}В ветке {branch} {n} {} не влиты в основную ветку. Папку {path} удалим, ветка останется в репозитории.", commits_word(n)),
+                "Удалить копию",
+                false,
+                false,
+            ),
+            Ok(Cleanup::Dirty(n)) => (
+                "В копии есть несохранённые правки",
+                format!("{lead}{n} {} в {path} изменены или не добавлены в git. Если удалить копию, эти правки пропадут; ветка {branch} останется.", files_word(n)),
+                "Удалить с правками",
+                true,
+                false,
+            ),
+        };
+        let this = cx.entity().downgrade();
+        let id = task.id.clone();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (this, id) = (this.clone(), id.clone());
+            alert
+                .title(title)
+                .description(text.clone())
+                .confirm()
+                .ok_text(ok)
+                .ok_variant(if force { ButtonVariant::Danger } else { ButtonVariant::Primary })
+                .cancel_text("Оставить")
+                .on_ok(move |_, window, cx| {
+                    this.update(cx, |this, cx| this.remove_worktree(&id, force, delete_branch, window, cx)).ok();
+                    true
+                })
+        });
+    }
+
+    fn remove_worktree(&mut self, id: &str, force: bool, delete_branch: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(task) = self.board.get(id) else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            let removed = cx
+                .background_spawn({
+                    let task = task.clone();
+                    async move { worktree::remove(&task, force, delete_branch) }
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                let branch = task.meta.branch.clone().filter(|_| !delete_branch);
+                let note = match &branch {
+                    Some(b) => format!("копия удалена, ветка {b} осталась"),
+                    None => "копия и ветка удалены".to_owned(),
+                };
+                match removed.and_then(|()| this.board.set_worktree(&task.id, "me", None, branch, &note)) {
+                    Ok(_) => window.push_notification(Notification::success(note).title(task.meta.title.clone()), cx),
+                    Err(err) => Self::toast_error(window, err, cx),
+                }
+                this.reload_tasks(cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The open session working on a task, if any.
@@ -499,7 +673,11 @@ impl AppView {
             .and_then(|s| s.split_once(':').map(|(_, native)| native.to_owned()))
             .and_then(|native| self.sessions.iter().find(|s| s.id == native).cloned());
         match summary {
-            Some(summary) => {
+            Some(mut summary) => {
+                // A worktree task resumes in its copy, wherever the index thought it ran.
+                if let Some(cwd) = self.tasks.iter().find(|t| t.id == id).filter(|t| t.meta.worktree.is_some()).and_then(worktree::session_cwd) {
+                    summary.cwd = Some(cwd);
+                }
                 self.open_session(&summary, window, cx);
                 if let Some(view) = self.open_sessions.last() {
                     view.update(cx, |v, _| v.task_id = Some(id.to_owned()));
@@ -555,6 +733,12 @@ impl AppView {
             }
             if matches!(v.status, Status::Running | Status::Loading) {
                 let _ = self.board.renew(&id, &agent, LEASE);
+            }
+        }
+        // A copy being prepared (a long `pnpm install`) keeps its claim.
+        for id in &self.preparing {
+            if let Some(by) = self.tasks.iter().find(|t| &t.id == id).and_then(|t| t.meta.claimed_by.clone()) {
+                let _ = self.board.renew(id, &by, LEASE);
             }
         }
         self.board.release_expired();
@@ -802,6 +986,8 @@ impl AppView {
         let mut dirs: Vec<PathBuf> = Vec::new();
         for s in &self.sessions {
             let Some(cwd) = &s.cwd else { continue };
+            // A session in a worktree (a task's copy) stands for its main checkout.
+            let cwd = &worktree::project_root(cwd);
             // Scratch places, not projects: temp dirs, t3code worktrees, Codex Desktop chats.
             let codex_chats = dirs_home().join("Documents/Codex");
             let skip = cwd.starts_with("/private/tmp")
@@ -836,6 +1022,7 @@ impl AppView {
                 v.task_id.is_some() && matches!(v.status, Status::Running | Status::Loading)
             })
             .count()
+            + self.preparing.len()
     }
 
     fn nav_item(&self, label: &'static str, icon: impl Into<Icon>, page: Page, count: Option<(String, bool)>, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1219,4 +1406,20 @@ fn update_card(p: &Palette, theme: &gpui_kit::component::Theme, cx: &mut Context
             })
             .into_any_element(),
     )
+}
+
+fn commits_word(n: usize) -> &'static str {
+    match (n % 10, n % 100) {
+        (1, r) if r != 11 => "коммит",
+        (2..=4, r) if !(12..=14).contains(&r) => "коммита",
+        _ => "коммитов",
+    }
+}
+
+fn files_word(n: usize) -> &'static str {
+    match (n % 10, n % 100) {
+        (1, r) if r != 11 => "файл",
+        (2..=4, r) if !(12..=14).contains(&r) => "файла",
+        _ => "файлов",
+    }
 }

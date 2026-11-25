@@ -141,7 +141,7 @@ impl SessionView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let project = cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let project = stepan_verify_core::worktree::project_name(&cwd).unwrap_or_default();
         let title = first_line(&prompt, 70);
         let spec = SessionSpec {
             provider: agent_provider(provider),
@@ -161,8 +161,9 @@ impl SessionView {
 
     /// Work on a board task: the agent gets the task as its first message and
     /// `STEPAN_VERIFY_TASK` / `STEPAN_VERIFY_AGENT` plus `stepan_verify` on PATH, so it can log and complete.
+    /// Runs in the task's own copy when it has one.
     pub fn start_task(provider: Provider, task: &BoardTask, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let cwd = task.meta.cwd.clone().unwrap_or_else(home_dir);
+        let cwd = stepan_verify_core::worktree::session_cwd(task).unwrap_or_else(home_dir);
         let project = task.project_name().unwrap_or_default();
         let mut env = vec![
             ("STEPAN_VERIFY_TASK".to_owned(), task.id.clone()),
@@ -200,6 +201,13 @@ impl SessionView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let mut spec = spec;
+        // Memory written from a worktree belongs to the main project, not to the task id folder.
+        if !spec.env.iter().any(|(k, _)| k == "STEPAN_VERIFY_PROJECT") {
+            if let Some(name) = docs_project(Some(&spec.cwd)) {
+                spec.env.push(("STEPAN_VERIFY_PROJECT".to_owned(), name));
+            }
+        }
         let native_id = spec.native_id.clone();
         let cwd = spec.cwd.clone();
         let following = follow.is_some();
@@ -1562,10 +1570,11 @@ fn docs_brief(provider: Provider, cwd: Option<&std::path::Path>, session: Option
     Some(stepan_verify_core::docs::agent_brief(&stepan_verify_core::Home::locate(), project.as_deref(), &provider.label().to_lowercase(), session))
 }
 
-/// The docs folder of a session in `cwd`: its last segment, none for $HOME.
+/// The docs folder of a session in `cwd`: its last segment (the main
+/// checkout's for a worktree), none for $HOME.
 pub(crate) fn docs_project(cwd: Option<&std::path::Path>) -> Option<String> {
     let cwd = cwd.filter(|c| *c != home_dir())?;
-    cwd.file_name().map(|n| n.to_string_lossy().into_owned())
+    stepan_verify_core::worktree::project_name(cwd)
 }
 
 fn agent_provider(p: Provider) -> stepan_verify_agents::Provider {

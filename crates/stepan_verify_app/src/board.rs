@@ -15,7 +15,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use crate::zoom::px;
 use crate::ui::PressButton;
-use stepan_verify_core::{Provider, Task, TaskStatus};
+use stepan_verify_core::{Provider, Task, TaskStatus, worktree::Isolation};
 
 use crate::{
     app::AppView,
@@ -385,6 +385,7 @@ fn render_card(app: &AppView, task: &Task, done: bool, p: &Palette, theme: &Them
                     .flex_wrap()
                     .when_some(project, |this, name| this.child(ui::chip(name, p, theme)))
                     .when_some(provider, |this, pr| this.child(ui::provider_chip(pr, p, theme)))
+                    .when(task.meta.worktree.is_some(), |this| this.child(ui::branch_chip("копия", p, theme)))
                     .children(task.meta.labels.iter().map(|l| ui::chip(l.clone(), p, theme))),
             )
             .child(
@@ -417,6 +418,7 @@ fn render_card(app: &AppView, task: &Task, done: bool, p: &Palette, theme: &Them
                     .child(div().min_w_0().truncate().font_weight(FontWeight::SEMIBOLD).text_color(p.fg).child(first)),
             )
         }
+        TaskStatus::InProgress if app.preparing.contains(&task.id) => card.child(preparing_line(p)),
         TaskStatus::InProgress => {
             let who = task.meta.claimed_by.clone().unwrap_or_else(|| "агент".into());
             let lease = task.meta.lease_until.map(|t| (t - Utc::now()).num_minutes().max(0));
@@ -498,6 +500,22 @@ fn lease_line(who: &str, minutes: Option<i64>, running: bool, p: &Palette, theme
         .child(h_flex().gap(px(4.)).child("взял").child(div().font_weight(FontWeight::SEMIBOLD).text_color(p.fg).child(who.to_owned())))
         .child(div().flex_1())
         .when_some(minutes, |this, m| this.child(ui::mono(format!("ещё {m} мин"), theme).text_size(px(10.5))))
+}
+
+/// The agent waits for its separate copy (git worktree, files, setup).
+fn preparing_line(p: &Palette) -> impl IntoElement {
+    h_flex()
+        .gap(px(7.))
+        .px(px(7.))
+        .py(px(5.))
+        .rounded(px(6.))
+        .border_1()
+        .border_color(p.border)
+        .bg(p.surface2)
+        .text_size(px(11.5))
+        .text_color(p.muted)
+        .child(Spinner::new().xsmall().color(p.blue.solid))
+        .child("Готовлю отдельную копию…")
 }
 
 /// A 14px ring whose inner disc shrinks as the lease runs out.
@@ -671,6 +689,7 @@ fn render_detail(app: &AppView, task: &Task, p: &Palette, theme: &Theme, cx: &mu
                 })
                 .when_some(task.meta.cwd.clone(), |this, cwd| {
                     this.child(v_flex().gap(px(6.)).child(label("Папка")).child(ui::mono(cwd.display().to_string(), theme).text_color(p.muted)))
+                        .child(render_workplace(app, task, p, theme, cx))
                 })
                 .when(!task.meta.attachments.is_empty(), |this| {
                     this.child(
@@ -761,8 +780,78 @@ fn render_detail(app: &AppView, task: &Task, p: &Palette, theme: &Theme, cx: &mu
         )
 }
 
+/// «Где работать»: the choice for the next run, and the task's copy if it has one.
+fn render_workplace(app: &AppView, task: &Task, p: &Palette, theme: &Theme, cx: &mut Context<AppView>) -> impl IntoElement {
+    let current = task.meta.isolation;
+    let option = |key: &'static str, text: &'static str, value: Option<Isolation>, cx: &mut Context<AppView>| {
+        let id = task.id.clone();
+        ui::segment(key, text, current == value, p)
+            .h(px(26.))
+            .px(px(10.))
+            .text_size(px(12.5))
+            .on_click(cx.listener(move |this, _, window, cx| this.set_task_isolation(&id, value, window, cx)))
+    };
+    let hint = match current {
+        None => "Отдельная копия, если в проекте уже работает другой агент",
+        Some(Isolation::Worktree) => "Своя git-копия и ветка",
+        Some(Isolation::Here) => "Прямо в папке проекта",
+    };
+    let preparing = app.preparing.contains(&task.id);
+    let id = task.id.clone();
+    v_flex()
+        .gap(px(6.))
+        .child(ui::eyebrow("Где работать", p, theme))
+        .child(
+            h_flex()
+                .gap(px(10.))
+                .child(
+                    ui::segmented(p)
+                        .flex_shrink_0()
+                        .child(option("detail-isolation-auto", "Авто", None, cx))
+                        .child(option("detail-isolation-worktree", "Отдельная копия", Some(Isolation::Worktree), cx))
+                        .child(option("detail-isolation-here", "Здесь", Some(Isolation::Here), cx)),
+                )
+                .child(div().min_w_0().truncate().text_size(px(12.)).text_color(p.faint).child(hint)),
+        )
+        .when(preparing, |this| this.child(preparing_line(p)))
+        .when_some(task.meta.worktree.clone(), |this, path| {
+            this.child(
+                v_flex()
+                    .p(px(10.))
+                    .gap(px(6.))
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(p.border)
+                    .bg(p.surface2)
+                    .child(
+                        h_flex()
+                            .gap(px(8.))
+                            .child(ui::branch_chip(task.meta.branch.clone().unwrap_or_else(|| "копия".into()), p, theme))
+                            .child(div().flex_1())
+                            .child(
+                                PressButton::new("detail-remove-copy")
+                                    .xsmall()
+                                    .outline()
+                                    .icon(Icon::empty().path("icons/trash.svg"))
+                                    .label("Удалить копию")
+                                    .disabled(preparing)
+                                    .on_click(cx.listener(move |this, _, window, cx| this.offer_worktree_cleanup(&id, false, window, cx))),
+                            ),
+                    )
+                    .child(ui::mono(path.display().to_string(), theme).text_color(p.muted)),
+            )
+        })
+        .when(task.meta.worktree.is_none(), |this| {
+            this.when_some(task.meta.branch.clone(), |this, branch| {
+                this.child(div().text_size(px(12.)).text_color(p.faint).child(format!("Копия удалена, ветка {branch} осталась в репозитории")))
+            })
+        })
+}
+
 fn event_label(kind: &str) -> &'static str {
     match kind {
+        "isolation" => "выбрал, где работать",
+        "worktree" => "отдельная копия",
         "create" => "создал",
         "claim" => "взял в работу",
         "log" => "отметил",

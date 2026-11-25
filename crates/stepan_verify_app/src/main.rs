@@ -68,9 +68,13 @@ fn main() {
     if let Err(err) = home.ensure() {
         eprintln!("stepan_verify: cannot prepare {}: {err:#}", home.root.display());
     }
-    // `/show-me` for every Claude / Codex session; its files open in our preview.
-    for w in stepan_verify_core::showme::install_skill(&home, &stepan_verify_core::flowsync::skill_targets()).warnings {
+    // `/show-me` and `/describe-pr` for every Claude / Codex session; show-me files open in our preview.
+    let targets = stepan_verify_core::flowsync::skill_targets();
+    for w in stepan_verify_core::showme::install_skill(&home, &targets).warnings {
         eprintln!("stepan_verify: skill {}: {w}", stepan_verify_core::showme::SKILL_NAME);
+    }
+    for w in stepan_verify_core::describepr::install_skill(&home, &targets).warnings {
+        eprintln!("stepan_verify: skill {}: {w}", stepan_verify_core::describepr::SKILL_NAME);
     }
 
     let launch = app::Launch::from_args(std::env::args().skip(1));

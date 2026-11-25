@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Home,
     events::{self, Event},
+    worktree::{self, Isolation},
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +73,16 @@ pub struct TaskMeta {
     /// Where an agent works on this task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
+    /// Own git worktree or the project folder; unset = decide at run time
+    /// (see `worktree::resolve`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<Isolation>,
+    /// The task's own checkout, once made (`~/.stepan_verify/worktrees/<project>/<id>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<PathBuf>,
+    /// Its branch, `stepan/<id>`; stays when the copy is removed but the branch kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// `key=value` labels, e.g. `kind=bug`, `area=admin`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
@@ -146,9 +157,7 @@ impl Task {
     }
 
     pub fn project_name(&self) -> Option<String> {
-        self.meta.project.clone().or_else(|| {
-            self.meta.cwd.as_ref().and_then(|c| c.file_name()).map(|n| n.to_string_lossy().into_owned())
-        })
+        self.meta.project.clone().or_else(|| self.meta.cwd.as_deref().and_then(worktree::project_name))
     }
 
     pub fn lease_expired(&self, now: DateTime<Utc>) -> bool {
@@ -180,6 +189,7 @@ pub struct NewTask {
     pub labels: Vec<String>,
     pub depends_on: Vec<String>,
     pub status: TaskStatus,
+    pub isolation: Option<Isolation>,
     /// Files to attach; `create` copies them next to the task.
     pub attachments: Vec<PathBuf>,
 }
@@ -217,6 +227,7 @@ impl Board {
                 title: new.title,
                 status: new.status,
                 cwd: new.cwd,
+                isolation: new.isolation,
                 labels: new.labels,
                 depends_on: new.depends_on,
                 attachments,
@@ -317,6 +328,27 @@ impl Board {
                 task.meta.claimed_by = None;
                 task.meta.lease_until = None;
             }
+            Ok(())
+        })
+    }
+
+    pub fn set_isolation(&self, id: &str, by: &str, isolation: Option<Isolation>) -> Result<Task> {
+        let text = match isolation {
+            Some(Isolation::Worktree) => "отдельная копия",
+            Some(Isolation::Here) => "здесь",
+            None => "авто",
+        };
+        self.update(id, by, "isolation", text, |task, _| {
+            task.meta.isolation = isolation;
+            Ok(())
+        })
+    }
+
+    /// Record the task's copy (or that it is gone; a kept branch stays in `branch`).
+    pub fn set_worktree(&self, id: &str, by: &str, path: Option<PathBuf>, branch: Option<String>, text: &str) -> Result<Task> {
+        self.update(id, by, "worktree", text, |task, _| {
+            task.meta.worktree = path;
+            task.meta.branch = branch;
             Ok(())
         })
     }

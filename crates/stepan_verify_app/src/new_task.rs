@@ -5,11 +5,10 @@ use gpui_kit::component::{
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
     h_flex, v_flex,
 };
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use crate::zoom::px;
 use crate::ui::PressButton;
-use stepan_verify_core::{NewTask, TaskStatus};
+use stepan_verify_core::{NewTask, TaskStatus, worktree::Isolation};
 
 use crate::{
     attach::{self, Attachments, AttachmentsEvent},
@@ -32,6 +31,8 @@ pub struct NewTaskForm {
     attachments: Entity<Attachments>,
     /// Straight to "К работе" (agents may take it) vs "Входящие".
     ready: bool,
+    /// Separate copy, the project folder, or decide at run time (None).
+    isolation: Option<Isolation>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -54,7 +55,7 @@ impl NewTaskForm {
             cx.subscribe(&picker, |_, _, _: &Picked, cx| cx.notify()),
             cx.subscribe(&attachments, |_, _, _: &AttachmentsEvent, cx| cx.notify()),
         ];
-        Self { picker, title, body, labels, attachments, ready: true, _subscriptions: subscriptions }
+        Self { picker, title, body, labels, attachments, ready: true, isolation: None, _subscriptions: subscriptions }
     }
 
     fn can_create(&self, cx: &App) -> bool {
@@ -81,6 +82,7 @@ impl NewTaskForm {
             labels,
             depends_on: Vec::new(),
             status: if self.ready { TaskStatus::Todo } else { TaskStatus::Inbox },
+            isolation: self.isolation,
             attachments: self.attachments.read(cx).paths().to_vec(),
         }));
     }
@@ -91,31 +93,23 @@ impl Render for NewTaskForm {
         let theme = cx.theme().clone();
         let p = Palette::of(&theme);
         let field = |label: &'static str| ui::eyebrow(label, &p, &theme);
+        let segment = |id: &'static str, label: &'static str, active: bool| ui::segment(id, label, active, &p).h(px(30.)).px(px(12.)).text_size(px(13.));
         let status_button = |id: &'static str, label: &'static str, ready: bool, cx: &mut Context<Self>| {
-            let active = self.ready == ready;
-            h_flex()
-                .id(id)
-                .h(px(30.))
-                .px(px(12.))
-                .rounded(px(6.))
-                .border_1()
-                .border_color(transparent_black())
-                .text_size(px(13.))
-                .font_weight(if active { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
-                .text_color(if active { p.ink } else { p.muted })
-                .cursor_pointer()
-                .map(|this| {
-                    if active {
-                        this.bg(p.surface).border_color(p.border).shadow(ui::edge_shadow(p.border_strong, 1.))
-                    } else {
-                        this.hover(|s| s.bg(p.ink.opacity(0.04)))
-                    }
-                })
-                .child(label)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.ready = ready;
-                    cx.notify();
-                }))
+            segment(id, label, self.ready == ready).on_click(cx.listener(move |this, _, _, cx| {
+                this.ready = ready;
+                cx.notify();
+            }))
+        };
+        let isolation_button = |id: &'static str, label: &'static str, isolation: Option<Isolation>, cx: &mut Context<Self>| {
+            segment(id, label, self.isolation == isolation).on_click(cx.listener(move |this, _, _, cx| {
+                this.isolation = isolation;
+                cx.notify();
+            }))
+        };
+        let isolation_hint = match self.isolation {
+            None => "Отдельная копия, если в проекте уже работает другой агент",
+            Some(Isolation::Worktree) => "Своя git-копия и ветка stepan/<задача>",
+            Some(Isolation::Here) => "Прямо в папке проекта",
         };
         let paste = |tray: &Entity<Attachments>| {
             let tray = tray.clone();
@@ -173,17 +167,25 @@ impl Render for NewTaskForm {
                     ),
             )
             .child(v_flex().gap_2().child(field("Проект")).child(self.picker.clone()))
+            .child(
+                v_flex().gap_2().child(field("Где работать")).child(
+                    h_flex()
+                        .gap_3()
+                        .child(
+                            ui::segmented(&p)
+                                .flex_shrink_0()
+                                .child(isolation_button("isolation-auto", "Авто", None, cx))
+                                .child(isolation_button("isolation-worktree", "Отдельная копия", Some(Isolation::Worktree), cx))
+                                .child(isolation_button("isolation-here", "Здесь", Some(Isolation::Here), cx)),
+                        )
+                        .child(div().min_w_0().truncate().text_size(px(12.)).text_color(p.faint).child(isolation_hint)),
+                ),
+            )
             .child(v_flex().gap_2().child(field("Метки")).child(Input::new(&self.labels)))
             .child(
                 v_flex().gap_2().child(field("Куда")).child(
-                    h_flex()
+                    ui::segmented(&p)
                         .self_start()
-                        .p(px(3.))
-                        .gap(px(2.))
-                        .rounded(px(8.))
-                        .border_1()
-                        .border_color(p.border)
-                        .bg(p.sunken)
                         .child(status_button("to-todo", "К работе — агенты могут брать", true, cx))
                         .child(status_button("to-inbox", "Во входящие — разберу сам", false, cx)),
                 ),

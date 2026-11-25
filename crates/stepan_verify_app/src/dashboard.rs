@@ -761,7 +761,7 @@ fn project_panel(project: String, list: Vec<&SessionSummary>, archived: bool, p:
     let path = if project == "Чаты Codex" {
         "~/Documents/Codex".to_owned()
     } else {
-        list.first().and_then(|s| s.cwd.as_deref()).map(short_path).unwrap_or_default()
+        list.first().and_then(|s| s.cwd.as_deref()).map(|c| short_path(&stepan_verify_core::worktree::project_root(c))).unwrap_or_default()
     };
     let mono = theme.mono_font_family.clone();
     ui::card(p)
@@ -819,6 +819,14 @@ fn session_row(i: usize, s: &SessionSummary, archived: bool, p: &Palette, theme:
     let open = s.clone();
     let (provider, id) = (s.provider, s.id.clone());
     let active = (chrono::Utc::now() - s.updated_at).num_seconds() < ACTIVE_WINDOW_SECS;
+    // Ran in a worktree of the project (a task's copy): say which branch.
+    let branch = s.cwd.as_deref().and_then(stepan_verify_core::worktree::linked).map(|l| {
+        let b = l.branch.unwrap_or_else(|| "worktree".into());
+        match b.char_indices().nth(24) {
+            Some((i, _)) => format!("{}…", &b[..i]),
+            None => b,
+        }
+    });
     h_flex()
         .id(SharedString::from(format!("{}:{}", s.provider.label(), s.id)))
         .group(SharedString::from("session-row"))
@@ -843,6 +851,7 @@ fn session_row(i: usize, s: &SessionSummary, archived: bool, p: &Palette, theme:
         })
         .child(div().w(px(56.)).flex_shrink_0().child(ui::provider_chip(s.provider, p, theme).whitespace_nowrap()))
         .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).text_color(p.fg).child(s.title.clone()))
+        .when_some(branch, |this, b| this.child(ui::branch_chip(b, p, theme)))
         .child(div().flex_shrink_0().font_family(theme.mono_font_family.clone()).text_size(px(11.5)).text_color(p.faint).child(ago(s.updated_at)))
         // Archive (or restore): shows on hover so the list stays calm.
         .child(

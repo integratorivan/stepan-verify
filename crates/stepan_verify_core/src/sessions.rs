@@ -52,13 +52,10 @@ impl SessionSummary {
         }
     }
 
-    /// Last path segment of the working directory, used as the project name.
+    /// Last path segment of the working directory, used as the project name
+    /// (of the main checkout when the session ran in a linked worktree).
     pub fn project(&self) -> String {
-        self.cwd
-            .as_deref()
-            .and_then(Path::file_name)
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "—".into())
+        self.cwd.as_deref().and_then(crate::worktree::project_name).unwrap_or_else(|| "—".into())
     }
 }
 

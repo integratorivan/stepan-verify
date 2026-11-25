@@ -1099,7 +1099,7 @@ impl ChangesView {
         if accept {
             let mut map = self.flow_map.clone().unwrap_or_else(|| FlowMap {
                 version: 1,
-                project: cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                project: stepan_verify_core::worktree::project_name(&cwd).unwrap_or_default(),
                 ..Default::default()
             });
             map.apply(&r.flows.proposal);

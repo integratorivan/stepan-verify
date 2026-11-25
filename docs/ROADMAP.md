@@ -59,6 +59,7 @@ JSON-RPC построчно без поля `jsonrpc`: `initialize` → `initial
 - [ ] **7a. Telegram** — канал на телефон: «ждёт подтверждения / ответа» с кнопками, утренний брифинг, короткие команды
 - [ ] **7b. Инструменты** — экран MCP: какие серверы видит Claude (`~/.claude.json`, `.mcp.json` проекта, коннекторы) и Codex (`~/.codex/config.toml`), где расходятся; включить сервер обоим; политики на подтверждениях
 - [ ] **8. Git** — worktree на задачу, чекпоинты и диффы
+- [x] **8a. Отдельная копия на задачу** — `isolation: worktree | here` (авто: копия, если в проекте уже работает агент), `git worktree` в `~/.stepan_verify/worktrees/<проект>/<задача>` на ветке `stepan/<задача>`; `<repo>/.stepan_verify/workspace.yaml`: `source_ref`, `copy` (.env…), `clone` (node_modules copy-on-write при равных lockfile), `setup`; сессии из копии считаются сессиями проекта; «Удалить копию» только по клику
 
 ## Проактивность (по разбору always-on ботов, Sarah / Composio)
 

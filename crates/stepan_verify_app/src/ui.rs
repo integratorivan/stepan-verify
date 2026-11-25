@@ -317,6 +317,48 @@ pub fn chip(text: impl Into<SharedString>, p: &Palette, theme: &Theme) -> Div {
         .child(text.into())
 }
 
+/// A chip with a branch mark: a task's own copy, a session in a worktree.
+pub fn branch_chip(text: impl Into<SharedString>, p: &Palette, theme: &Theme) -> Div {
+    h_flex()
+        .flex_shrink_0()
+        .gap(px(3.))
+        .px(px(5.))
+        .rounded(px(4.))
+        .border_1()
+        .border_color(p.border)
+        .bg(p.surface2)
+        .font_family(theme.mono_font_family.clone())
+        .text_size(px(11.))
+        .text_color(p.muted)
+        .child(gpui_kit::component::Icon::empty().path("icons/git-branch.svg").size(px(11.)))
+        .child(text.into())
+}
+
+/// The sunken track of a segmented choice; children are `segment`s.
+pub fn segmented(p: &Palette) -> Div {
+    h_flex().p(px(3.)).gap(px(2.)).rounded(px(8.)).border_1().border_color(p.border).bg(p.sunken)
+}
+
+/// One option of a segmented choice; the caller sets the size and what a click does.
+pub fn segment(id: &'static str, label: &'static str, active: bool, p: &Palette) -> Stateful<Div> {
+    h_flex()
+        .id(id)
+        .rounded(px(6.))
+        .border_1()
+        .border_color(transparent_black())
+        .font_weight(if active { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+        .text_color(if active { p.ink } else { p.muted })
+        .cursor_pointer()
+        .map(|this| {
+            if active {
+                this.bg(p.surface).border_color(p.border).shadow(edge_shadow(p.border_strong, 1.))
+            } else {
+                this.hover(|s| s.bg(p.ink.opacity(0.04)))
+            }
+        })
+        .child(label)
+}
+
 /// Small filled dot (activity marker).
 pub fn dot(color: Hsla) -> Div {
     div().size(px(7.)).flex_shrink_0().rounded_full().bg(color)

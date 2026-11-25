@@ -4,6 +4,7 @@
 pub mod archive;
 pub mod cli;
 pub mod config;
+pub mod describepr;
 pub mod docs;
 pub mod events;
 pub mod flowdsl;
@@ -17,6 +18,7 @@ pub mod showme;
 pub mod skills;
 pub mod store;
 pub mod tasks;
+pub mod worktree;
 
 pub use home::Home;
 pub use store::Store;
