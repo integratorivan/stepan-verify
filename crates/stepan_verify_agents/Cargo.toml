@@ -1,0 +1,11 @@
+[package]
+name = "stepan_verify_agents"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+anyhow.workspace = true
+async-channel = "2"
+similar = "2"
+base64 = "0.22"

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="crates/iv3-app/assets/icon/icon-512.png" width="160" alt="Stepan">
+  <img src="crates/stepan_verify_app/assets/icon/icon-512.png" width="160" alt="Stepan">
 </p>
 
 <h1 align="center">Stepan</h1>
@@ -19,10 +19,10 @@
 - **Дашборд**: живые сессии карточками («Пульт») — шаги, текущий шаг, «нужен ответ / нужно подтверждение» с решением прямо на карточке.
 - **Сессии**: лента как в t3code — сообщения, инструменты, диффы, картинки; запуск и продолжение Claude Code и Codex.
 - **Изменения**: «Карта» — нативный граф функций «было / стало / разница», итерации, батч-обновления длинной сессии с решениями агента; отчёт пишет агент того же семейства, что и сессия.
-- **Задачи**: доска в духе Vercel Board — аренда задач агентами, автопилот, `iv3 task …` CLI.
+- **Задачи**: доска в духе Vercel Board — аренда задач агентами, автопилот, `stepan_verify task …` CLI.
 - **Документы** («Полка»): разборы, решения, фактура проектов и вопросы к тебе. Агенты пишут их сами по правилам, которые Stepan даёт каждой сессии, а после сессии отдельный агент записывает итоги.
 - **Скиллы** («Связи»: кто видит скилл и как Claude/Codex его используют).
-- Общая папка `~/.iv3`: skills, tasks, docs, automations, state. (Внутреннее имя — iv3: папка, CLI `iv3 task …`, крейты.)
+- Общая папка `~/.stepan_verify`: skills, tasks, docs, automations, state. Данные из старой `~/.iv3` переносятся сами при первом запуске.
 
 ## Установка
 
@@ -35,9 +35,9 @@
 ## Сборка из исходников
 
 ```sh
-cargo build -p iv3-app        # Rust 1.100 (rust-toolchain.toml)
-./target/debug/iv3            # окно
-./target/debug/iv3 task list  # CLI доски
+cargo build -p stepan_verify_app        # Rust 1.100 (rust-toolchain.toml)
+./target/debug/stepan_verify            # окно
+./target/debug/stepan_verify task list  # CLI доски
 scripts/bundle.sh             # dist/Stepan.app, .zip и .dmg для этого Mac
 ```
 
@@ -49,4 +49,4 @@ scripts/bundle.sh             # dist/Stepan.app, .zip и .dmg для этого 
 
 Подробности — `docs/ROADMAP.md`.
 
-Шрифт интерфейса по умолчанию — [Instrument Sans](https://github.com/Instrument/instrument-sans) (SIL Open Font License, `crates/iv3-app/assets/fonts/OFL.txt`); шрифты текста и кода меняются в настройках.
+Шрифт интерфейса по умолчанию — [Instrument Sans](https://github.com/Instrument/instrument-sans) (SIL Open Font License, `crates/stepan_verify_app/assets/fonts/OFL.txt`); шрифты текста и кода меняются в настройках.

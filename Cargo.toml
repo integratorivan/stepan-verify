@@ -25,6 +25,6 @@ gpui-pre-platform = { opt-level = 3 }
 rustybuzz = { opt-level = 3 }
 taffy = { opt-level = 3 }
 ttf-parser = { opt-level = 3 }
-iv3-core = { opt-level = 3 }
+stepan_verify_core = { opt-level = 3 }
 serde_json = { opt-level = 3 }
 memchr = { opt-level = 3 }

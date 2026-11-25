@@ -1,0 +1,32 @@
+[package]
+name = "stepan_verify_app"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "stepan_verify"
+path = "src/main.rs"
+
+[dependencies]
+gpui-kit = { workspace = true, features = ["syntect"] }
+# Real browser rendering for HTML previews (WKWebView). Same backend as gpui-kit: no `gpui-fast`.
+gpui-webview = "0.11.0"
+wry = { version = "0.53.3", package = "lb-wry" }
+stepan_verify_core = { path = "../stepan_verify_core" }
+stepan_verify_agents = { path = "../stepan_verify_agents" }
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Image dimensions from the file header, to reserve layout space before decoding.
+imagesize = "0.14"
+# Word diff of node signatures on the change map (same crate stepan_verify_agents uses for hunks).
+similar = "2"
+# Release versions from GitHub tags (updates).
+semver = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Dock icon when running as a bare binary (dev builds); bundles use AppIcon.icns.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSData"] }
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSResponder"] }
