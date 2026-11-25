@@ -159,7 +159,15 @@ struct CodexIndexRow {
 }
 
 pub fn scan_codex(codex_home: &Path, cutoff: SystemTime) -> Vec<SessionSummary> {
-    let names: HashMap<String, String> = File::open(codex_home.join("session_index.jsonl"))
+    let names = codex_names(codex_home);
+    let mut files = Vec::new();
+    collect_rollouts(&codex_home.join("sessions"), cutoff, &mut files);
+    codex_summaries_named(&names, files)
+}
+
+/// Thread names from ~/.codex/session_index.jsonl.
+fn codex_names(codex_home: &Path) -> HashMap<String, String> {
+    File::open(codex_home.join("session_index.jsonl"))
         .map(|f| {
             BufReader::new(f)
                 .lines()
@@ -168,11 +176,10 @@ pub fn scan_codex(codex_home: &Path, cutoff: SystemTime) -> Vec<SessionSummary> 
                 .filter_map(|r| Some((r.id, r.thread_name?)))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
 
-    let mut files = Vec::new();
-    collect_rollouts(&codex_home.join("sessions"), cutoff, &mut files);
-
+fn codex_summaries_named(names: &HashMap<String, String>, files: Vec<(PathBuf, SystemTime)>) -> Vec<SessionSummary> {
     files
         .into_iter()
         .filter_map(|(path, mtime)| {
@@ -235,5 +242,220 @@ fn one_line(s: &str) -> String {
     match line.char_indices().nth(80) {
         Some((i, _)) => format!("{}…", &line[..i]),
         None => line.to_owned(),
+    }
+}
+
+// ------------------------------------------------------------ indexed scan
+//
+// The plain scan reads every transcript of the last two weeks (gigabytes) on
+// each start. The index in the store remembers, per file, its size, mtime and
+// how far it was read; transcripts only grow, so a later scan reads just the
+// new tail, and an unchanged file costs one stat.
+
+use crate::store::{FileRow, Store, mtime_ns};
+
+/// Sessions as the last scan saw them, without touching a transcript: what the
+/// window shows the moment it opens.
+pub fn cached(store: &Store, max_age: Duration) -> Vec<SessionSummary> {
+    let cutoff = mtime_ns(SystemTime::now() - max_age);
+    let mut out: Vec<SessionSummary> = store
+        .files()
+        .into_iter()
+        .filter(|(_, row)| row.mtime_ns >= cutoff)
+        .filter_map(|(path, row)| summary_of(path, &row))
+        .collect();
+    out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    out
+}
+
+/// Scan reading only what changed since the last scan, and save the index.
+pub fn scan_indexed(store: &Store, max_age: Duration) -> Vec<SessionSummary> {
+    let home = dirs::home_dir().unwrap_or_default();
+    scan_indexed_in(store, &home.join(".claude/projects"), &home.join(".codex"), max_age)
+}
+
+fn scan_indexed_in(store: &Store, claude_projects: &Path, codex_home: &Path, max_age: Duration) -> Vec<SessionSummary> {
+    let cutoff = SystemTime::now() - max_age;
+    let prev = store.files();
+    let mut rows: HashMap<PathBuf, FileRow> = HashMap::new();
+    let stat = |path: &Path| fs::metadata(path).ok().and_then(|m| Some((m.modified().ok()?, m.len() as i64)));
+
+    for dir in fs::read_dir(claude_projects).into_iter().flatten().flatten() {
+        for entry in fs::read_dir(dir.path()).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|x| x != "jsonl") {
+                continue;
+            }
+            let Some((mtime, size)) = stat(&path).filter(|(t, _)| *t >= cutoff) else { continue };
+            let mtime = mtime_ns(mtime);
+            let old = prev.get(&path).filter(|r| r.provider == Some(Provider::Claude));
+            let mut row = match old {
+                Some(r) if r.size == size && r.mtime_ns == mtime => r.clone(),
+                // Grown: read on from where the last scan stopped.
+                Some(r) if size >= r.size => r.clone(),
+                _ => FileRow {
+                    provider: Some(Provider::Claude),
+                    id: path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+                    ..Default::default()
+                },
+            };
+            if row.offset < size {
+                read_claude_tail(&path, &mut row);
+            }
+            row.size = size;
+            row.mtime_ns = mtime;
+            rows.insert(path, row);
+        }
+    }
+
+    let names = codex_names(codex_home);
+    let mut files = Vec::new();
+    collect_rollouts(&codex_home.join("sessions"), cutoff, &mut files);
+    for (path, mtime) in files {
+        let size = fs::metadata(&path).map_or(0, |m| m.len() as i64);
+        let mtime = mtime_ns(mtime);
+        let mut row = match prev.get(&path).filter(|r| r.provider == Some(Provider::Codex)) {
+            Some(r) if r.size == size && r.mtime_ns == mtime => r.clone(),
+            // Cheap to read again: the first line and a few hundred more at most.
+            Some(r) if r.first_prompt.is_some() => FileRow { size, mtime_ns: mtime, ..r.clone() },
+            _ => {
+                let meta = first_line_json(&path);
+                let payload = meta.as_ref().and_then(|m| m.get("payload"));
+                FileRow {
+                    provider: Some(Provider::Codex),
+                    mtime_ns: mtime,
+                    size,
+                    offset: size,
+                    id: payload.and_then(|p| p.get("id")).and_then(Value::as_str).unwrap_or_default().to_owned(),
+                    title: None,
+                    first_prompt: codex_first_prompt(&path),
+                    cwd: payload.and_then(|p| p.get("cwd")).and_then(Value::as_str).map(PathBuf::from),
+                }
+            }
+        };
+        // Thread names change any time; take the current one.
+        row.title = names.get(&row.id).cloned();
+        rows.insert(path, row);
+    }
+
+    if let Err(err) = store.replace_files(&rows) {
+        eprintln!("stepan_verify: session index: {err:#}");
+    }
+    let mut out: Vec<SessionSummary> = rows.into_iter().filter_map(|(path, row)| summary_of(path, &row)).collect();
+    out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    out
+}
+
+/// Read a Claude transcript from `row.offset` to its last complete line,
+/// picking up the first human prompt (and its cwd) and the latest title.
+fn read_claude_tail(path: &Path, row: &mut FileRow) {
+    use std::io::{Seek, SeekFrom};
+    let Ok(mut file) = File::open(path) else { return };
+    if file.seek(SeekFrom::Start(row.offset as u64)).is_err() {
+        return;
+    }
+    let mut reader = BufReader::with_capacity(1 << 20, file);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let Ok(n) = reader.read_until(b'\n', &mut buf) else { break };
+        // A line still being written is read next time, whole.
+        if n == 0 || buf.last() != Some(&b'\n') {
+            break;
+        }
+        row.offset += n as i64;
+        let Ok(line) = std::str::from_utf8(&buf) else { continue };
+        let is_title = line.contains("\"type\":\"ai-title\"") || line.contains("\"type\":\"custom-title\"");
+        let is_user = row.first_prompt.is_none() && line.contains("\"type\":\"user\"");
+        if !is_title && !is_user {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if is_title {
+            if let Some(t) = v.get("customTitle").or_else(|| v.get("aiTitle")).and_then(Value::as_str) {
+                row.title = Some(t.to_owned());
+            }
+        } else if let Some(text) = claude_user_text(&v) {
+            row.cwd = v.get("cwd").and_then(Value::as_str).map(PathBuf::from);
+            row.first_prompt = Some(one_line(&text));
+        }
+    }
+}
+
+fn summary_of(file: PathBuf, row: &FileRow) -> Option<SessionSummary> {
+    let provider = row.provider?;
+    if row.id.is_empty() {
+        return None;
+    }
+    let title = match provider {
+        // Sessions with no human prompt are hook/sidechain noise.
+        Provider::Claude => row.title.clone().or_else(|| row.first_prompt.clone())?.clone(),
+        Provider::Codex => row.title.clone().or_else(|| row.first_prompt.clone()).unwrap_or_else(|| "Без названия".into()),
+    };
+    if provider == Provider::Claude && row.first_prompt.is_none() {
+        return None;
+    }
+    let secs = row.mtime_ns.div_euclid(1_000_000_000);
+    let nanos = row.mtime_ns.rem_euclid(1_000_000_000) as u32;
+    Some(SessionSummary {
+        provider,
+        id: row.id.clone(),
+        title,
+        cwd: row.cwd.clone(),
+        updated_at: DateTime::from_timestamp(secs, nanos).unwrap_or_default(),
+        file,
+    })
+}
+
+/// Where Claude keeps the transcript of session `id` (any project folder).
+pub fn claude_transcript(id: &str) -> Option<PathBuf> {
+    let projects = dirs::home_dir()?.join(".claude/projects");
+    fs::read_dir(projects).ok()?.flatten().map(|d| d.path().join(format!("{id}.jsonl"))).find(|p| p.is_file())
+}
+
+#[cfg(test)]
+mod indexed_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    #[test]
+    fn reads_only_the_new_tail_and_keeps_partial_lines_for_later() {
+        let root = std::env::temp_dir().join(format!("stepan-index-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let project = root.join("claude/-x");
+        fs::create_dir_all(&project).unwrap();
+        let store = Store::open_at(&root.join("stepan.db")).unwrap();
+        let file = project.join("s1.jsonl");
+        let user = r#"{"type":"user","cwd":"/p/app","message":{"role":"user","content":"почини поиск"}}"#;
+        fs::write(&file, format!("{user}\n")).unwrap();
+        let day = Duration::from_secs(86_400);
+        let scan = |store: &Store| scan_indexed_in(store, &root.join("claude"), &root.join("codex"), day);
+
+        let first = scan(&store);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].title, "почини поиск");
+        assert_eq!(first[0].cwd.as_deref(), Some(Path::new("/p/app")));
+
+        // A title arrives, the next line is half written.
+        let mut f = fs::OpenOptions::new().append(true).open(&file).unwrap();
+        write!(f, "{}\n{}", r#"{"type":"ai-title","aiTitle":"Поиск событий"}"#, r#"{"type":"ai-ti"#).unwrap();
+        drop(f);
+        let second = scan(&store);
+        assert_eq!(second[0].title, "Поиск событий");
+        let row = &store.files()[&file];
+        assert_eq!(row.offset as usize, user.len() + 1 + r#"{"type":"ai-title","aiTitle":"Поиск событий"}"#.len() + 1);
+
+        // The half line completes; it is read whole now.
+        let mut f = fs::OpenOptions::new().append(true).open(&file).unwrap();
+        writeln!(f, "{}", r#"tle","aiTitle":"Поиск v2"}"#).unwrap();
+        drop(f);
+        assert_eq!(scan(&store)[0].title, "Поиск v2");
+        assert_eq!(cached(&store, day)[0].title, "Поиск v2");
+
+        // A deleted file leaves the index.
+        fs::remove_file(&file).unwrap();
+        assert!(scan(&store).is_empty());
+        assert!(cached(&store, day).is_empty());
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -135,6 +135,11 @@ impl DocsView {
         self.pending_open = Some(rel);
     }
 
+    /// The document open on the shelf (or about to open, while it loads).
+    pub fn selected(&self) -> Option<&str> {
+        self.selected.as_deref().or(self.pending_open.as_deref())
+    }
+
     pub fn count(&self) -> usize {
         self.docs.len()
     }

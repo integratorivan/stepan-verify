@@ -17,7 +17,8 @@ use anyhow::Result;
 ///   memory/            what agents must remember: the user's corrections, don'ts,
 ///                      project facts (log.jsonl + snapshots, see `memory` module)
 ///   automations/       proactive triggers (schedules, watchers)
-///   state/             app-owned state (session links, event logs)
+///   state/             app-owned state (session links, event logs);
+///     stepan.db        open tabs, session index, last transcripts (see `store`)
 /// ```
 #[derive(Clone, Debug)]
 pub struct Home {

@@ -492,11 +492,59 @@ pub fn peek(path: &Path) -> Vec<Item> {
 }
 
 fn items_from_lines(lines: impl Iterator<Item = String>, store: &ImageStore) -> Vec<Item> {
-    let mut mapper = Mapper::new(store.clone());
-    let mut items: Vec<Item> = Vec::new();
-    let mut index: HashMap<String, usize> = HashMap::new();
-
+    let mut feed = Feed::new(store.clone());
     for line in lines {
+        feed.push(&line);
+    }
+    feed.items
+}
+
+/// Transcript built line by line, for history and for following a file that
+/// another process keeps writing.
+pub(crate) struct Feed {
+    mapper: Mapper,
+    pub(crate) items: Vec<Item>,
+    index: HashMap<String, usize>,
+    /// A human prompt (or new agent output) came after the last end-of-turn record.
+    turn: bool,
+    /// Background tools (`run_in_background`) not yet reported by a task notification.
+    background: std::collections::HashSet<String>,
+}
+
+impl Feed {
+    pub(crate) fn new(store: ImageStore) -> Self {
+        Self { mapper: Mapper::new(store), items: Vec::new(), index: HashMap::new(), turn: false, background: Default::default() }
+    }
+
+    /// The agent is mid-turn or waits for its own background work.
+    pub(crate) fn running(&self) -> bool {
+        self.turn || !self.background.is_empty()
+    }
+
+    /// Forget everything in flight: the other process is gone.
+    pub(crate) fn settle(&mut self) {
+        self.turn = false;
+        self.background.clear();
+    }
+
+    /// Apply one record; returns the items it created or changed.
+    pub(crate) fn push(&mut self, line: &str) -> Vec<Item> {
+        if line.contains("\"subtype\":\"turn_duration\"") || line.contains("\"stop_reason\":\"end_turn\"") {
+            self.turn = false;
+        } else if line.contains("\"type\":\"assistant\"") && !line.contains("\"isSidechain\":true") {
+            // The agent is writing again, e.g. woken by a background task finishing.
+            self.turn = true;
+        }
+        // Background work finished (queued notification or its delivery).
+        if line.contains("<task-notification>") {
+            let mut rest = line;
+            while let Some(at) = rest.find("<tool-use-id>") {
+                rest = &rest[at + "<tool-use-id>".len()..];
+                let Some(end) = rest.find("</tool-use-id>") else { break };
+                self.background.remove(&rest[..end]);
+                rest = &rest[end..];
+            }
+        }
         // Cheap prefilter: hooks and other bookkeeping dominate these files.
         let wanted = line.contains("\"type\":\"user\"")
             || line.contains("\"type\":\"assistant\"")
@@ -506,32 +554,80 @@ fn items_from_lines(lines: impl Iterator<Item = String>, store: &ImageStore) -> 
             || line.contains("\"type\":\"compact_file_reference\"")
             || line.contains("\"type\":\"hook_blocking_error\"");
         if !wanted {
-            continue;
+            return Vec::new();
         }
-        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
-        for op in mapper.record(&v) {
-            match op {
-                Op::Upsert(item) => match index.get(&item.id) {
-                    Some(&ix) => items[ix] = item,
-                    None => {
-                        index.insert(item.id.clone(), items.len());
-                        items.push(item);
+        let Ok(v) = serde_json::from_str::<Value>(line) else { return Vec::new() };
+        let main = v.get("isSidechain").and_then(Value::as_bool) != Some(true);
+        match v.get("type").and_then(Value::as_str) {
+            Some("user") if main => match user_turn_mark(&v) {
+                Some(true) => self.turn = true,
+                Some(false) => self.turn = false,
+                None => {}
+            },
+            Some("assistant") if main => {
+                let blocks = v.pointer("/message/content").and_then(Value::as_array).into_iter().flatten();
+                for b in blocks.filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use")) {
+                    if b.pointer("/input/run_in_background").and_then(Value::as_bool) == Some(true) {
+                        self.background.insert(str_field(b, "id"));
                     }
-                },
-                Op::AttachToLastUser(attachments) => match items.last_mut() {
+                }
+            }
+            _ => {}
+        }
+        let mut changed = Vec::new();
+        for op in self.mapper.record(&v) {
+            match op {
+                Op::Upsert(item) => {
+                    match self.index.get(&item.id) {
+                        Some(&ix) => self.items[ix] = item.clone(),
+                        None => {
+                            self.index.insert(item.id.clone(), self.items.len());
+                            self.items.push(item.clone());
+                        }
+                    }
+                    changed.push(item);
+                }
+                Op::AttachToLastUser(attachments) => match self.items.last_mut() {
                     Some(last) if last.kind == ItemKind::User => {
                         for a in attachments {
                             if !last.attachments.contains(&a) {
                                 last.attachments.push(a);
                             }
                         }
+                        changed.push(last.clone());
                     }
                     _ => {}
                 },
             }
         }
+        changed
     }
-    items
+}
+
+/// Some(true): a human prompt starts a turn; Some(false): the turn was
+/// interrupted; None: tool results and injected context.
+fn user_turn_mark(v: &Value) -> Option<bool> {
+    if v.get("isMeta").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let texts: Vec<String> = match v.pointer("/message/content")? {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(parts) => parts
+            .iter()
+            .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+            .map(|p| str_field(p, "text"))
+            .collect(),
+        _ => return None,
+    };
+    let text = texts.join("\n");
+    let text = text.trim();
+    if text.starts_with("[Request interrupted") {
+        Some(false)
+    } else if !text.is_empty() && !text.starts_with('<') {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 // ------------------------------------------------------------------ helpers

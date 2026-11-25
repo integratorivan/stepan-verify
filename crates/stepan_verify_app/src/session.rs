@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use gpui_kit::component::{
@@ -71,6 +71,11 @@ pub struct SessionView {
     /// Board task this session works on.
     pub task_id: Option<String>,
     pub status: Status,
+    /// Replaying the transcript file of a session that runs elsewhere (a
+    /// terminal); the first message sent from here takes it over.
+    pub following: bool,
+    /// Last time the other process wrote to the transcript.
+    external_at: Option<SystemTime>,
     cwd: PathBuf,
     handle: AgentHandle,
     items: Vec<Item>,
@@ -110,7 +115,16 @@ impl SessionView {
             model: None,
             instructions: docs_brief(summary.provider, summary.cwd.as_deref(), Some(&summary.id), cx),
         };
-        Self::new(summary.provider, summary.title.clone(), summary.project(), spec, window, cx)
+        // Claude history comes from the same file either way, so always follow;
+        // a Codex rollout carries less than `thread/read`, so only while it is fresh.
+        let written = std::fs::metadata(&summary.file).and_then(|m| m.modified()).ok();
+        let follow = match summary.provider {
+            Provider::Claude => true,
+            Provider::Codex => written.is_some_and(|t| t.elapsed().unwrap_or_default() < Duration::from_secs(30 * 60)),
+        };
+        let mut this = Self::new(summary.provider, summary.title.clone(), summary.project(), spec, follow.then(|| summary.file.clone()), window, cx);
+        this.external_at = written;
+        this
     }
 
     /// Start a fresh session in `cwd` and send `prompt` (with `images`) as the first message.
@@ -135,7 +149,7 @@ impl SessionView {
             env: Vec::new(),
             model: None,
         };
-        let mut this = Self::new(provider, title, project, spec, window, cx);
+        let mut this = Self::new(provider, title, project, spec, None, window, cx);
         this.send_message(stepan_verify_agents::Outgoing { text: prompt, images }, cx);
         this
     }
@@ -164,7 +178,7 @@ impl SessionView {
             env,
             model: None,
         };
-        let mut this = Self::new(provider, task.meta.title.clone(), project, spec, window, cx);
+        let mut this = Self::new(provider, task.meta.title.clone(), project, spec, None, window, cx);
         this.task_id = Some(task.id.clone());
         // Attached images go with the message; other files are listed in it.
         let images = task.meta.attachments.iter().filter(|p| stepan_verify_agents::is_image_path(p)).cloned().collect();
@@ -177,12 +191,17 @@ impl SessionView {
         title: String,
         project: String,
         spec: SessionSpec,
+        follow: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let native_id = spec.native_id.clone();
         let cwd = spec.cwd.clone();
-        let (handle, events) = stepan_verify_agents::open(spec);
+        let following = follow.is_some();
+        let (handle, events) = match follow {
+            Some(file) => stepan_verify_agents::open_following(spec, file),
+            None => stepan_verify_agents::open(spec),
+        };
 
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
@@ -224,6 +243,8 @@ impl SessionView {
             native_id,
             task_id: None,
             status: Status::Loading,
+            following,
+            external_at: None,
             cwd,
             handle,
             items: Vec::new(),
@@ -267,7 +288,21 @@ impl SessionView {
     }
 
     pub fn interrupt(&self) {
-        self.handle.interrupt();
+        if !self.following {
+            self.handle.interrupt();
+        }
+    }
+
+    /// The other process is mid-turn: messages from here would race it.
+    pub fn busy_elsewhere(&self) -> bool {
+        self.following && self.status == Status::Running
+    }
+
+    /// Show the «runs in a terminal» notice: following and written lately.
+    fn live_elsewhere(&self) -> bool {
+        self.following
+            && (self.status == Status::Running
+                || self.external_at.is_some_and(|t| t.elapsed().unwrap_or_default() < Duration::from_secs(10 * 60)))
     }
 
     pub fn activity(&self) -> Activity {
@@ -316,6 +351,7 @@ impl SessionView {
                 if self.show_changes && self.changes.is_none() {
                     self.open_changes(cx);
                 }
+                self.save_snapshot(cx);
             }
             AgentEvent::SessionId(id) => self.native_id = Some(id),
             AgentEvent::TurnStarted => {
@@ -326,6 +362,9 @@ impl SessionView {
                 self.error = None;
             }
             AgentEvent::Upsert(item) => {
+                if self.following {
+                    self.external_at = Some(SystemTime::now());
+                }
                 // Step timing for the dashboard card: first seen → first not running.
                 let now = Instant::now();
                 let timing = self.timing.entry(item.id.clone()).or_insert((now, None));
@@ -370,6 +409,7 @@ impl SessionView {
                 if self.native_id.is_some() {
                     crate::distill::turn_finished(self.changes_input(), docs_project(Some(self.cwd.as_path())), cx);
                 }
+                self.save_snapshot(cx);
             }
             AgentEvent::Error(err) => {
                 self.error = Some(err);
@@ -428,7 +468,7 @@ impl SessionView {
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).value().trim().to_owned();
-        if (text.is_empty() && self.attachments.read(cx).is_empty()) || self.status == Status::Exited {
+        if (text.is_empty() && self.attachments.read(cx).is_empty()) || self.status == Status::Exited || self.busy_elsewhere() {
             return;
         }
         self.composer.update(cx, |c, cx| c.set_value("", window, cx));
@@ -442,6 +482,11 @@ impl SessionView {
     }
 
     fn send_message(&mut self, message: stepan_verify_agents::Outgoing, cx: &mut Context<Self>) {
+        if self.busy_elsewhere() {
+            return;
+        }
+        // From here on the session runs in stepan_verify.
+        self.following = false;
         self.handle.send_message(message);
         self.begin_turn(cx);
         self.scroller.update(cx, |s, cx| s.scroll_to_end(cx));
@@ -496,6 +541,26 @@ impl SessionView {
     }
 
     // ------------------------------------------------------------- rendering
+
+    /// Notice above the composer while the session runs in another process.
+    fn render_elsewhere(&self, theme: &Theme) -> impl IntoElement {
+        let p = Palette::of(theme);
+        let (text, note) = if self.status == Status::Running {
+            ("Агент работает в терминале", "шаги появляются здесь сами · ответить можно после конца хода")
+        } else {
+            ("Сессия запущена в терминале", "сообщение отсюда продолжит её в Stepan · в терминале её лучше закрыть")
+        };
+        h_flex()
+            .gap_2()
+            .items_center()
+            .px(px(10.))
+            .py(px(6.))
+            .rounded(px(6.))
+            .bg(p.blue.soft)
+            .child(ui::dot(p.blue.solid))
+            .child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).text_color(p.blue.text).child(text))
+            .child(ui::mono(note, theme).text_color(p.muted).truncate())
+    }
 
     fn render_row(&self, r: usize, weak: &WeakEntity<Self>, cx: &App) -> AnyElement {
         let row = match self.rows.get(r).copied() {
@@ -1000,6 +1065,43 @@ impl SessionView {
         files
     }
 
+    pub fn cwd(&self) -> &std::path::Path {
+        &self.cwd
+    }
+
+    /// Whether «Изменения» is the tab in front.
+    pub fn showing_changes(&self) -> bool {
+        self.show_changes
+    }
+
+    /// Keep this transcript for the next start (see `workspace`).
+    fn save_snapshot(&self, cx: &App) {
+        if let (Some(id), false) = (&self.native_id, self.items.is_empty()) {
+            crate::workspace::save_snapshot(self.provider, id, &self.items, cx);
+        }
+    }
+
+    /// Show the transcript saved last time until the real one arrives, so a
+    /// restored tab is not empty while a long transcript is re-read.
+    pub fn show_snapshot(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.native_id.clone() else { return };
+        let load = crate::workspace::load_snapshot(self.provider, &id, cx);
+        cx.spawn(async move |this, cx| {
+            let Some(items) = load.await else { return };
+            this.update(cx, |this, cx| {
+                if this.status != Status::Loading || !this.items.is_empty() {
+                    return; // the real transcript won
+                }
+                this.index = items.iter().enumerate().map(|(i, it)| (it.id.clone(), i)).collect();
+                this.items = items;
+                this.sync_rows(true, &HashSet::new(), cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// The report needs the transcript: while history is still loading, the tab
     /// shows a placeholder and the report starts once history arrives.
     pub fn open_changes(&mut self, cx: &mut Context<Self>) {
@@ -1240,7 +1342,8 @@ impl Render for SessionView {
             .child(div().flex_1().min_h_0().map(|this| match (&self.changes, self.status) {
                 (Some(changes), _) if self.show_changes => this.child(changes.clone()),
                 (None, _) if self.show_changes => this.child(crate::loading::transcript(&theme)),
-                (_, Status::Loading) => this.child(crate::loading::transcript(&theme)),
+                // A restored tab shows last time's transcript while the agent re-reads it.
+                (_, Status::Loading) if self.items.is_empty() => this.child(crate::loading::transcript(&theme)),
                 _ => this.child(transcript),
             }))
             .child(
@@ -1267,6 +1370,7 @@ impl Render for SessionView {
                             this.child(crate::loading::working("session-working", self.activity().line, elapsed, &theme))
                         })
                         .child(self.render_approvals(cx))
+                        .when(self.live_elsewhere() && !self.show_changes, |this| this.child(self.render_elsewhere(&theme)))
                         // The report is for reading: no composer over it.
                         .when(!self.show_changes, |this| this.child(
                             v_flex()
@@ -1300,8 +1404,29 @@ impl Render for SessionView {
                                         ))
                                         .child(attach::screenshot_button("screenshot", &self.attachments, cx))
                                         .child(div().flex_1())
-                                        .child(ui::mono(if running { "агент работает" } else { "⏎ отправить" }, &theme).text_color(p.faint).mr_2())
-                                        .child(if running {
+                                        .child(
+                                            ui::mono(
+                                                if self.busy_elsewhere() {
+                                                    "ход идёт в терминале"
+                                                } else if running {
+                                                    "агент работает"
+                                                } else {
+                                                    "⏎ отправить"
+                                                },
+                                                &theme,
+                                            )
+                                            .text_color(p.faint)
+                                            .mr_2(),
+                                        )
+                                        .child(if self.busy_elsewhere() {
+                                            PressButton::new("send")
+                                                .small()
+                                                .primary()
+                                                .icon(IconName::ArrowUp)
+                                                .label("Отправить")
+                                                .disabled(true)
+                                                .tooltip("Дождитесь конца хода: агент сейчас работает в терминале")
+                                        } else if running {
                                             PressButton::new("stop")
                                                 .small()
                                                 .outline()

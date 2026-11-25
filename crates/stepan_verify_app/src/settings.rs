@@ -39,3 +39,13 @@ pub fn agent_mode(cx: &App) -> Mode {
         AgentMode::Ask => Mode::Ask,
     }
 }
+
+/// The model a report / helper agent of `provider`'s family runs on (Настройки →
+/// «Отчёт „Изменения“»). `None` for Codex means Codex's own default.
+pub fn report_model(provider: stepan_verify_agents::Provider, cx: &App) -> Option<String> {
+    let changes = &config(cx).changes;
+    match provider {
+        stepan_verify_agents::Provider::Claude => Some(changes.model.clone()),
+        stepan_verify_agents::Provider::Codex => Some(changes.codex_model.clone()).filter(|m| !m.is_empty()),
+    }
+}

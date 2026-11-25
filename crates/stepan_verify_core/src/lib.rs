@@ -14,9 +14,11 @@ pub mod home;
 pub mod memory;
 pub mod sessions;
 pub mod skills;
+pub mod store;
 pub mod tasks;
 
 pub use home::Home;
+pub use store::Store;
 pub use sessions::{Provider, SessionSummary};
 pub use config::{AgentMode, Config};
 pub use events::Event;

@@ -1,4 +1,4 @@
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ItemKind {
     User,
     Assistant,
@@ -12,7 +12,7 @@ pub enum ItemKind {
     Plan,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ItemStatus {
     Running,
     Done,
@@ -24,7 +24,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AttachmentKind {
     Image,
     File,
@@ -33,7 +33,7 @@ pub enum AttachmentKind {
 
 /// Something shown next to a message or tool call: a screenshot, a pasted
 /// image, a mentioned file, a file the agent sent you.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Attachment {
     pub kind: AttachmentKind,
     pub path: PathBuf,
@@ -98,7 +98,7 @@ impl ImageStore {
 }
 
 /// A unified-diff hunk set for one file.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FileDiff {
     pub path: String,
     /// Hunk lines prefixed with ' ', '+', '-' or '@@'.
@@ -121,7 +121,7 @@ impl FileDiff {
 }
 
 /// One row of the transcript.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Item {
     pub id: String,
     pub kind: ItemKind,

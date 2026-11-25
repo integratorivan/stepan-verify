@@ -135,6 +135,10 @@ pub struct AppView {
     page: Page,
     pub sessions: Vec<SessionSummary>,
     pub sessions_loading: bool,
+    /// A background `rescan` is in flight.
+    rescanning: bool,
+    /// What was last written to the store as the window's open tabs and page.
+    saved_workspace: Option<crate::workspace::Workspace>,
     pub tasks: Vec<BoardTask>,
     pub board: Board,
     /// Task shown in the detail panel of the board.
@@ -160,6 +164,17 @@ pub struct AppView {
     /// Sessions put away: hidden from «Сейчас» and «Недавние».
     pub archive: stepan_verify_core::archive::Archive,
     _tick: Task<()>,
+}
+
+/// Sessions this recent are listed.
+const SESSION_AGE: Duration = Duration::from_secs(14 * 86_400);
+
+/// Scan for sessions, through the index when the store is there.
+async fn scan(store: Option<stepan_verify_core::Store>) -> Vec<SessionSummary> {
+    match store {
+        Some(store) => stepan_verify_core::sessions::scan_indexed(&store, SESSION_AGE),
+        None => stepan_verify_core::sessions::scan_all(SESSION_AGE),
+    }
 }
 
 /// How long a claim holds without renewal.
@@ -224,6 +239,8 @@ impl AppView {
             page: Page::Dashboard,
             sessions: Vec::new(),
             sessions_loading: true,
+            rescanning: false,
+            saved_workspace: None,
             docs,
             flows,
             font_pickers: None,
@@ -244,6 +261,11 @@ impl AppView {
             this.docs.update(cx, |d, _| d.open_on_load(rel));
         }
         this.autopilot = this.launch.autopilot;
+        // Last scan's list right away; the scan below only brings it up to date.
+        if let Some(store) = crate::workspace::store(cx) {
+            this.sessions = stepan_verify_core::sessions::cached(&store, SESSION_AGE);
+        }
+        this.restore_workspace(window, cx);
         this.refresh_sessions(window, cx);
         // Board heartbeat: pick up file changes, renew and expire leases, run the autopilot.
         this._tick = cx.spawn_in(window, async move |this, cx| {
@@ -259,12 +281,11 @@ impl AppView {
 
     pub fn refresh_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sessions_loading = true;
+        let store = crate::workspace::store(cx);
         self.tasks = self.board.tasks();
         self.skills = self.home.list_skills();
         cx.spawn_in(window, async move |this, cx| {
-            let sessions = cx
-                .background_spawn(async { stepan_verify_core::sessions::scan_all(Duration::from_secs(14 * 86400)) })
-                .await;
+            let sessions = cx.background_spawn(scan(store)).await;
             this.update_in(cx, |this, window, cx| {
                 this.sessions = sessions;
                 this.sessions_loading = false;
@@ -383,6 +404,7 @@ impl AppView {
             page => page,
         };
         self.show(page, cx);
+        self.persist_workspace(cx);
     }
 
     /// Hide a session from the dashboard (or bring it back).
@@ -533,10 +555,47 @@ impl AppView {
         if self.autopilot {
             self.autopilot_step(window, cx);
         }
+        self.rescan(window, cx);
+        self.persist_workspace(cx);
         if self.page == Page::Dashboard {
             self.refresh_external(cx);
         }
         cx.notify();
+    }
+
+    /// Pick up sessions started elsewhere since the last scan (a new `claude`
+    /// in a terminal) without re-reading every transcript.
+    fn rescan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rescanning || self.sessions_loading {
+            return;
+        }
+        self.rescanning = true;
+        let store = crate::workspace::store(cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let sessions = cx.background_spawn(scan(store)).await;
+            this.update_in(cx, |this, _, cx| {
+                this.rescanning = false;
+                if this.sessions_loading {
+                    return; // a full scan is on its way
+                }
+                let before = this.project_dirs();
+                this.sessions = sessions;
+                let dirs = this.project_dirs();
+                if dirs != before {
+                    this.pickers.retain(|p| p.upgrade().is_some());
+                    for picker in this.pickers.iter().filter_map(|p| p.upgrade()) {
+                        picker.update(cx, |p, cx| p.set_projects(dirs.clone(), cx));
+                    }
+                    this.flows.update(cx, |f, cx| f.set_projects(dirs.clone(), cx));
+                }
+                if this.page == Page::Dashboard {
+                    this.refresh_external(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Peek at sessions whose transcript changed in the last minutes and that
@@ -610,7 +669,103 @@ impl AppView {
         if page == Page::Skills {
             self.skills_view.update(cx, |v, cx| v.refresh_if_stale(cx));
         }
+        self.persist_workspace(cx);
         cx.notify();
+    }
+
+    /// Open tabs and the page as they are now.
+    fn workspace(&self, cx: &App) -> crate::workspace::Workspace {
+        use crate::workspace::{OpenTab, Workspace};
+        let (page, session) = match self.page {
+            Page::Dashboard => ("dashboard", None),
+            Page::Tasks => ("tasks", None),
+            Page::Flows => ("flows", None),
+            Page::Docs => ("docs", None),
+            Page::Memory => ("memory", None),
+            Page::Skills => ("skills", None),
+            Page::Settings => ("settings", None),
+            Page::Session(ix) => ("session", Some(ix)),
+        };
+        let mut open = Vec::new();
+        let mut session_at = None;
+        for (ix, view) in self.open_sessions.iter().enumerate() {
+            let v = view.read(cx);
+            // A session that has no id yet cannot be resumed.
+            let Some(id) = v.native_id.clone() else { continue };
+            if session == Some(ix) {
+                session_at = Some(open.len());
+            }
+            open.push(OpenTab {
+                provider: v.provider,
+                id,
+                title: v.title.to_string(),
+                cwd: Some(v.cwd().to_owned()),
+                task_id: v.task_id.clone(),
+                changes: v.showing_changes(),
+            });
+        }
+        let page = if page == "session" && session_at.is_none() { "dashboard" } else { page };
+        Workspace { page: page.into(), session: session_at, open, doc: self.docs.read(cx).selected().map(str::to_owned) }
+    }
+
+    /// Write the open tabs and page to the store when they changed.
+    fn persist_workspace(&mut self, cx: &App) {
+        let now = self.workspace(cx);
+        if self.saved_workspace.as_ref() != Some(&now) {
+            crate::workspace::save(&now, cx);
+            self.saved_workspace = Some(now);
+        }
+    }
+
+    /// Reopen what was open last time: session tabs (with last time's
+    /// transcript until the agent re-reads it), the «Изменения» tab, the page.
+    fn restore_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let saved = crate::workspace::load(cx);
+        for tab in &saved.open {
+            let summary = self.sessions.iter().find(|s| s.provider == tab.provider && s.id == tab.id).cloned().or_else(|| {
+                let file = match tab.provider {
+                    Provider::Claude => stepan_verify_core::sessions::claude_transcript(&tab.id)?,
+                    Provider::Codex => PathBuf::new(),
+                };
+                Some(SessionSummary {
+                    provider: tab.provider,
+                    id: tab.id.clone(),
+                    title: tab.title.clone(),
+                    cwd: tab.cwd.clone(),
+                    updated_at: chrono::Utc::now(),
+                    file,
+                })
+            });
+            // Its transcript is gone: nothing to reopen.
+            let Some(summary) = summary else { continue };
+            self.open_session(&summary, window, cx);
+            if let Some(view) = self.open_sessions.last() {
+                view.update(cx, |v, cx| {
+                    if v.task_id.is_none() {
+                        v.task_id = tab.task_id.clone();
+                    }
+                    v.show_snapshot(cx);
+                    if tab.changes {
+                        v.open_changes(cx);
+                    }
+                });
+            }
+        }
+        if let Some(rel) = saved.doc.filter(|_| self.launch.doc.is_none()) {
+            self.docs.update(cx, |d, _| d.open_on_load(rel));
+        }
+        let page = match (saved.page.as_str(), saved.session) {
+            ("session", Some(i)) if i < self.open_sessions.len() => Page::Session(i),
+            ("tasks", _) => Page::Tasks,
+            ("flows", _) => Page::Flows,
+            ("docs", _) => Page::Docs,
+            ("memory", _) => Page::Memory,
+            ("skills", _) => Page::Skills,
+            ("settings", _) => Page::Settings,
+            _ => Page::Dashboard,
+        };
+        // An explicit `--page` / `--doc` wins over last time.
+        self.show(self.launch.page.unwrap_or(page), cx);
     }
 
     pub fn live_sessions(&self, cx: &App) -> Vec<LiveSession> {

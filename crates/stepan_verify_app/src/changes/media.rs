@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, Theme, h_flex, spinner::Spinner, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use stepan_verify_agents::{AgentEvent, AgentHandle, ItemKind, Mode, Provider, SessionSpec};
+use stepan_verify_agents::{AgentEvent, AgentHandle, ItemKind, Mode, SessionSpec};
 use stepan_verify_core::config::MediaMode;
 use serde::{Deserialize, Serialize};
 
@@ -372,11 +372,7 @@ fn launch(input: ChangesInput, trigger: Trigger, cx: &mut App) {
     let upto_prev = prev.as_ref().map_or(0, |r| r.meta.upto);
     let files = changed_files(&input, base.as_deref(), upto_prev);
     let provider = input.provider;
-    let config = crate::settings::config(cx).changes.clone();
-    let model = match provider {
-        Provider::Claude => Some(config.model.clone()),
-        Provider::Codex => Some(config.codex_model.clone()).filter(|m| !m.is_empty()),
-    };
+    let model = crate::settings::report_model(provider, cx);
     let reviewer = reviewer_name(provider, model.as_deref());
     let meta = Meta {
         at: Some(Utc::now()),

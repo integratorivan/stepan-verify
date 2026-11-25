@@ -22,6 +22,7 @@ mod settings_page;
 mod skills;
 mod ui;
 mod update;
+mod workspace;
 
 use gpui_kit::*;
 
@@ -80,6 +81,7 @@ fn main() {
         init(cx);
         ui::init(cx);
         settings::init(home.clone(), cx);
+        workspace::init(&home, cx);
         ui::apply_fonts(cx);
         update::init(cx);
         attach::init(cx);

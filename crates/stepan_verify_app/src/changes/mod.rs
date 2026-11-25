@@ -20,6 +20,8 @@ use std::{
 
 use gpui_kit::component::{
     ActiveTheme, Icon, IconName, Sizable as _, Theme,
+    button::Button,
+    menu::{DropdownMenu as _, PopupMenuItem},
     input::{Input, InputState},
     skeleton::Skeleton,
     spinner::Spinner,
@@ -714,11 +716,7 @@ impl ChangesView {
             }
         };
         let provider = self.input.provider;
-        let config = crate::settings::config(cx).changes.clone();
-        let model = match provider {
-            Provider::Claude => Some(config.model.clone()),
-            Provider::Codex => Some(config.codex_model.clone()).filter(|m| !m.is_empty()),
-        };
+        let model = crate::settings::report_model(provider, cx);
         let reviewer = reviewer_name(provider, model.as_deref());
         let snapshot = runs::snapshot(&self.input.cwd);
         let mut meta = Meta {
@@ -1081,11 +1079,7 @@ impl ChangesView {
         let Some(report) = run.ok() else { return };
         let Some((i, risk)) = report.risks.iter().enumerate().find(|(i, r)| risk_key(*i, r) == key) else { return };
         let other = other_family(self.input.provider);
-        let config = crate::settings::config(cx).changes.clone();
-        let model = match other {
-            Provider::Claude => Some(config.model.clone()),
-            Provider::Codex => Some(config.codex_model.clone()).filter(|m| !m.is_empty()),
-        };
+        let model = crate::settings::report_model(other, cx);
         let by = reviewer_name(other, model.as_deref());
         let vdir = run.dir.join("verify");
         let _ = fs::create_dir_all(&vdir);
@@ -1498,6 +1492,49 @@ fn node_hunks(node: &map::MapNode, patches: &[(String, String)]) -> Vec<String> 
     out
 }
 
+/// The model the next report of this family runs on; the same setting as
+/// Настройки → «Отчёт „Изменения“», so picking here changes it there too.
+fn model_picker(provider: Provider, current: String, running: bool) -> impl IntoElement {
+    Button::new("changes-model")
+        .small()
+        .outline()
+        .dropdown_caret(true)
+        .label(current)
+        .tooltip(if running { "Модель для следующего прогона (текущий уже идёт)" } else { "Модель отчёта · то же, что в Настройках" })
+        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, cx| {
+            let chosen = crate::settings::report_model(provider, cx);
+            let options: Vec<(Option<String>, String)> = match provider {
+                Provider::Claude => [("haiku", "~40 с"), ("sonnet", "1–3 мин"), ("opus", "3–6 мин")]
+                    .into_iter()
+                    .map(|(m, time)| (Some(m.to_owned()), format!("{} · {time}", reviewer_name(provider, Some(m)))))
+                    .collect(),
+                Provider::Codex => {
+                    let default = stepan_verify_core::config::codex_default_model().map(|m| format!("по умолчанию · {m}")).unwrap_or_else(|| "по умолчанию".into());
+                    std::iter::once((None, default))
+                        .chain(stepan_verify_core::config::codex_models().into_iter().map(|(slug, name)| (Some(slug), name)))
+                        .collect()
+                }
+            };
+            options.into_iter().fold(menu.label(format!("Отчёт для {}-сессий", provider_label(provider))), |menu, (model, label)| {
+                let checked = model == chosen;
+                menu.item(PopupMenuItem::new(label).checked(checked).on_click(move |_, _, cx| {
+                    let model = model.clone();
+                    crate::settings::update(cx, move |c| match provider {
+                        Provider::Claude => c.changes.model = model.unwrap_or_else(|| "sonnet".into()),
+                        Provider::Codex => c.changes.codex_model = model.unwrap_or_default(),
+                    });
+                }))
+            })
+        })
+}
+
+fn provider_label(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Claude => "Claude",
+        Provider::Codex => "Codex",
+    }
+}
+
 /// "Claude Sonnet" for `sonnet`, "Codex · GPT-6.2-Sol" for a Codex slug
 /// (no slug: Codex's own default model).
 pub fn reviewer_name(provider: Provider, model: Option<&str>) -> String {
@@ -1702,14 +1739,15 @@ impl ChangesView {
     fn render_header(&self, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let run = self.selected.and_then(|i| self.runs.get(i));
         let r = self.report();
-        let reviewer = run.map(|r| r.meta.reviewer.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| reviewer_name(self.input.provider, None));
+        let provider = self.input.provider;
+        let next = reviewer_name(provider, crate::settings::report_model(provider, cx).as_deref());
+        // Who wrote the iteration on screen; the picker says who writes the next one.
         let eyebrow = match run {
-            Some(run) if r.is_some() => format!(
-                "Карта изменений · {reviewer} · итерация {} · {}",
-                run.n,
-                run.meta.at.map(ago).unwrap_or_default()
-            ),
-            _ => format!("Карта изменений · {reviewer}"),
+            Some(run) if r.is_some() => {
+                let by = Some(run.meta.reviewer.clone()).filter(|s| !s.is_empty() && *s != next).map(|s| format!(" · {s}")).unwrap_or_default();
+                format!("Карта изменений · итерация {} · {}{by}", run.n, run.meta.at.map(ago).unwrap_or_default())
+            }
+            _ => "Карта изменений".to_owned(),
         };
         let out = self.out.clone();
         let can_batch = self.running.is_none() && self.runs.iter().any(|r| r.ok().is_some()) && self.news;
@@ -1719,6 +1757,7 @@ impl ChangesView {
                 h_flex()
                     .gap(px(8.))
                     .child(div().flex_1().min_w_0().child(ui::eyebrow(eyebrow, p, theme).truncate()))
+                    .child(model_picker(provider, next, self.running.is_some()))
                     .child(
                         h_flex()
                             .flex_shrink_0()

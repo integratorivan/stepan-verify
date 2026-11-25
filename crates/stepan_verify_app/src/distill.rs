@@ -323,11 +323,7 @@ fn launch(input: ChangesInput, project: Option<String>, cx: &mut App) {
     state.passes.push(PassRecord { n, at: Some(Utc::now()), ..Default::default() });
     save_state(&key, &state);
 
-    let config = crate::settings::config(cx).changes.clone();
-    let model = match input.provider {
-        Provider::Claude => Some(config.model.clone()),
-        Provider::Codex => Some(config.codex_model.clone()).filter(|m| !m.is_empty()),
-    };
+    let model = crate::settings::report_model(input.provider, cx);
     let spec = SessionSpec {
         provider: input.provider,
         native_id: None,

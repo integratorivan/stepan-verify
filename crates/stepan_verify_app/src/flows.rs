@@ -734,10 +734,7 @@ impl FlowsView {
             stepan_verify_core::config::ProviderSetting::Codex => Provider::Codex,
             _ => Provider::Claude,
         };
-        let model = match provider {
-            Provider::Claude => Some(config.changes.model.clone()),
-            Provider::Codex => Some(config.changes.codex_model.clone()).filter(|m| !m.is_empty()),
-        };
+        let model = crate::settings::report_model(provider, cx);
         let n = builds_dir(&self.home, &repo)
             .read_dir()
             .map(|rd| rd.flatten().filter_map(|e| e.file_name().to_str()?.parse::<usize>().ok()).max().unwrap_or(0))

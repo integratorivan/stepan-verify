@@ -51,30 +51,43 @@ pub fn peek_claude(path: &Path) -> Peek {
 /// Codex rollout: `event_msg` records carry item_started / item_completed
 /// with PascalCase item types, plus task_started / task_complete.
 pub fn peek_codex(path: &Path) -> Peek {
-    let mut items: Vec<Item> = Vec::new();
-    let mut running = None;
+    let mut feed = CodexFeed::default();
     for line in tail_lines(path, TAIL_BYTES) {
+        feed.push(&line);
+    }
+    Peek { items: feed.items, running: feed.running }
+}
+
+/// Codex rollout read line by line (peek, and following a live file).
+#[derive(Default)]
+pub(crate) struct CodexFeed {
+    pub(crate) items: Vec<Item>,
+    pub(crate) running: Option<bool>,
+}
+
+impl CodexFeed {
+    /// Apply one record; returns the item it created or changed.
+    pub(crate) fn push(&mut self, line: &str) -> Option<Item> {
         if !line.contains("\"event_msg\"") {
-            continue;
+            return None;
         }
-        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
-        let Some(p) = v.get("payload") else { continue };
+        let v = serde_json::from_str::<Value>(line).ok()?;
+        let p = v.get("payload")?;
         match p.get("type").and_then(Value::as_str) {
-            Some("task_started") => running = Some(true),
-            Some("task_complete") | Some("turn_aborted") => running = Some(false),
+            Some("task_started") => self.running = Some(true),
+            Some("task_complete") | Some("turn_aborted") => self.running = Some(false),
             Some(kind @ ("item_started" | "item_completed")) => {
-                let done = kind == "item_completed";
-                if let Some(item) = p.get("item").and_then(|i| codex_item(i, done)) {
-                    match items.iter().position(|x| x.id == item.id) {
-                        Some(ix) => items[ix] = item,
-                        None => items.push(item),
-                    }
+                let item = codex_item(p.get("item")?, kind == "item_completed")?;
+                match self.items.iter().position(|x| x.id == item.id) {
+                    Some(ix) => self.items[ix] = item.clone(),
+                    None => self.items.push(item.clone()),
                 }
+                return Some(item);
             }
             _ => {}
         }
+        None
     }
-    Peek { items, running }
 }
 
 fn codex_item(item: &Value, done: bool) -> Option<Item> {

@@ -7,6 +7,7 @@
 
 mod claude;
 mod codex;
+mod follow;
 mod model;
 pub mod peek;
 
@@ -95,15 +96,27 @@ impl Drop for AgentHandle {
 
 /// Start (or resume) a session. History arrives first as `AgentEvent::History`.
 pub fn open(spec: SessionSpec) -> (AgentHandle, async_channel::Receiver<AgentEvent>) {
+    launch(spec, None)
+}
+
+/// Resume a session that may still be running elsewhere: its transcript
+/// `file` is replayed and then followed until the first message sent from
+/// here, which takes the session over.
+pub fn open_following(spec: SessionSpec, file: PathBuf) -> (AgentHandle, async_channel::Receiver<AgentEvent>) {
+    launch(spec, Some(file))
+}
+
+fn launch(spec: SessionSpec, follow: Option<PathBuf>) -> (AgentHandle, async_channel::Receiver<AgentEvent>) {
     let (tx, rx) = mpsc::channel();
     let (events_tx, events_rx) = async_channel::unbounded();
     let events = model::Emitter(events_tx);
     std::thread::Builder::new()
         .name(format!("stepan_verify-{:?}", spec.provider).to_lowercase())
         .spawn(move || {
-            let result = match spec.provider {
-                Provider::Claude => claude::run(spec, rx, &events),
-                Provider::Codex => codex::run(spec, rx, &events),
+            let result = match (&follow, spec.provider) {
+                (Some(file), _) => follow::run(spec, file, rx, &events),
+                (None, Provider::Claude) => claude::run(spec, rx, &events),
+                (None, Provider::Codex) => codex::run(spec, rx, &events),
             };
             if let Err(err) = result {
                 events.emit(AgentEvent::Error(format!("{err:#}")));
