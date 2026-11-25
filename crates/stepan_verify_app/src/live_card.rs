@@ -11,6 +11,7 @@ use gpui_kit::component::{
 use crate::ui::{Palette, mix};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use crate::zoom::px;
 use stepan_verify_agents::{Item, ItemKind, ItemStatus};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -18,6 +18,7 @@ use chrono::{DateTime, Utc};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, Theme, h_flex, spinner::Spinner, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use crate::zoom::px;
 use stepan_verify_agents::{AgentEvent, AgentHandle, ItemKind, Mode, SessionSpec};
 use stepan_verify_core::config::MediaMode;
 use serde::{Deserialize, Serialize};

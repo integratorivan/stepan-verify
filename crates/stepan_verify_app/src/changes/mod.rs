@@ -31,6 +31,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use crate::zoom::{px, units};
 use stepan_verify_agents::{AgentEvent, AgentHandle, ItemKind, Mode, Provider, SessionSpec};
 use stepan_verify_core::flows::{self as flowmap, FlowMap, FlowProposal, Freshness, Touched};
 use serde::{Deserialize, Serialize};
@@ -958,7 +959,7 @@ impl ChangesView {
 
     /// A press on the canvas: it may become a pan.
     fn drag_start(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
-        self.drag = Some(canvas::Drag::new((f32::from(at.x), f32::from(at.y)), self.view));
+        self.drag = Some(canvas::Drag::new((units(at.x), units(at.y)), self.view));
         self.dragged = false;
         cx.notify();
     }
@@ -966,11 +967,11 @@ impl ChangesView {
     /// A window position relative to the canvas viewport.
     fn local(&self, at: Point<Pixels>) -> (f32, f32) {
         let o = self.viewport.get().map(|b| b.origin).unwrap_or_default();
-        (f32::from(at.x - o.x), f32::from(at.y - o.y))
+        (units(at.x - o.x), units(at.y - o.y))
     }
 
     fn zoom_center(&mut self, factor: f32, cx: &mut Context<Self>) {
-        let center = self.viewport.get().map_or((400., 300.), |b| (f32::from(b.size.width) / 2., f32::from(b.size.height) / 2.));
+        let center = self.viewport.get().map_or((400., 300.), |b| (units(b.size.width) / 2., units(b.size.height) / 2.));
         self.view = self.view.zoom_at(factor, center);
         self.touched = true;
         cx.notify();
@@ -978,13 +979,13 @@ impl ChangesView {
 
     /// World width the frames pack into: the canvas at 100%.
     fn layout_target(&self) -> f32 {
-        layout_width(self.viewport.get().map_or(1200., |b| f32::from(b.size.width)))
+        layout_width(self.viewport.get().map_or(1200., |b| units(b.size.width)))
     }
 
     /// Back to the readable start: 100% on the main feature.
     fn readable(&mut self, g: &Graph, cx: &mut Context<Self>) {
         if let Some(b) = self.viewport.get() {
-            let size = (f32::from(b.size.width), f32::from(b.size.height));
+            let size = (units(b.size.width), units(b.size.height));
             let c = map::canvas_layout(g, self.mode, layout_width(size.0));
             self.view = canvas::View::readable((c.width, c.height), map::main_frame(g, &c).map(|f| (f.x, f.y)), size);
             self.fit_size = size;
@@ -995,7 +996,7 @@ impl ChangesView {
 
     fn fit(&mut self, world: (f32, f32), cx: &mut Context<Self>) {
         if let Some(b) = self.viewport.get() {
-            self.fit_size = (f32::from(b.size.width), f32::from(b.size.height));
+            self.fit_size = (units(b.size.width), units(b.size.height));
             self.view = canvas::View::fit(world, self.fit_size);
             self.touched = false;
             cx.notify();
@@ -1680,7 +1681,7 @@ impl Render for ChangesView {
         if let Some(g) = &graph {
             let run = self.selected.and_then(|i| self.runs.get(i)).map_or(0, |r| r.n);
             let key = format!("{run}-{:?}", self.mode);
-            let size = self.viewport.get().map(|b| (f32::from(b.size.width), f32::from(b.size.height)));
+            let size = self.viewport.get().map(|b| (units(b.size.width), units(b.size.height)));
             let resized = size.is_some_and(|(w, h)| (w - self.fit_size.0).abs() > 1. || (h - self.fit_size.1).abs() > 1.);
             if self.fit_key.as_deref() != Some(key.as_str()) || (resized && !self.touched) {
                 match size {
@@ -1701,7 +1702,7 @@ impl Render for ChangesView {
         let body: AnyElement = match (&graph, self.selected.and_then(|i| self.runs.get(i)), &self.running) {
             (Some(g), _, _) => {
                 // The canvas takes most of the window height; the page scrolls around it.
-                let canvas_h = (f32::from(window.viewport_size().height) - 340.).max(440.);
+                let canvas_h = (units(window.viewport_size().height) - 340.).max(440.);
                 self.render_report(g, canvas_h, &p, &theme, cx).into_any_element()
             }
             (None, _, Some(r)) if self.selected.is_none() || self.selected.and_then(|i| self.runs.get(i)).is_some_and(|run| run.n == r.n) => {
@@ -2425,7 +2426,7 @@ impl ChangesView {
                 while step < 14. {
                     step *= 2.;
                 }
-                let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                let (w, h) = (units(bounds.size.width), units(bounds.size.height));
                 let (mut x, start_y) = (gx.rem_euclid(step), gy.rem_euclid(step));
                 if (w / step) * (h / step) < 6000. {
                     while x < w {
@@ -2866,7 +2867,7 @@ impl ChangesView {
                     cx.notify();
                     return;
                 }
-                this.view = drag.update((f32::from(e.position.x), f32::from(e.position.y)));
+                this.view = drag.update((units(e.position.x), units(e.position.y)));
                 this.dragged = drag.moved;
                 this.touched |= drag.moved;
                 this.drag = Some(drag);
@@ -2887,7 +2888,7 @@ impl ChangesView {
                 // The canvas owns the wheel: the page does not scroll under it.
                 cx.stop_propagation();
                 let delta = match e.delta {
-                    ScrollDelta::Pixels(d) => (f32::from(d.x), f32::from(d.y)),
+                    ScrollDelta::Pixels(d) => (units(d.x), units(d.y)),
                     ScrollDelta::Lines(l) => (l.x * 24., l.y * 24.),
                 };
                 let at = this.local(e.position);

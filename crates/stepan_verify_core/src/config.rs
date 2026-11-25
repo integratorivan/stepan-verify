@@ -172,11 +172,13 @@ pub struct AppearanceConfig {
     pub font: String,
     /// Code, paths, ids.
     pub mono_font: String,
+    /// Interface scale, ⌘+ / ⌘− / ⌘0 (1.0 = 100%).
+    pub zoom: f32,
 }
 
 impl Default for AppearanceConfig {
     fn default() -> Self {
-        Self { font: "Instrument Sans".into(), mono_font: "Fira Code".into() }
+        Self { font: "Instrument Sans".into(), mono_font: "Fira Code".into(), zoom: 1.0 }
     }
 }
 

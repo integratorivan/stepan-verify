@@ -219,8 +219,10 @@ mod tests {
         (dir, store)
     }
 
-    fn rand_suffix() -> u128 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+    /// Tests run in parallel and the clock ticks in microseconds: a counter keeps their dirs apart.
+    fn rand_suffix() -> usize {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     #[test]

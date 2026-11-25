@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use gpui_kit::*;
+use crate::zoom::px;
 
 /// Logical size of an image file. Screenshots and rendered diagrams are 2x.
 pub fn logical_size(path: &Path) -> Option<(f32, f32)> {

@@ -14,6 +14,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use crate::zoom::px;
 use crate::ui::PressButton;
 use stepan_verify_agents::{AgentEvent, AgentHandle, Approval, Attachment, AttachmentKind, FileDiff, Item, ItemKind, ItemStatus, SessionSpec};
 use stepan_verify_core::{Provider, SessionSummary, Task as BoardTask};

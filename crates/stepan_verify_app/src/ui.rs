@@ -6,6 +6,7 @@
 use gpui_kit::component::{ActiveTheme as _, Theme, ThemeRegistry, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use crate::zoom::px;
 use stepan_verify_core::Provider;
 
 /// Install the stepan_verify light/dark themes and follow the system appearance.

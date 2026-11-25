@@ -22,6 +22,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use crate::zoom::px;
 use gpui_webview::WebView;
 use stepan_verify_core::{
     Home, Provider, SessionSummary,

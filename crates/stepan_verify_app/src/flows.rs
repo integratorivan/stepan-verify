@@ -22,6 +22,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use crate::zoom::{px, units};
 use stepan_verify_agents::{AgentEvent, AgentHandle, ItemKind, Mode, Provider, SessionSpec};
 use stepan_verify_core::{
     Home,
@@ -1313,11 +1314,11 @@ impl FlowsView {
 
     fn local(&self, at: Point<Pixels>) -> (f32, f32) {
         let o = self.viewport.get().map(|b| b.origin).unwrap_or_default();
-        (f32::from(at.x - o.x), f32::from(at.y - o.y))
+        (units(at.x - o.x), units(at.y - o.y))
     }
 
     fn viewport_size(&self) -> (f32, f32) {
-        self.viewport.get().map_or((1200., 700.), |b| (f32::from(b.size.width), f32::from(b.size.height)))
+        self.viewport.get().map_or((1200., 700.), |b| (units(b.size.width), units(b.size.height)))
     }
 
     /// Readable by default: the first area in the top-left corner at 100%,
@@ -2460,7 +2461,7 @@ impl FlowsView {
                 while step < 14. {
                     step *= 2.;
                 }
-                let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                let (w, h) = (units(bounds.size.width), units(bounds.size.height));
                 let (mut x, start_y) = (gx.rem_euclid(step), gy.rem_euclid(step));
                 if (w / step) * (h / step) < 6000. {
                     while x < w {
@@ -2766,12 +2767,12 @@ impl FlowsView {
             .overflow_hidden()
             .cursor(if grabbing { CursorStyle::ClosedHand } else { CursorStyle::OpenHand })
             .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, _, cx| {
-                this.drag = Some(canvas::Drag::new((f32::from(e.position.x), f32::from(e.position.y)), this.view));
+                this.drag = Some(canvas::Drag::new((units(e.position.x), units(e.position.y)), this.view));
                 this.dragged = false;
                 cx.notify();
             }))
             .on_mouse_down(MouseButton::Middle, cx.listener(|this, e: &MouseDownEvent, _, cx| {
-                this.drag = Some(canvas::Drag::new((f32::from(e.position.x), f32::from(e.position.y)), this.view));
+                this.drag = Some(canvas::Drag::new((units(e.position.x), units(e.position.y)), this.view));
                 this.dragged = false;
                 cx.notify();
             }))
@@ -2782,7 +2783,7 @@ impl FlowsView {
                     cx.notify();
                     return;
                 }
-                this.view = drag.update((f32::from(e.position.x), f32::from(e.position.y)));
+                this.view = drag.update((units(e.position.x), units(e.position.y)));
                 this.dragged = drag.moved;
                 this.drag = Some(drag);
                 cx.notify();
@@ -2798,7 +2799,7 @@ impl FlowsView {
             .on_scroll(cx.listener(|this, e: &ScrollEvent, _, cx| {
                 cx.stop_propagation();
                 let delta = match e.delta {
-                    ScrollDelta::Pixels(d) => (f32::from(d.x), f32::from(d.y)),
+                    ScrollDelta::Pixels(d) => (units(d.x), units(d.y)),
                     ScrollDelta::Lines(l) => (l.x * 24., l.y * 24.),
                 };
                 let at = this.local(e.position);
@@ -3016,7 +3017,7 @@ impl FlowsView {
                 while step < 14. {
                     step *= 2.;
                 }
-                let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                let (w, h) = (units(bounds.size.width), units(bounds.size.height));
                 let (mut x, start_y) = (v.x.rem_euclid(step), v.y.rem_euclid(step));
                 if (w / step) * (h / step) < 6000. {
                     while x < w {
@@ -3042,12 +3043,12 @@ impl FlowsView {
             .overflow_hidden()
             .cursor(if grabbing { CursorStyle::ClosedHand } else { CursorStyle::OpenHand })
             .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, _, cx| {
-                this.drag = Some(canvas::Drag::new((f32::from(e.position.x), f32::from(e.position.y)), this.view));
+                this.drag = Some(canvas::Drag::new((units(e.position.x), units(e.position.y)), this.view));
                 this.dragged = false;
                 cx.notify();
             }))
             .on_mouse_down(MouseButton::Middle, cx.listener(|this, e: &MouseDownEvent, _, cx| {
-                this.drag = Some(canvas::Drag::new((f32::from(e.position.x), f32::from(e.position.y)), this.view));
+                this.drag = Some(canvas::Drag::new((units(e.position.x), units(e.position.y)), this.view));
                 this.dragged = false;
                 cx.notify();
             }))
@@ -3058,7 +3059,7 @@ impl FlowsView {
                     cx.notify();
                     return;
                 }
-                this.view = drag.update((f32::from(e.position.x), f32::from(e.position.y)));
+                this.view = drag.update((units(e.position.x), units(e.position.y)));
                 this.dragged = drag.moved;
                 this.drag = Some(drag);
                 cx.notify();
@@ -3074,7 +3075,7 @@ impl FlowsView {
             .on_scroll(cx.listener(|this, e: &ScrollEvent, _, cx| {
                 cx.stop_propagation();
                 let delta = match e.delta {
-                    ScrollDelta::Pixels(d) => (f32::from(d.x), f32::from(d.y)),
+                    ScrollDelta::Pixels(d) => (units(d.x), units(d.y)),
                     ScrollDelta::Lines(l) => (l.x * 24., l.y * 24.),
                 };
                 let at = this.local(e.position);

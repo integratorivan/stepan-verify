@@ -23,6 +23,7 @@ mod skills;
 mod ui;
 mod update;
 mod workspace;
+mod zoom;
 
 use gpui_kit::*;
 
@@ -83,6 +84,7 @@ fn main() {
         settings::init(home.clone(), cx);
         workspace::init(&home, cx);
         ui::apply_fonts(cx);
+        zoom::init(cx);
         update::init(cx);
         attach::init(cx);
         let options = WindowOptions {

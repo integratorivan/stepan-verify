@@ -9,6 +9,7 @@ use gpui_kit::component::{
     h_flex, v_flex,
 };
 use gpui_kit::*;
+use crate::zoom::px;
 
 /// Conversation shape: user bubble, answer lines, a tool card, repeated.
 pub fn transcript(theme: &Theme) -> impl IntoElement {
