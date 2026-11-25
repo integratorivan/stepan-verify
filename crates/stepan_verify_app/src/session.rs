@@ -52,6 +52,8 @@ pub enum SessionEvent {
     TurnFinished { error: Option<String> },
     /// Show a file or folder in the preview panel; `root` is the session's project.
     OpenFile { path: PathBuf, root: PathBuf },
+    /// The agent just made a `/show-me` HTML view: show it if you are looking at this session.
+    ShowMe { path: PathBuf, root: PathBuf },
 }
 
 impl EventEmitter<SessionEvent> for SessionView {}
@@ -99,6 +101,8 @@ pub struct SessionView {
     show_changes: bool,
     /// item id → (first seen, finished) for live items; history has no timing.
     timing: HashMap<String, (Instant, Option<Instant>)>,
+    /// `/show-me` HTML files already handed to the preview, so each opens once.
+    shown: HashSet<PathBuf>,
     _events: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -262,6 +266,7 @@ impl SessionView {
             changes: None,
             show_changes: false,
             timing: HashMap::new(),
+            shown: HashSet::new(),
             _events: pump,
             _subscriptions: vec![submit, attached],
         }
@@ -339,6 +344,24 @@ impl SessionView {
         cx.notify();
     }
 
+    /// A finished tool call that produced a fresh `/show-me` HTML file opens it
+    /// in the preview (once); older files (a replayed transcript) only stay as chips.
+    fn reveal_show_me(&mut self, item: &Item, cx: &mut Context<Self>) {
+        let fresh = |p: &std::path::Path| {
+            std::fs::metadata(p).and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age < Duration::from_secs(120)))
+        };
+        let html = item.attachments.iter().map(|a| &a.path).find(|p| {
+            stepan_verify_agents::is_show_me(p)
+                && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("html") || e.eq_ignore_ascii_case("htm"))
+                && !self.shown.contains(*p)
+                && fresh(p)
+        });
+        if let Some(path) = html.cloned() {
+            self.shown.insert(path.clone());
+            cx.emit(SessionEvent::ShowMe { path, root: self.cwd.clone() });
+        }
+    }
+
     fn apply(&mut self, event: AgentEvent, dirty: &mut HashSet<usize>, reset: &mut bool, cx: &mut Context<Self>) {
         match event {
             AgentEvent::History(items) => {
@@ -371,6 +394,9 @@ impl SessionView {
                 let timing = self.timing.entry(item.id.clone()).or_insert((now, None));
                 if item.status != ItemStatus::Running && timing.1.is_none() {
                     timing.1 = Some(now);
+                }
+                if !self.following && item.status == ItemStatus::Done {
+                    self.reveal_show_me(&item, cx);
                 }
                 match self.index.get(&item.id).copied() {
                     Some(ix) => {

@@ -23,7 +23,8 @@ use serde_json::{Value, json};
 use crate::{
     Command, Mode, SessionSpec,
     model::{
-        AgentEvent, Approval, Attachment, Emitter, FileDiff, ImageStore, Item, ItemKind, ItemStatus, unified,
+        AgentEvent, Approval, Attachment, Emitter, FileDiff, ImageStore, Item, ItemKind, ItemStatus, show_me_attachments,
+        unified,
     },
 };
 
@@ -725,7 +726,7 @@ fn tool_input_body(name: &str, input: &Value) -> String {
     }
 }
 
-/// Files the agent hands you (SendUserFile) become attachments right away.
+/// Files the agent hands you (SendUserFile, `/show-me` output) become attachments right away.
 fn tool_input_attachments(name: &str, input: &Value) -> Vec<Attachment> {
     match name {
         "SendUserFile" => input
@@ -736,6 +737,9 @@ fn tool_input_attachments(name: &str, input: &Value) -> Vec<Attachment> {
             .filter_map(Value::as_str)
             .map(Attachment::for_path)
             .collect(),
+        // `/show-me` pictures and HTML: written by a tool or named in a command.
+        "Write" => input.get("file_path").and_then(Value::as_str).map(show_me_attachments).unwrap_or_default(),
+        "Bash" => input.get("command").and_then(Value::as_str).map(show_me_attachments).unwrap_or_default(),
         _ => Vec::new(),
     }
 }
@@ -772,6 +776,18 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn show_me_files_become_attachments() {
+        let write = tool_input_attachments("Write", &json!({"file_path": "/tmp/show-me/show-me-flow.html", "content": "<p>"}));
+        assert_eq!(write, vec![Attachment::for_path("/tmp/show-me/show-me-flow.html")]);
+        let cmd = r#"node ~/d.mjs --src /tmp/show-me/a.mmd --out "/tmp/show-me/show-me-a.png"; [ -n "$STEPAN_VERIFY_DOCS" ] || open /tmp/show-me/show-me-flow.html /tmp/show-me/show-me-flow.html"#;
+        let bash = tool_input_attachments("Bash", &json!({ "command": cmd }));
+        assert_eq!(bash, vec![Attachment::for_path("/tmp/show-me/show-me-a.png"), Attachment::for_path("/tmp/show-me/show-me-flow.html")]);
+        assert_eq!(bash[0].kind, crate::AttachmentKind::Image);
+        assert!(tool_input_attachments("Write", &json!({"file_path": "/p/src/show-me.ts"})).is_empty());
+        assert!(tool_input_attachments("Bash", &json!({"command": "open show-me-rel.html"})).is_empty(), "relative paths are not ours");
+    }
 
     #[test]
     fn edit_becomes_unified_diff() {

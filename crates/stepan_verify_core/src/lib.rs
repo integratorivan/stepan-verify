@@ -13,6 +13,7 @@ pub mod flowsync;
 pub mod home;
 pub mod memory;
 pub mod sessions;
+pub mod showme;
 pub mod skills;
 pub mod store;
 pub mod tasks;

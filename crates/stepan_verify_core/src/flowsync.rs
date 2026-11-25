@@ -210,18 +210,29 @@ pub fn skill_dir(home: &Home) -> PathBuf {
 /// Write (or refresh) the skill and link it into every target; idempotent.
 /// A target that is not our symlink (a real folder, or a link elsewhere) is never touched.
 pub fn install_skill(home: &Home, targets: &[PathBuf]) -> SkillReport {
+    install_bundled(home, SKILL_NAME, &skill_text(), targets)
+}
+
+/// Remove only our own links; the skill file in our home stays.
+pub fn uninstall_skill(home: &Home, targets: &[PathBuf]) -> SkillReport {
+    uninstall_bundled(home, SKILL_NAME, targets)
+}
+
+/// Any skill Stepan ships: `SKILL.md` written to `<home>/skills/<name>/` and that
+/// folder symlinked into every target; idempotent. A target that is not our
+/// symlink (a real folder, or a link elsewhere) is never touched.
+pub fn install_bundled(home: &Home, name: &str, text: &str, targets: &[PathBuf]) -> SkillReport {
     let mut report = SkillReport::default();
-    let dir = skill_dir(home);
+    let dir = home.skills().join(name);
     let file = dir.join("SKILL.md");
-    let text = skill_text();
-    if fs::read_to_string(&file).ok().as_deref() != Some(text.as_str()) {
-        if let Err(err) = fs::create_dir_all(&dir).and_then(|_| fs::write(&file, &text)) {
+    if fs::read_to_string(&file).ok().as_deref() != Some(text) {
+        if let Err(err) = fs::create_dir_all(&dir).and_then(|_| fs::write(&file, text)) {
             report.warnings.push(format!("{}: {err}", file.display()));
             return report;
         }
     }
     for target in targets {
-        let link = target.join(SKILL_NAME);
+        let link = target.join(name);
         match fs::symlink_metadata(&link) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 if points_to(&link, &dir) {
@@ -243,12 +254,12 @@ pub fn install_skill(home: &Home, targets: &[PathBuf]) -> SkillReport {
     report
 }
 
-/// Remove only our own links; the skill file in our home stays.
-pub fn uninstall_skill(home: &Home, targets: &[PathBuf]) -> SkillReport {
+/// Remove only our own links to a bundled skill; its file in our home stays.
+pub fn uninstall_bundled(home: &Home, name: &str, targets: &[PathBuf]) -> SkillReport {
     let mut report = SkillReport::default();
-    let dir = skill_dir(home);
+    let dir = home.skills().join(name);
     for target in targets {
-        let link = target.join(SKILL_NAME);
+        let link = target.join(name);
         let ours = fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink()) && points_to(&link, &dir);
         if ours {
             if let Err(err) = fs::remove_file(&link) {

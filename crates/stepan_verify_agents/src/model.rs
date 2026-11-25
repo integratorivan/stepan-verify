@@ -61,6 +61,27 @@ pub fn is_image_path(path: &Path) -> bool {
     )
 }
 
+/// A `/show-me` output: an absolute `show-me-*.html|htm|png|svg` path. Stepan
+/// attaches these to the transcript and opens the HTML in its preview panel.
+pub fn is_show_me(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+    path.is_absolute() && name.starts_with("show-me-") && matches!(ext.as_deref(), Some("html" | "htm" | "png" | "svg"))
+}
+
+/// `/show-me` files named in a shell command or a tool input, in order, once each.
+pub fn show_me_attachments(text: &str) -> Vec<Attachment> {
+    let mut out: Vec<Attachment> = Vec::new();
+    let split = |c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '=' | '(' | ')' | ';' | '|' | '&' | '<' | '>' | ',');
+    for token in text.split(split) {
+        let path = Path::new(token);
+        if is_show_me(path) && !out.iter().any(|a| a.path == path) {
+            out.push(Attachment::for_path(path));
+        }
+    }
+    out
+}
+
 /// Writes inline (base64) images to disk once, so the UI only handles paths.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ImageStore {

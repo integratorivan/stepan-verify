@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use crate::{
     Command, Mode, SessionSpec,
     claude::truncate,
-    model::{AgentEvent, Approval, Attachment, Emitter, FileDiff, ImageStore, Item, ItemKind, ItemStatus},
+    model::{AgentEvent, Approval, Attachment, Emitter, FileDiff, ImageStore, Item, ItemKind, ItemStatus, show_me_attachments},
 };
 
 const MAX_HISTORY_PAGES: usize = 50;
@@ -351,7 +351,8 @@ fn map_item(item: &Value, store: &ImageStore) -> Option<Item> {
             format!("$ {}", strip_shell(&s("command"))),
             truncate(&s("aggregatedOutput"), 6000),
             status,
-        ),
+        )
+        .with_attachments(show_me_attachments(&s("command"))),
         "fileChange" => {
             let diffs: Vec<FileDiff> = item
                 .get("changes")?
@@ -362,7 +363,8 @@ fn map_item(item: &Value, store: &ImageStore) -> Option<Item> {
                 })
                 .collect();
             let files: Vec<&str> = diffs.iter().map(|d| short_path(&d.path)).collect();
-            Item::tool(id, format!("Правки: {}", files.join(", ")), String::new(), status).with_diffs(diffs)
+            let shown: Vec<Attachment> = diffs.iter().flat_map(|d| show_me_attachments(&d.path)).collect();
+            Item::tool(id, format!("Правки: {}", files.join(", ")), String::new(), status).with_diffs(diffs).with_attachments(shown)
         }
         "mcpToolCall" => {
             // MCP results are content blocks: text, and images as base64.

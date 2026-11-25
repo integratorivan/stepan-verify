@@ -13,7 +13,7 @@ pub mod peek;
 
 use std::{path::PathBuf, sync::mpsc};
 
-pub use model::{AgentEvent, Approval, Attachment, AttachmentKind, FileDiff, Item, ItemKind, ItemStatus, is_image_path};
+pub use model::{AgentEvent, Approval, Attachment, AttachmentKind, FileDiff, Item, ItemKind, ItemStatus, is_image_path, is_show_me};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {

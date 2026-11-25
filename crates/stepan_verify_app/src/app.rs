@@ -371,6 +371,12 @@ impl AppView {
             match event {
                 SessionEvent::Close => this.close_session(ix, cx),
                 SessionEvent::OpenFile { path, root } => this.open_preview(path.clone(), Some(root.clone()), window, cx),
+                // A `/show-me` view replaces the preview only for the session you look at;
+                // elsewhere it waits as a chip in that session's transcript.
+                SessionEvent::ShowMe { path, root } if this.page == Page::Session(ix) => this.open_preview(path.clone(), Some(root.clone()), window, cx),
+                SessionEvent::ShowMe { .. } => {
+                    window.push_notification(Notification::info("Готова визуализация /show-me — открой её в ленте сессии").title(title), cx);
+                }
                 SessionEvent::NeedsApproval(what) if !watching => {
                     window.push_notification(
                         Notification::warning(format!("Ждёт подтверждения: {what}")).title(title),

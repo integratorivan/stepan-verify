@@ -94,6 +94,9 @@ pub struct Report {
     pub structure: Option<Diagram>,
     /// Extra diagrams of whatever type tells the story best: sequence, state, ER, class, …
     pub diagrams: Vec<Diagram>,
+    /// «Как устроено»: show-me views — call/component/file trees, pseudocode,
+    /// code shapes (often as было → стало diffs) and at most one HTML explainer.
+    pub views: Vec<View>,
     pub code: CodeChanges,
     /// Links the session removed (they existed before, not after).
     pub removed_edges: Vec<EdgeRef>,
@@ -258,6 +261,38 @@ pub struct Diagram {
     pub image: Option<String>,
     pub mermaid: Option<String>,
     pub caption: String,
+}
+
+/// One show-me view of how the change works.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct View {
+    /// `call_tree` | `component_tree` | `file_tree` | `pseudocode` | `code` | `html`.
+    pub kind: String,
+    pub title: String,
+    /// The body is in diff syntax (`+` / `-` / space in the first column).
+    pub diff: bool,
+    pub body: String,
+    /// Language of a `code` view.
+    pub lang: String,
+    /// The HTML file of an `html` view, absolute or relative to the run folder.
+    pub file: Option<String>,
+    pub caption: String,
+    /// Map nodes the view is about.
+    pub nodes: Vec<String>,
+}
+
+impl View {
+    fn kind_label(&self) -> &'static str {
+        match self.kind.as_str() {
+            "call_tree" => "дерево вызовов",
+            "component_tree" => "дерево компонентов",
+            "file_tree" => "файлы",
+            "pseudocode" => "псевдокод",
+            "html" => "HTML",
+            _ => "код",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -925,6 +960,15 @@ impl ChangesView {
                 }
             }
         }
+        for (list, key) in [("diagrams", "image"), ("views", "file")] {
+            for d in v.get_mut(list).and_then(|l| l.as_array_mut()).into_iter().flatten() {
+                if let Some(p) = d.get_mut(key) {
+                    if let Some(rel) = p.as_str() {
+                        *p = resolve(base_dir, rel).display().to_string().into();
+                    }
+                }
+            }
+        }
         if let Some(items) = v.get_mut("ui").and_then(|u| u.as_array_mut()) {
             for u in items {
                 for key in ["before", "after"] {
@@ -1281,6 +1325,8 @@ const SCHEMA: &str = "{\"title\": \"заголовок изменений\", \"s
  \"flow\": {\"title\": \"…\", \"image\": \"flow.png\", \"mermaid\": \"исходник\", \"caption\": \"одна фраза\"} или null,\n\
  \"structure\": {\"title\": \"…\", \"image\": \"structure.png\", \"caption\": \"…\"} или null,\n\
  \"diagrams\": [{\"title\": \"…\", \"image\": \"lifecycle.png\", \"mermaid\": \"исходник\", \"caption\": \"…\"}],\n\
+ \"views\": [{\"kind\": \"call_tree|component_tree|file_tree|pseudocode|code|html\", \"title\": \"что показывает вид\", \"diff\": true, \
+\"body\": \"текст вида, строки через \\n (у html пусто)\", \"lang\": \"ts (только у code)\", \"file\": \"explainer.html (только у html)\", \"caption\": \"одна фраза\", \"nodes\": [\"id\"]}],\n\
  \"code\": {\"added\": [{\"id\": \"короткий_id\", \"name\": \"имя как в коде\", \"kind\": \"function|component|hook|endpoint|route|type|table|config|test|file|other\", \
 \"role\": \"component|function|hook|type|dto|config|test|api|store|style|script|other\", \"entity\": \"человеческое имя сущности\", \
 \"file\": \"путь от корня проекта\", \"line\": 42, \"note\": \"зачем, одной фразой\", \
@@ -1327,6 +1373,14 @@ const MAP_RULES: &str = "Карта — главное в отчёте: прил
 Низкоуровневые мелочи не плоди отдельными узлами — сворачивай в helper-группу. `tests` — тесты, которые сессия добавила или поменяла, и существующие, что проверяют изменённое (поищи в проекте рядом с файлами); \
 `verifies` — id узлов, которые тест проверяет; `result` — только если видно, что тест запускали. Если тестов нет — оставь `tests` пустым, это тоже сигнал.";
 
+const VIEW_RULES: &str = "Как устроено (`views`, приём скилла show-me): 1–4 компактных вида того, КАК теперь работает сделанное — то, что человек иначе выяснял бы чтением кода. \
+Бери самый маленький вид, который объясняет суть: поток выполнения — `call_tree` (дерево вызовов, отступ 2 пробела); UI — `component_tree` (компоненты с путями файлов в скобках, хуки и границы состояния, которые важны); \
+раскладка файлов или рефакторинг — `file_tree` (неглубокое дерево `├──`/`└──`, у каждой строки `# зачем`); логика или алгоритм — `pseudocode`; новая форма целиком (интерфейс, тип, сигнатуры) — `code` с `lang`. \
+Если форма уже была и изменилась — пиши в diff-синтаксисе, как `git diff` без заголовков: первая колонка `+` (добавлено), `-` (убрано) или пробел (контекст, оставь его), и ставь `diff: true`. \
+Только то, что нужно, чтобы понять изменение: до ~25 строк на вид, имена как в коде, без пересказа всего файла. `nodes` — id узлов карты, о которых вид. Не дублируй схему flow. \
+Если суть — визуальный UI, сравнение состояний или идея слишком плотная для схемы — один HTML-файл $OUT/explainer.html (вид `html`, поле `file`, `body` пустой): самодостаточный (без сети и внешних шрифтов), \
+светлая и тёмная тема через prefers-color-scheme, реальные имена и данные из кода, одна мысль; не больше одного такого файла и только когда он правда нужен.";
+
 fn prompt_full(out: &Path) -> String {
     let skill = find_skill().unwrap_or_default();
     let renderer = if skill.join("scripts/diagram.mjs").exists() {
@@ -1352,6 +1406,7 @@ fn prompt_full(out: &Path) -> String {
 поток запроса — sequenceDiagram, кто что делает — swimlane-beta, жизненный цикл — stateDiagram-v2. Если поменялась структура модулей — before.mmd/after.mmd (тем же типом), иначе пропусти. \
 Если сессия меняла то, что лучше видно другой схемой (схема БД — erDiagram, классы/интерфейсы — classDiagram, статусы — stateDiagram-v2, папки — treeView-beta, план — gantt), \
 добавь 0–3 такие в `diagrams` (было/стало, если это изменение, иначе одна). Не рисуй схему ради схемы.\n\
+         3а. {VIEW_RULES}\n\
          4. UI: скриншоты из context.md — как «Стало». «Было» — только если это дёшево и честно, иначе null. Никогда не подделывай «Было».\n\
          5. Решения: 3–7 главных решений агента за сессию (`decisions`) — что выбрал и почему, к каким узлам.\n\
          5а. {FLOW_RULES}\n\
@@ -1376,6 +1431,7 @@ fn prompt_batch(out: &Path) -> String {
          4. title/summary/риски/проверки обнови под итог на сейчас. Поля flow/structure/diagrams/ui скопируй из base.json как есть (схемы не перерисовывай).\n\
          4а. {FLOW_RULES} В батче `flows.touched` — шаги, задетые за всю сессию (объедини с base.json), `proposal` — все предложения сессии на сейчас (объедини с base.json).\n\
          4б. {EVIDENCE_RULES}\n\
+         4в. `views` (как устроено): оставь виды из base.json; поправь или добавь текстовый вид, только если порция поменяла форму кода (дерево вызовов, компонентов, файлов, псевдокод). Вид `html` копируй как есть. {VIEW_RULES}\n\
          5. Запиши ПОЛНЫЙ обновлённый $OUT/report.json по той же схеме:\n{SCHEMA}\n\n\
          Ничего не меняй в проекте, пиши только в $OUT, уложись в 2–3 минуты. Когда записал — ответь: готово.",
         out = out.display(),
@@ -1970,6 +2026,7 @@ impl ChangesView {
                 )
             })
             .child(metrics(files, plus, minus, &r.code, r.risks.len(), p, theme))
+            .when_some((!r.views.is_empty()).then(|| self.render_views(g, r, &dir, p, theme, cx)), |this, v| this.child(v))
 
             .when_some(self.render_decisions(g, p, theme, cx), |this, d| this.child(d))
             .child(
@@ -3296,6 +3353,87 @@ impl ChangesView {
             })
     }
 
+    /// «Как устроено»: the reviewer's show-me views — trees, pseudocode and code
+    /// shapes drawn as text (diff lines tinted), and one HTML explainer that opens in the preview.
+    fn render_views(&self, g: &Graph, r: &Report, dir: &Path, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let root = self.input.cwd.clone();
+        let cards: Vec<AnyElement> = r
+            .views
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let label = if v.diff { format!("{} · было → стало", v.kind_label()) } else { v.kind_label().to_owned() };
+                let body = match (v.kind.as_str(), &v.file) {
+                    ("html", Some(file)) => {
+                        let path = resolve(dir, file);
+                        let exists = path.exists();
+                        let (open, root) = (path.clone(), root.clone());
+                        h_flex()
+                            .px(px(14.))
+                            .py(px(12.))
+                            .gap(px(10.))
+                            .child(Icon::new(IconName::Globe).small().text_color(p.muted))
+                            .child(div().flex_1().min_w_0().truncate().font_family(theme.mono_font_family.clone()).text_size(px(12.)).text_color(p.muted).child(
+                                path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                            ))
+                            .child(
+                                PressButton::new(SharedString::from(format!("view-open-{i}")))
+                                    .small()
+                                    .label(if exists { "Открыть" } else { "Файла нет" })
+                                    .disabled(!exists)
+                                    .on_click(move |_, window, cx| crate::preview::open_in_app(open.clone(), Some(root.clone()), window, cx)),
+                            )
+                            .into_any_element()
+                    }
+                    _ => sketch(i, &v.body, v.diff, p, theme).into_any_element(),
+                };
+                // Wide sketches (long tree comments, code) take the whole row instead of clipping.
+                let wide = v.kind == "code" || v.body.lines().map(|l| l.chars().count()).max().unwrap_or(0) > 52;
+                ui::card(p)
+                    .map(|c| if wide { c.w_full() } else { c.flex_1().min_w(px(380.)) })
+                    .overflow_hidden()
+                    .child(
+                        h_flex()
+                            .px(px(14.))
+                            .pt(px(10.))
+                            .pb(px(8.))
+                            .gap(px(8.))
+                            .border_b_1()
+                            .border_color(p.border)
+                            .child(div().flex_1().min_w_0().truncate().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).text_color(p.ink).child(if v.title.is_empty() {
+                                label.clone()
+                            } else {
+                                v.title.clone()
+                            }))
+                            .child(ui::mono(label, theme).text_color(p.faint)),
+                    )
+                    .child(body)
+                    .when(!v.caption.is_empty() || !v.nodes.is_empty(), |card| {
+                        card.child(
+                            v_flex()
+                                .px(px(14.))
+                                .py(px(8.))
+                                .gap(px(6.))
+                                .border_t_1()
+                                .border_color(p.border)
+                                .when(!v.caption.is_empty(), |c| c.child(div().text_size(px(12.5)).text_color(p.muted).child(v.caption.clone())))
+                                .when(!v.nodes.is_empty(), |c| {
+                                    c.child(h_flex().gap(px(5.)).flex_wrap().children(v.nodes.iter().enumerate().map(|(ni, k)| {
+                                        self.node_chip(SharedString::from(format!("view-{i}-{ni}")), &map::normalize(k), g, p, theme, cx)
+                                    })))
+                                }),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect();
+        v_flex()
+            .gap(px(12.))
+            .child(ui::section_title("Как устроено", Some(r.views.len().to_string()), p, theme).child(ui::mono("show-me: что и как сделано", theme).text_color(p.faint)))
+            .child(div().flex().flex_wrap().gap(px(12.)).items_start().children(cards))
+            .into_any_element()
+    }
+
     fn render_diagram(&self, key: String, d: &Diagram, dir: &Path, p: &Palette, theme: &Theme) -> impl IntoElement {
         let dark = theme.is_dark();
         let image = d.image.as_ref().map(|path| themed_image(&resolve(dir, path), dark)).filter(|path| path.exists());
@@ -3958,6 +4096,32 @@ fn field_row(f: &map::MapField, mode: MapMode, p: &Palette, theme: &Theme) -> im
         .when(!f.ty.is_empty(), |h| h.child(div().min_w_0().truncate().text_color(p.muted).child(format!(": {}", f.ty))))
 }
 
+/// A show-me text view: monospace lines, tinted as a diff when `diff` is set.
+fn sketch(i: usize, body: &str, diff: bool, p: &Palette, theme: &Theme) -> impl IntoElement {
+    let lines: Vec<&str> = body.trim_end().lines().take(80).collect();
+    v_flex()
+        .id(SharedString::from(format!("view-body-{i}")))
+        .py(px(8.))
+        .bg(p.surface2)
+        .font_family(theme.mono_font_family.clone())
+        .text_size(px(12.))
+        .line_height(px(18.))
+        .children(lines.into_iter().map(|l| {
+            let (bg, fg) = match l.chars().next() {
+                Some('+') if diff => (Some(ui::mix(p.green.soft, p.surface, 0.8)), p.green.text),
+                Some('-') if diff => (Some(ui::mix(p.red.soft, p.surface, 0.8)), p.red.text),
+                _ => (None, p.fg),
+            };
+            div()
+                .px(px(14.))
+                .when_some(bg, |d, bg| d.bg(bg))
+                .text_color(fg)
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .child(if l.is_empty() { " ".to_owned() } else { l.to_owned() })
+        }))
+}
+
 fn render_hunk(i: usize, hunk: &str, p: &Palette, theme: &Theme) -> impl IntoElement {
     let lines: Vec<&str> = hunk.lines().take(60).collect();
     v_flex()
@@ -4145,6 +4309,21 @@ mod tests {
         assert_eq!((r.removed_edges[1].from.as_str(), r.removed_edges[0].to.as_str()), ("c", "b"));
         assert_eq!(r.decisions[0].title, "Оставил флаг");
         assert_eq!(r.decisions[0].nodes, vec!["a"]);
+        assert!(r.views.is_empty());
+    }
+
+    #[core::prelude::v1::test]
+    fn show_me_views_parse() {
+        let r: Report = serde_json::from_str(
+            r#"{"views":[{"kind":"call_tree","title":"Отправка","diff":true,"body":" submit\n+  validate\n   send","nodes":["submit"]},
+                {"kind":"html","title":"Состояния","file":"explainer.html"},{"kind":"something"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(r.views.len(), 3);
+        assert!(r.views[0].diff && r.views[0].body.lines().nth(1) == Some("+  validate"));
+        assert_eq!(r.views[0].kind_label(), "дерево вызовов");
+        assert_eq!(r.views[1].file.as_deref(), Some("explainer.html"));
+        assert_eq!(r.views[2].kind_label(), "код", "unknown kinds still render as text");
     }
 
     #[core::prelude::v1::test]
