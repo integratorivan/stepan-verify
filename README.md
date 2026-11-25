@@ -11,8 +11,6 @@
 <p align="center">
   <a href="https://github.com/integratorivan/stepan-verify/releases/latest/download/stepan-macos-arm64.dmg"><b>Скачать для Apple Silicon</b></a>
   ·
-  <a href="https://github.com/integratorivan/stepan-verify/releases/latest/download/stepan-macos-x86_64.dmg">для Intel</a>
-  ·
   <a href="https://github.com/integratorivan/stepan-verify/releases">все релизы</a>
 </p>
 
@@ -45,7 +43,7 @@ scripts/bundle.sh             # dist/Stepan.app, .zip и .dmg для этого 
 
 1. Подними `version` в `Cargo.toml` (`[workspace.package]`) и закоммить.
 2. `git tag v0.2.0 && git push origin v0.2.0`.
-3. GitHub Actions (`.github/workflows/release.yml`) соберёт Stepan для Apple Silicon и Intel и опубликует релиз с `stepan-macos-<arch>.zip` (их качает апдейтер) и `.dmg` (для людей). Установленные копии увидят его сами.
+3. GitHub Actions (`.github/workflows/release.yml`) соберёт Stepan для Apple Silicon (Intel не собираем) и опубликует релиз с `stepan-macos-arm64.zip` (их качает апдейтер) и `.dmg` (для людей). Установленные копии увидят его сами.
 
 Подробности — `docs/ROADMAP.md`.
 

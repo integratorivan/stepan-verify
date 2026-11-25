@@ -1,5 +1,5 @@
 # Push a tag `vX.Y.Z` (matching `version` in Cargo.toml) → a GitHub Release
-# with Stepan for Apple Silicon and Intel. Installed apps find it on their own.
+# with Stepan for Apple Silicon (Intel is not built). Installed apps find it on their own.
 # Run it by hand without a tag to only build (artifacts, no release).
 name: release
 
@@ -21,7 +21,7 @@ jobs:
     runs-on: macos-15
     strategy:
       matrix:
-        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+        target: [aarch64-apple-darwin]
     steps:
       - uses: actions/checkout@v4
         with:
