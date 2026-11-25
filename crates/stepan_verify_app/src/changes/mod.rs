@@ -263,6 +263,13 @@ pub struct Diagram {
     pub caption: String,
 }
 
+/// Two looks at one report: the canvas of entries and links, or show-me views.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lens {
+    Map,
+    Views,
+}
+
 /// One show-me view of how the change works.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
@@ -571,6 +578,8 @@ pub struct ChangesView {
     panel: Option<Panel>,
     /// Show the added / changed / removed columns instead of the map.
     show_list: bool,
+    /// The canvas of the change, or the show-me views of how it works.
+    lens: Lens,
     /// Ticked rows of «Проверь руками».
     checked: HashSet<usize>,
     /// Node keys put into the remark for the agent.
@@ -631,6 +640,7 @@ impl ChangesView {
             hovered_dto: None,
             panel: None,
             show_list: false,
+            lens: Lens::Map,
             checked: HashSet::new(),
             remarks: Vec::new(),
             accepted: false,
@@ -2014,7 +2024,11 @@ impl ChangesView {
             })
             // Which user flows the session went through, then the canvas of what changed.
             .child(self.render_flows(g, r, p, theme, cx))
-            .child(self.render_map_section(g, r, &fresh, canvas_h, p, theme, cx))
+            .child(self.render_lens_tabs(r, p, theme, cx))
+            .child(match self.lens {
+                Lens::Map => self.render_map_section(g, r, &fresh, canvas_h, p, theme, cx).into_any_element(),
+                Lens::Views => self.render_views(g, r, &dir, p, theme, cx),
+            })
             .when(!r.summary.is_empty(), |this| {
                 this.child(
                     div()
@@ -2026,7 +2040,6 @@ impl ChangesView {
                 )
             })
             .child(metrics(files, plus, minus, &r.code, r.risks.len(), p, theme))
-            .when_some((!r.views.is_empty()).then(|| self.render_views(g, r, &dir, p, theme, cx)), |this, v| this.child(v))
 
             .when_some(self.render_decisions(g, p, theme, cx), |this, d| this.child(d))
             .child(
@@ -3427,11 +3440,54 @@ impl ChangesView {
                     .into_any_element()
             })
             .collect();
-        v_flex()
+        if cards.is_empty() {
+            return ui::card(p)
+                .px(px(16.))
+                .py(px(14.))
+                .gap(px(4.))
+                .child(div().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).text_color(p.ink).child("В этой итерации видов нет"))
+                .child(div().text_size(px(12.5)).text_color(p.muted).child("Их пишет ревьюер с Stepan 0.2.6 — нажми «Пересобрать» или «Дополнить»."))
+                .into_any_element();
+        }
+        div().flex().flex_wrap().gap(px(12.)).items_start().children(cards).into_any_element()
+    }
+
+    /// «Карта | Как устроено»: the canvas and the show-me views are two looks at one report.
+    fn render_lens_tabs(&self, r: &Report, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let tab = |key: &'static str, icon: IconName, label: &'static str, count: Option<usize>, lens: Lens, cx: &mut Context<Self>| {
+            let active = self.lens == lens;
+            h_flex()
+                .id(key)
+                .gap(px(7.))
+                .px(px(14.))
+                .h(px(32.))
+                .rounded(px(7.))
+                .cursor_pointer()
+                .text_size(px(13.5))
+                .font_weight(if active { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+                .map(|d| if active { d.bg(p.surface).text_color(p.ink).shadow(ui::card_shadow()) } else { d.text_color(p.muted).hover(|s| s.text_color(p.ink)) })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.lens = lens;
+                    cx.notify();
+                }))
+                .child(Icon::new(icon).small())
+                .child(label)
+                .when_some(count, |d, n| d.child(div().font_family(theme.mono_font_family.clone()).text_size(px(11.5)).text_color(p.faint).child(n.to_string())))
+        };
+        h_flex()
             .gap(px(12.))
-            .child(ui::section_title("Как устроено", Some(r.views.len().to_string()), p, theme).child(ui::mono("show-me: что и как сделано", theme).text_color(p.faint)))
-            .child(div().flex().flex_wrap().gap(px(12.)).items_start().children(cards))
-            .into_any_element()
+            .child(
+                h_flex()
+                    .p(px(3.))
+                    .gap(px(2.))
+                    .rounded(px(9.))
+                    .border_1()
+                    .border_color(p.border)
+                    .bg(p.sunken)
+                    .child(tab("lens-map", IconName::Network, "Карта", None, Lens::Map, cx))
+                    .child(tab("lens-views", IconName::Eye, "Как устроено", Some(r.views.len()), Lens::Views, cx)),
+            )
+            .child(ui::mono(if self.lens == Lens::Map { "канвас: что изменилось и как связано" } else { "show-me: деревья, псевдокод, было → стало" }, theme).text_color(p.faint))
     }
 
     fn render_diagram(&self, key: String, d: &Diagram, dir: &Path, p: &Palette, theme: &Theme) -> impl IntoElement {
