@@ -67,7 +67,8 @@ impl Kind {
         }
         let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
         match ext.as_str() {
-            "html" | "htm" | "xhtml" | "pdf" => Self::Web,
+            // WKWebView plays video files with its own controls.
+            "html" | "htm" | "xhtml" | "pdf" | "mp4" | "webm" | "mov" | "m4v" => Self::Web,
             "md" | "markdown" | "mdx" => Self::Markdown,
             "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "ico" | "avif" | "svg" => Self::Image,
             _ => Self::Text,

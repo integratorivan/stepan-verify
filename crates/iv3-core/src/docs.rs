@@ -9,6 +9,9 @@
 //! ---
 //! title: Разбор /events/search
 //! project: outpoll-web
+//! kind: research           # facts | decision | research | handoff | briefing | note
+//! status: open             # decisions: proposed | accepted | superseded
+//! question: Убрать fuzzy?  # what the agent asks you; open until status says otherwise
 //! author: codex            # claude | codex | ты | авто
 //! session: 01a20e11-…      # session that wrote it
 //! task: t-0418             # board task it belongs to
@@ -16,6 +19,11 @@
 //! pinned: true
 //! ---
 //! ```
+//!
+//! Per project (`docs/<project>/`): `project.md` is the one living facts
+//! document, `decisions/` holds decisions, `research/` write-ups, `handoff/`
+//! unfinished work. A missing `kind` is guessed from that layout. Agents get
+//! the rules and the project's facts and decisions at start ([`agent_brief`]).
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -98,6 +106,85 @@ impl Author {
     }
 }
 
+/// What a document is for (its `kind`), as opposed to its file format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DocType {
+    /// `project.md`: the living facts of a project.
+    Facts,
+    Decision,
+    Research,
+    Handoff,
+    Briefing,
+    Note,
+}
+
+impl DocType {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "facts" | "project" | "фактура" | "проект" => Some(Self::Facts),
+            "decision" | "adr" | "решение" => Some(Self::Decision),
+            "research" | "investigation" | "analysis" | "разбор" | "исследование" => Some(Self::Research),
+            "handoff" | "передача" => Some(Self::Handoff),
+            "briefing" | "брифинг" => Some(Self::Briefing),
+            "note" | "notes" | "заметка" => Some(Self::Note),
+            _ => None,
+        }
+    }
+
+    /// From the folder layout: `<project>/project.md`, `…/decisions/…` and so on.
+    pub fn infer(rel: &str) -> Self {
+        let parts: Vec<&str> = rel.split('/').collect();
+        let file = parts.last().copied().unwrap_or_default().to_lowercase();
+        let dirs = &parts[..parts.len().saturating_sub(1)];
+        let has = |name: &str| dirs.iter().any(|d| d.eq_ignore_ascii_case(name));
+        if parts.len() == 2 && file == "project.md" {
+            Self::Facts
+        } else if has("decisions") {
+            Self::Decision
+        } else if has("research") {
+            Self::Research
+        } else if has("handoff") {
+            Self::Handoff
+        } else if has("briefings") || file.starts_with("briefing") {
+            Self::Briefing
+        } else {
+            Self::Note
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Facts => "фактура",
+            Self::Decision => "решение",
+            Self::Research => "разбор",
+            Self::Handoff => "передача",
+            Self::Briefing => "брифинг",
+            Self::Note => "заметка",
+        }
+    }
+}
+
+/// Statuses that close a document's question (and retire a decision).
+fn closed(status: &str) -> bool {
+    matches!(
+        status.trim().to_lowercase().as_str(),
+        "answered" | "closed" | "done" | "accepted" | "rejected" | "superseded" | "отвечено" | "закрыт" | "принято" | "отклонено" | "заменено"
+    )
+}
+
+/// Russian label for a decision status.
+pub fn status_label(status: &str) -> Option<&'static str> {
+    Some(match status.trim().to_lowercase().as_str() {
+        "proposed" | "предложено" => "предложено",
+        "accepted" | "принято" => "принято",
+        "superseded" | "заменено" => "заменено",
+        "rejected" | "отклонено" => "отклонено",
+        "open" | "открыт" => "открыт",
+        "answered" | "closed" | "отвечено" | "закрыт" => "отвечено",
+        _ => return None,
+    })
+}
+
 /// Frontmatter as written in the file; every field optional.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
@@ -109,6 +196,10 @@ pub struct Front {
     pub task: Option<String>,
     pub summary: Option<String>,
     pub pinned: bool,
+    pub kind: Option<String>,
+    pub status: Option<String>,
+    pub question: Option<String>,
+    pub supersedes: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -123,6 +214,9 @@ pub struct Doc {
     pub session: Option<String>,
     pub task: Option<String>,
     pub summary: Option<String>,
+    pub doc_type: DocType,
+    pub status: Option<String>,
+    pub question: Option<String>,
     pub pinned: bool,
     pub modified: DateTime<Utc>,
     pub size: u64,
@@ -136,6 +230,17 @@ impl Doc {
     pub fn read_minutes(&self) -> usize {
         (self.words / 180).max(1)
     }
+
+    /// The question the agent asks you, while no status closes it.
+    pub fn open_question(&self) -> Option<&str> {
+        self.question.as_deref().filter(|q| !q.trim().is_empty() && !self.status.as_deref().is_some_and(closed))
+    }
+
+    /// A decision still in force (accepted or proposed).
+    pub fn live_decision(&self) -> bool {
+        self.doc_type == DocType::Decision
+            && !self.status.as_deref().is_some_and(|s| matches!(s.trim().to_lowercase().as_str(), "superseded" | "rejected" | "заменено" | "отклонено"))
+    }
 }
 
 /// Strip YAML frontmatter: (parsed frontmatter, body).
@@ -147,8 +252,70 @@ pub fn split_front(text: &str) -> (Option<Front>, &str) {
     let body = after[end + 4..].trim_start_matches(['-']).trim_start_matches(['\r', '\n']);
     match serde_yaml::from_str::<Front>(yaml) {
         Ok(front) => (Some(front), body),
-        Err(_) => (None, body),
+        // Agents write `title: Разбор: p95` — not YAML, but meant plainly.
+        Err(_) => (Some(loose_front(yaml)), body),
     }
+}
+
+/// Frontmatter read line by line: `key: everything after the first colon`,
+/// quotes and a trailing `  # comment` dropped.
+fn loose_front(yaml: &str) -> Front {
+    let mut f = Front::default();
+    for line in yaml.lines().filter(|l| !l.starts_with([' ', '\t', '#', '-'])) {
+        let Some((key, value)) = line.split_once(':') else { continue };
+        let mut value = value.trim();
+        if let Some(at) = value.find(" #").filter(|_| !value.starts_with(['"', '\''])) {
+            value = value[..at].trim_end();
+        }
+        let value = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')).or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\''))).unwrap_or(value);
+        let value = (!value.is_empty()).then(|| value.to_owned());
+        match key.trim() {
+            "title" => f.title = value,
+            "project" => f.project = value,
+            "author" => f.author = value,
+            "session" => f.session = value,
+            "task" => f.task = value,
+            "summary" => f.summary = value,
+            "kind" => f.kind = value,
+            "status" => f.status = value,
+            "question" => f.question = value,
+            "supersedes" => f.supersedes = value,
+            "pinned" => f.pinned = value.as_deref() == Some("true"),
+            _ => {}
+        }
+    }
+    f
+}
+
+/// Set (or add) one frontmatter field of a markdown document in place,
+/// keeping everything else as written. A file without frontmatter gets one.
+pub fn set_front_field(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
+    let text = fs::read_to_string(path)?;
+    let line = format!("{key}: {value}");
+    let rest = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let out = match rest.strip_prefix("---\n").and_then(|after| after.find("\n---").map(|end| (after, end))) {
+        Some((after, end)) => {
+            let yaml = &after[..end];
+            let mut found = false;
+            let mut lines: Vec<String> = yaml
+                .lines()
+                .map(|l| {
+                    if l.split_once(':').is_some_and(|(k, _)| k.trim() == key) && !l.starts_with([' ', '\t']) {
+                        found = true;
+                        line.clone()
+                    } else {
+                        l.to_owned()
+                    }
+                })
+                .collect();
+            if !found {
+                lines.push(line);
+            }
+            format!("---\n{}{}", lines.join("\n"), &after[end..])
+        }
+        None => format!("---\n{line}\n---\n\n{rest}"),
+    };
+    fs::write(path, out)
 }
 
 /// HTML metadata: `<title>` and `<meta name="iv3:project" content="…">` tags.
@@ -178,6 +345,10 @@ pub fn html_front(text: &str) -> Front {
         task: meta("task"),
         summary: meta("summary"),
         pinned: meta("pinned").is_some_and(|v| v == "true"),
+        kind: meta("kind"),
+        status: meta("status"),
+        question: meta("question"),
+        supersedes: meta("supersedes"),
     }
 }
 
@@ -421,6 +592,7 @@ pub fn scan(home: &Home) -> Vec<Doc> {
             // docs/<project>/file.md: the folder names the project.
             let folder = rel.split_once('/').map(|(d, _)| d.to_owned());
             let project = front.project.clone().filter(|p| !p.trim().is_empty()).or(folder);
+            let doc_type = front.kind.as_deref().and_then(DocType::parse).unwrap_or_else(|| DocType::infer(&rel));
             Some(Doc {
                 read: read.get(&rel).is_some_and(|&t| t >= modified.timestamp()),
                 pinned: front.pinned || pins.contains(&rel),
@@ -434,6 +606,9 @@ pub fn scan(home: &Home) -> Vec<Doc> {
                 session: front.session.filter(|s| !s.is_empty()),
                 task: front.task.filter(|s| !s.is_empty()),
                 summary: front.summary,
+                doc_type,
+                status: front.status.filter(|s| !s.trim().is_empty()),
+                question: front.question.filter(|s| !s.trim().is_empty()),
                 modified,
                 size: meta.len(),
                 words,
@@ -461,6 +636,111 @@ fn strip_tags(html: &str) -> String {
     out
 }
 
+// ------------------------------------------------------------------ agent brief
+
+/// How much of `project.md` goes into an agent's start context.
+const FACTS_LIMIT: usize = 5000;
+/// Decisions listed in the start context (newest first).
+const DECISIONS_LIMIT: usize = 25;
+
+/// The rules for writing documents, in every agent session Stepan starts.
+/// `{docs}` is the docs folder, `{dir}` where this project's documents go,
+/// `{author}` / `{session}` fill the frontmatter.
+const RULES: &str = r#"# Документы Stepan
+
+У пользователя есть полка документов Stepan — папка `{docs}` (она же `$IV3_DOCS`). Документы этого проекта лежат в `{dir}/`, пути ниже — от этой папки. Полку читают пользователь и следующие агенты, поэтому ты пишешь туда сам, без отдельной просьбы, когда это оправдано:
+
+- **Разбор** — `research/<slug>.md`. Ты что-то исследовал: замеры, причина бага, сравнение вариантов, устройство чужого кода. Пиши, если результат пригодится позже и его нельзя восстановить из кода или git.
+- **Решение** — `decisions/<ГГГГ-ММ-ДД>-<slug>.md`. В работе выбрали подход, библиотеку, схему данных или отказались от варианта. Что выбрали, какие варианты отвергли и почему, когда стоит пересмотреть. Решение — это выбор, а не перечень сделанного.
+- **Вопрос пользователю** — развилка, которую должен решить он. Запиши варианты и свою рекомендацию в разбор, вопрос — в поле `question`, и задай его в чате. Когда ответ получен, поставь `status: answered` и запиши решение.
+- **Фактура проекта** — `project.md`, один живой документ на проект: как запускать и тестировать, где что лежит, инварианты, грабли, внешние зависимости. Не заводи второй — дополняй и исправляй этот, коротко, по разделам. Устаревшее удаляй.
+- **Передача** — `handoff/<slug>.md`, только если работа остаётся незаконченной: что сделано, что осталось, где остановился.
+
+Не пиши: отчёт о проделанной работе, пересказ диффа, то, что уже есть в коде, README, CLAUDE.md или AGENTS.md. Один точный документ лучше пяти. Нечего записать — ничего не пиши. Если пользователь ведёт тебя по шагам, пиши документ по итогу, а не после каждого шага.
+
+Формат — markdown с YAML-фронтматтером:
+
+```markdown
+---
+title: Разбор /events/search — +40 ms к p95
+kind: research          # research | decision | facts | handoff
+status: open            # решения: proposed | accepted | superseded; вопросы: open | answered
+question: Убрать fuzzy-поиск или оставить с индексом? Я бы оставил: …
+author: {author}
+session: {session}
+summary: Одна строка о сути
+---
+```
+
+Пиши по-русски, коротко, с конкретикой: цифры, пути, команды, ссылки на файлы. Если новое решение отменяет старое — поставь старому `status: superseded`, а в новом укажи `supersedes: <файл>`. Создавай папки, если их нет.
+"#;
+
+/// The text an agent session starts with: the rules plus what the shelf
+/// already knows about the project (facts, live decisions, open questions).
+/// `project` is the docs folder name (the cwd's last segment); None for a
+/// session outside any project.
+pub fn agent_brief(home: &Home, project: Option<&str>, author: &str, session: Option<&str>) -> String {
+    brief_from(&scan(home), &home.docs(), project, author, session)
+}
+
+fn brief_from(docs: &[Doc], root: &Path, project: Option<&str>, author: &str, session: Option<&str>) -> String {
+    let dir = match project {
+        Some(p) => root.join(p),
+        None => root.to_owned(),
+    };
+    let session = session.map_or_else(|| "<id сессии, если знаешь: $CLAUDE_CODE_SESSION_ID или $CODEX_THREAD_ID>".to_owned(), str::to_owned);
+    let mut out = RULES
+        .replace("{docs}", &root.display().to_string())
+        .replace("{dir}", &dir.display().to_string())
+        .replace("{author}", author)
+        .replace("{session}", &session);
+    let Some(project) = project else { return out };
+    let mine: Vec<&Doc> = docs.iter().filter(|d| d.project.as_deref() == Some(project)).collect();
+    out.push_str(&format!("\n## Что полка уже знает о проекте {project}\n\n"));
+    if mine.is_empty() {
+        out.push_str(&format!("Пока ничего. Если в этой работе выяснится, как устроен проект, начни `{}/project.md`.\n", dir.display()));
+        return out;
+    }
+    if let Some(facts) = mine.iter().find(|d| d.doc_type == DocType::Facts) {
+        let text = fs::read_to_string(&facts.path).unwrap_or_default();
+        let (_, body) = split_front(&text);
+        let body = body.trim();
+        out.push_str(&format!("### Фактура (`{}`)\n\n", facts.path.display()));
+        if body.chars().count() > FACTS_LIMIT {
+            let cut: String = body.chars().take(FACTS_LIMIT).collect();
+            out.push_str(&format!("{cut}\n\n…обрезано, полный текст — в файле.\n\n"));
+        } else {
+            out.push_str(&format!("{body}\n\n"));
+        }
+    }
+    let decisions: Vec<&&Doc> = mine.iter().filter(|d| d.live_decision()).take(DECISIONS_LIMIT).collect();
+    if !decisions.is_empty() {
+        out.push_str("### Решения в силе\n\nНе переобсуждай их без новой причины; нужное открой и прочитай целиком.\n\n");
+        for d in decisions {
+            out.push_str(&format!("- {}{} — `{}`\n", d.title, d.summary.as_deref().map(|s| format!(": {s}")).unwrap_or_default(), d.path.display()));
+        }
+        out.push('\n');
+    }
+    let questions: Vec<(&&Doc, &str)> = mine.iter().filter_map(|d| d.open_question().map(|q| (d, q))).collect();
+    if !questions.is_empty() {
+        out.push_str("### Открытые вопросы к пользователю\n\n");
+        for (d, q) in questions {
+            out.push_str(&format!("- {q} — `{}`\n", d.path.display()));
+        }
+        out.push('\n');
+    }
+    let others: Vec<&&Doc> =
+        mine.iter().filter(|d| matches!(d.doc_type, DocType::Research | DocType::Handoff) && d.open_question().is_none()).take(10).collect();
+    if !others.is_empty() {
+        out.push_str("### Последние разборы и передачи\n\n");
+        for d in others {
+            out.push_str(&format!("- {} ({}) — `{}`\n", d.title, d.doc_type.label(), d.path.display()));
+        }
+        out.push('\n');
+    }
+    out
+}
+
 // ------------------------------------------------------------------ groups
 
 /// Label of the group for documents without a project.
@@ -483,8 +763,12 @@ pub fn group_by_project(docs: &[Doc]) -> Vec<(String, Vec<usize>)> {
         }
     }
     let mut projects: Vec<(String, Vec<usize>)> = by.into_iter().collect();
-    // `docs` is newest first, so the first index is the newest document.
-    projects.sort_by(|a, b| docs[b.1[0]].modified.cmp(&docs[a.1[0]].modified));
+    // The project's facts open its group: it is the document you return to.
+    for (_, list) in &mut projects {
+        list.sort_by_key(|&i| docs[i].doc_type != DocType::Facts);
+    }
+    let newest = |list: &[usize]| list.iter().map(|&i| docs[i].modified).max();
+    projects.sort_by_key(|g| std::cmp::Reverse(newest(&g.1)));
     groups.extend(projects);
     if !loose.is_empty() {
         groups.push((NO_PROJECT.into(), loose));
@@ -546,6 +830,9 @@ mod tests {
             session: None,
             task: None,
             summary: None,
+            doc_type: DocType::infer(rel),
+            status: None,
+            question: None,
             pinned,
             modified,
             size: 0,
@@ -565,6 +852,14 @@ mod tests {
         assert_eq!(Author::parse(front.author.as_deref().unwrap()), Some(Author::Codex));
         assert!(front.pinned);
         assert!(body.starts_with("# Другое"));
+
+        // Colons inside values are not YAML but still meant plainly.
+        let (front, _) = split_front("---\ntitle: Разбор: p95 вырос\nkind: research   # комментарий\nquestion: \"Убрать: fuzzy?\"\nstatus: open\n---\nтекст");
+        let front = front.unwrap();
+        assert_eq!(front.title.as_deref(), Some("Разбор: p95 вырос"));
+        assert_eq!(front.kind.as_deref(), Some("research"));
+        assert_eq!(front.question.as_deref(), Some("Убрать: fuzzy?"));
+        assert_eq!(front.status.as_deref(), Some("open"));
 
         let (none, body) = split_front("# Просто заголовок\nтекст");
         assert!(none.is_none());
@@ -649,6 +944,74 @@ mod tests {
         assert_eq!(p95.given, 1);
         assert!(docs.iter().find(|d| d.rel == "map.html").unwrap().pinned);
         assert!(!toggle_pin(&home, "map.html"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn front_field_edit() {
+        let path = std::env::temp_dir().join(format!("iv3-front-{}.md", std::process::id()));
+        fs::write(&path, "---\ntitle: A\nstatus: open\nquestion: Да?\n---\n# A\n\nстатус: не трогать\n").unwrap();
+        set_front_field(&path, "status", "answered").unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "---\ntitle: A\nstatus: answered\nquestion: Да?\n---\n# A\n\nстатус: не трогать\n");
+        set_front_field(&path, "pinned", "true").unwrap();
+        let (front, _) = split_front(&fs::read_to_string(&path).unwrap());
+        assert!(front.unwrap().pinned);
+        fs::write(&path, "# Без фронтматтера\n").unwrap();
+        set_front_field(&path, "status", "accepted").unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        let (front, body) = split_front(&text);
+        assert_eq!(front.unwrap().status.as_deref(), Some("accepted"));
+        assert_eq!(body, "# Без фронтматтера\n");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn types_and_questions() {
+        assert_eq!(DocType::infer("iv3/project.md"), DocType::Facts);
+        assert_eq!(DocType::infer("project.md"), DocType::Note);
+        assert_eq!(DocType::infer("iv3/decisions/2026-11-25-x.md"), DocType::Decision);
+        assert_eq!(DocType::infer("iv3/research/p95.md"), DocType::Research);
+        assert_eq!(DocType::infer("briefing-24.md"), DocType::Briefing);
+        assert_eq!(DocType::parse("Решение"), Some(DocType::Decision));
+        let mut d = doc("iv3/research/p95.md", Some("iv3"), Utc::now(), false);
+        d.question = Some("Убрать fuzzy?".into());
+        assert_eq!(d.open_question(), Some("Убрать fuzzy?"));
+        d.status = Some("answered".into());
+        assert_eq!(d.open_question(), None);
+        let mut dec = doc("iv3/decisions/a.md", Some("iv3"), Utc::now(), false);
+        assert!(dec.live_decision());
+        dec.status = Some("superseded".into());
+        assert!(!dec.live_decision());
+    }
+
+    #[test]
+    fn brief_lists_project_knowledge() {
+        let root = std::env::temp_dir().join(format!("iv3-brief-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let home = Home { root: root.clone() };
+        let dir = home.docs().join("iv3");
+        fs::create_dir_all(dir.join("decisions")).unwrap();
+        fs::create_dir_all(dir.join("research")).unwrap();
+        fs::write(dir.join("project.md"), "---\ntitle: iv3\n---\n## Запуск\n\ncargo run, IV3_HOME для тестов").unwrap();
+        fs::write(dir.join("decisions/a.md"), "---\ntitle: WKWebView для HTML\nstatus: accepted\nsummary: нативно, без Electron\n---\n").unwrap();
+        fs::write(dir.join("decisions/b.md"), "---\ntitle: Старое решение\nstatus: superseded\n---\n").unwrap();
+        fs::write(dir.join("research/q.md"), "---\ntitle: Поиск\nquestion: Убрать fuzzy?\n---\n").unwrap();
+        fs::write(home.docs().join("other.md"), "# Чужое").unwrap();
+
+        let brief = agent_brief(&home, Some("iv3"), "claude", Some("abc"));
+        assert!(brief.contains("session: abc") && brief.contains("author: claude"));
+        assert!(brief.contains(&format!("лежат в `{}/`", dir.display())));
+        assert!(brief.contains("IV3_HOME для тестов"), "facts body is included");
+        assert!(brief.contains("WKWebView для HTML: нативно, без Electron"));
+        assert!(!brief.contains("Старое решение"), "superseded decisions are left out");
+        assert!(brief.contains("Убрать fuzzy?"));
+        assert!(!brief.contains("Чужое"));
+
+        let empty = agent_brief(&home, Some("new-project"), "codex", None);
+        assert!(empty.contains("Пока ничего") && empty.contains("$CODEX_THREAD_ID"));
+        let loose = agent_brief(&home, None, "codex", None);
+        assert!(!loose.contains("Что полка уже знает"));
         let _ = fs::remove_dir_all(root);
     }
 }

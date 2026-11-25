@@ -150,6 +150,43 @@ pub fn snapshot(cwd: &Path) -> Option<String> {
     stash.or_else(|| git(cwd, &["rev-parse", "HEAD"]).map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()))
 }
 
+/// Tool state, build output and vendored deps: never part of the change map.
+/// (`.github/` and other dot-folders of the project itself still count.)
+pub fn is_noise(path: &str) -> bool {
+    const DIRS: [&str; 7] = [".omc", ".claude", ".git", "node_modules", "target", "dist", ".next"];
+    let mut parts = path.trim().trim_start_matches("./").split('/').filter(|c| !c.is_empty()).peekable();
+    while let Some(c) = parts.next() {
+        if parts.peek().is_none() {
+            return c == ".DS_Store";
+        }
+        if DIRS.contains(&c) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Drop the files of a `git diff` text that are tool state or build output.
+fn without_noise(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, chunk) in text.split("\ndiff --git ").enumerate() {
+        let body = if i == 0 { chunk.strip_prefix("diff --git ").unwrap_or(chunk) } else { chunk };
+        let path = body.lines().next().and_then(|h| h.split(" b/").nth(1)).unwrap_or_default();
+        if body.trim().is_empty() || (!path.is_empty() && is_noise(path)) {
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("diff --git ");
+        out.push_str(body);
+    }
+    if text.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 /// Tracked changes against `base` (HEAD when none) plus untracked files
 /// (only those touched after `since`, when given), capped in size.
 pub fn diff(cwd: &Path, base: Option<&str>, since: Option<SystemTime>) -> String {
@@ -158,9 +195,9 @@ pub fn diff(cwd: &Path, base: Option<&str>, since: Option<SystemTime>) -> String
         return String::new();
     }
     let base = base.unwrap_or("HEAD");
-    let mut out = git(cwd, &["diff", "--no-color", "--no-ext-diff", "-U3", base]).unwrap_or_default();
+    let mut out = without_noise(&git(cwd, &["diff", "--no-color", "--no-ext-diff", "-U3", base]).unwrap_or_default());
     let untracked = git(cwd, &["ls-files", "--others", "--exclude-standard"]).unwrap_or_default();
-    for rel in untracked.lines().filter(|l| !l.trim().is_empty()).take(40) {
+    for rel in untracked.lines().filter(|l| !l.trim().is_empty() && !is_noise(l)).take(40) {
         if out.len() > MAX {
             break;
         }
@@ -195,6 +232,9 @@ pub fn parse_patch(text: &str) -> Vec<(String, String)> {
     for chunk in text.split("\ndiff --git ").map(|c| c.strip_prefix("diff --git ").unwrap_or(c)) {
         let Some(header) = chunk.lines().next() else { continue };
         let Some(path) = header.split(" b/").nth(1) else { continue };
+        if is_noise(path) {
+            continue;
+        }
         let body = chunk.find("\n@@").map(|i| &chunk[i + 1..]).unwrap_or("");
         if !body.is_empty() {
             files.push((path.trim().to_owned(), body.trim_end().to_owned()));
@@ -243,5 +283,19 @@ mod tests {
         assert_eq!(files[0].0, "m.js");
         assert!(files[0].1.starts_with("@@ -1,2") && files[0].1.contains("+b"));
         assert_eq!(files[1].0, "n.js");
+    }
+
+    #[core::prelude::v1::test]
+    fn tool_state_and_build_output_are_not_the_change() {
+        for noise in [".omc/project-memory.json", "crates/.omc/state/x.json", ".claude/skills/a/SKILL.md", "web/node_modules/x/i.js", "target/debug/iv3", "apps/web/.next/cache/a", "dist/app.js", "src/.DS_Store", ".git/HEAD"] {
+            assert!(is_noise(noise), "{noise}");
+        }
+        for real in ["src/main.rs", ".github/workflows/ci.yml", "docs/target.md", "src/dist.rs", ".gitignore"] {
+            assert!(!is_noise(real), "{real}");
+        }
+        let text = "diff --git a/.omc/m.json b/.omc/m.json\n--- a/.omc/m.json\n+++ b/.omc/m.json\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/src/m.js b/src/m.js\n--- a/src/m.js\n+++ b/src/m.js\n@@ -1 +1,2 @@\n a\n+b\n";
+        let clean = without_noise(text);
+        assert!(clean.starts_with("diff --git a/src/m.js") && !clean.contains(".omc"), "{clean}");
+        assert_eq!(parse_patch(text).iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(), vec!["src/m.js"]);
     }
 }

@@ -127,6 +127,9 @@ fn spawn(spec: &SessionSpec, shared: &Arc<Mutex<Shared>>, store: &ImageStore, ev
     if let Some(model) = &spec.model {
         cmd.args(["--model", model]);
     }
+    if let Some(text) = spec.instructions.as_deref().filter(|t| !t.trim().is_empty()) {
+        cmd.args(["--append-system-prompt", text]);
+    }
     if crate::board_home(spec).is_some() {
         cmd.args(["--allowedTools", "Bash(iv3 task *)"]);
     }

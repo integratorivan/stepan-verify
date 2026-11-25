@@ -25,6 +25,48 @@ pub fn init(cx: &mut App) {
     Theme::change(appearance, None, cx);
 }
 
+/// The embedded text face, always available.
+pub const DEFAULT_FONT: &str = "Instrument Sans";
+/// Monospace faces every Mac has, tried when the chosen one is missing.
+const MONO_FALLBACKS: [&str; 2] = ["SF Mono", "Menlo"];
+
+/// Font families on this machine plus the embedded ones, sorted, no hidden `.`-faces.
+pub fn font_families(cx: &App) -> Vec<String> {
+    let mut all = cx.text_system().all_font_names();
+    all.push(DEFAULT_FONT.to_owned());
+    all.retain(|f| !f.starts_with('.'));
+    all.sort_by_key(|f| f.to_lowercase());
+    all.dedup();
+    all
+}
+
+/// Put the fonts from settings into both themes (so light/dark switches keep
+/// them) and into the live theme. GPUI panics on a family it cannot find, so a
+/// missing choice falls back instead of reaching the text system.
+pub fn apply_fonts(cx: &mut App) {
+    let config = crate::settings::config(cx).appearance.clone();
+    let have = font_families(cx);
+    let installed = |f: &str| have.iter().any(|h| h == f);
+    let text: SharedString = if installed(&config.font) { config.font.clone() } else { DEFAULT_FONT.to_owned() }.into();
+    let mono: SharedString = if installed(&config.mono_font) {
+        config.mono_font.clone()
+    } else {
+        MONO_FALLBACKS.iter().find(|f| installed(f)).map_or("Menlo", |f| *f).to_owned()
+    }
+    .into();
+    Theme::update(cx, |t| {
+        for slot in [&mut t.light_theme, &mut t.dark_theme] {
+            let mut c = (**slot).clone();
+            c.font_family = Some(text.clone());
+            c.mono_font_family = Some(mono.clone());
+            *slot = std::rc::Rc::new(c);
+        }
+        t.font_family = text;
+        t.mono_font_family = mono;
+    });
+    cx.refresh_windows();
+}
+
 /// A status: solid color, soft background, readable text on the soft background.
 #[derive(Clone, Copy)]
 pub struct Tone {

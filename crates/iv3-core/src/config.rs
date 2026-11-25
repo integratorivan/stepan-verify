@@ -90,11 +90,107 @@ pub struct ChangesConfig {
     pub model: String,
     /// Codex model slug for reports on Codex sessions; empty = Codex's own default.
     pub codex_model: String,
+    /// Before/after screenshots and videos (pr-before-after) after an agent's turn.
+    pub media: MediaMode,
 }
 
 impl Default for ChangesConfig {
     fn default() -> Self {
-        Self { model: "sonnet".into(), codex_model: String::new() }
+        Self { model: "sonnet".into(), codex_model: String::new(), media: MediaMode::Auto }
+    }
+}
+
+/// When the before/after pass runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaMode {
+    /// After every turn that touched UI files.
+    #[default]
+    Auto,
+    /// Only by the button in «Изменения».
+    Manual,
+    Off,
+}
+
+impl MediaMode {
+    pub const ALL: [MediaMode; 3] = [MediaMode::Auto, MediaMode::Manual, MediaMode::Off];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MediaMode::Auto => "после хода",
+            MediaMode::Manual => "по кнопке",
+            MediaMode::Off => "выкл",
+        }
+    }
+}
+
+/// The «Документы» shelf and how agents feed it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DocsConfig {
+    /// Every agent session iv3 starts gets the document rules plus the
+    /// project's facts, decisions and open questions.
+    pub brief: bool,
+    /// After a session goes quiet, a subagent writes down its decisions and facts.
+    pub distill: DistillMode,
+    /// Minutes without a new turn before a session counts as quiet.
+    pub distill_after_min: u64,
+}
+
+impl Default for DocsConfig {
+    fn default() -> Self {
+        Self { brief: true, distill: DistillMode::Auto, distill_after_min: 10 }
+    }
+}
+
+/// When the post-session distiller runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DistillMode {
+    /// When a session has been quiet for `distill_after_min`.
+    #[default]
+    Auto,
+    Off,
+}
+
+impl DistillMode {
+    pub const ALL: [DistillMode; 2] = [DistillMode::Auto, DistillMode::Off];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DistillMode::Auto => "после сессии",
+            DistillMode::Off => "выкл",
+        }
+    }
+}
+
+/// Interface fonts; each falls back to a safe face when not installed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppearanceConfig {
+    /// Text: Instrument Sans is embedded in the app, so it is always there.
+    pub font: String,
+    /// Code, paths, ids.
+    pub mono_font: String,
+}
+
+impl Default for AppearanceConfig {
+    fn default() -> Self {
+        Self { font: "Instrument Sans".into(), mono_font: "Fira Code".into() }
+    }
+}
+
+/// New versions from GitHub Releases.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdatesConfig {
+    /// Look for a new release at start and every few hours.
+    pub check: bool,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self { check: true }
     }
 }
 
@@ -129,6 +225,9 @@ pub fn codex_default_model() -> Option<String> {
 pub struct Config {
     pub agents: AgentsConfig,
     pub changes: ChangesConfig,
+    pub docs: DocsConfig,
+    pub appearance: AppearanceConfig,
+    pub updates: UpdatesConfig,
 }
 
 impl Config {
@@ -161,6 +260,8 @@ mod tests {
         let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.agents.mode, AgentMode::Full);
         assert_eq!(config.changes.model, "sonnet");
+        assert!(config.docs.brief);
+        assert_eq!(config.docs.distill, DistillMode::Auto);
     }
 
     #[test]

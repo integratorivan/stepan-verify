@@ -47,6 +47,10 @@ pub struct SessionSpec {
     pub env: Vec<(String, String)>,
     /// Model override (`sonnet`, `gpt-5`…); the CLI default otherwise.
     pub model: Option<String>,
+    /// Added to the agent's own system prompt: Claude `--append-system-prompt`,
+    /// Codex `developerInstructions` (a resumed Codex thread keeps the ones it
+    /// started with).
+    pub instructions: Option<String>,
 }
 
 /// A message to the agent: text plus attached images (local files).

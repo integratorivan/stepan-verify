@@ -51,6 +51,8 @@ pub struct Launch {
     autopilot: bool,
     /// `--preview <path>`: open a file in the preview panel.
     preview: Option<PathBuf>,
+    /// `--doc <rel>`: open «Документы» on this document (path inside docs/).
+    doc: Option<String>,
 }
 
 impl Launch {
@@ -72,6 +74,10 @@ impl Launch {
                 "--changes" => launch.changes = true,
                 "--autopilot" => launch.autopilot = true,
                 "--preview" => launch.preview = args.next().map(|p| std::fs::canonicalize(&p).unwrap_or_else(|_| p.into())),
+                "--doc" => {
+                    launch.doc = args.next();
+                    launch.page = Some(Page::Docs);
+                }
                 "--page" => {
                     launch.page = match args.next().as_deref() {
                         Some("tasks") => Some(Page::Tasks),
@@ -126,6 +132,8 @@ pub struct AppView {
     pub skills: Vec<String>,
     docs: Entity<DocsView>,
     skills_view: Entity<crate::skills::SkillsView>,
+    /// Text and code font pickers on the settings page, made on first visit.
+    pub(crate) font_pickers: Option<[Entity<crate::settings_page::FontPicker>; 2]>,
     /// Sessions opened in this window, in opening order.
     pub(crate) open_sessions: Vec<Entity<SessionView>>,
     /// Project pickers in open dialogs, refreshed when the scan finishes.
@@ -135,6 +143,8 @@ pub struct AppView {
     preview: Option<Entity<PreviewView>>,
     /// Active sessions outside iv3, refreshed by the tick while the dashboard is shown.
     pub external: Vec<ExternalLive>,
+    /// Sessions put away: hidden from «Сейчас» and «Недавние».
+    pub archive: iv3_core::archive::Archive,
     _tick: Task<()>,
 }
 
@@ -143,6 +153,7 @@ const LEASE: Duration = Duration::from_secs(15 * 60);
 
 impl AppView {
     pub fn new(home: Home, launch: Launch, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let archive = iv3_core::archive::Archive::load(&home);
         let app_handle = cx.weak_entity();
         let docs = cx.new(|cx| DocsView::new(home.clone(), app_handle, window, cx));
         cx.subscribe_in(&docs, window, |this, _, event: &crate::docs::DocsEvent, window, cx| {
@@ -183,16 +194,21 @@ impl AppView {
             sessions: Vec::new(),
             sessions_loading: true,
             docs,
+            font_pickers: None,
             skills_view,
             open_sessions: Vec::new(),
             pickers: Vec::new(),
             launch,
             preview: None,
             external: Vec::new(),
+            archive,
             _tick: Task::ready(()),
         };
         if let Some(page) = this.launch.page {
             this.page = page;
+        }
+        if let Some(rel) = this.launch.doc.take() {
+            this.docs.update(cx, |d, _| d.open_on_load(rel));
         }
         this.autopilot = this.launch.autopilot;
         this.refresh_sessions(window, cx);
@@ -320,11 +336,34 @@ impl AppView {
         self.open_sessions.len() - 1
     }
 
-    fn close_session(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if ix < self.open_sessions.len() {
-            self.open_sessions.remove(ix);
+    /// Close an open session (its agent process stops). The page you look at
+    /// stays put unless it was this session.
+    pub(crate) fn close_session(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix >= self.open_sessions.len() {
+            return;
         }
-        self.show(Page::Dashboard, cx);
+        self.open_sessions.remove(ix);
+        let page = match self.page {
+            Page::Session(j) if j == ix => Page::Dashboard,
+            Page::Session(j) if j > ix => Page::Session(j - 1),
+            page => page,
+        };
+        self.show(page, cx);
+    }
+
+    /// Hide a session from the dashboard (or bring it back).
+    pub(crate) fn set_archived(&mut self, provider: Provider, id: &str, archived: bool, window: &mut Window, cx: &mut Context<Self>) {
+        match self.archive.set(provider, id, archived) {
+            Ok(()) => {
+                if archived {
+                    self.external.retain(|e| !(e.summary.provider == provider && e.summary.id == id));
+                }
+                let text = if archived { "Сессия в архиве · вернуть можно в «Недавние → Архив»" } else { "Сессия вернулась из архива" };
+                window.push_notification(Notification::info(text), cx);
+            }
+            Err(err) => window.push_notification(Notification::error(format!("Архив: {err:#}")), cx),
+        }
+        cx.notify();
     }
 
     /// Show a file in the panel on the right, reusing the panel if it is open.
@@ -475,7 +514,7 @@ impl AppView {
         self.external = self
             .sessions
             .iter()
-            .filter(|s| s.updated_at > recent && !open.contains(&s.id))
+            .filter(|s| s.updated_at > recent && !open.contains(&s.id) && !self.archive.contains(s.provider, &s.id) && !crate::dashboard::is_internal(&s.title))
             .filter_map(|s| {
                 let mtime = std::fs::metadata(&s.file).and_then(|m| m.modified()).ok()?;
                 let age = now.duration_since(mtime).unwrap_or_default().as_secs();
@@ -677,6 +716,7 @@ impl AppView {
                     this.hover(|st| st.bg(p.ink.opacity(0.05)))
                 }
             })
+            .group(SharedString::from("nav-session"))
             .on_click(cx.listener(move |this, _, _, cx| this.show(Page::Session(ix), cx)))
             .child(div().mt(px(2.)).child(Icon::new(icon).small().text_color(color)))
             .child(
@@ -694,6 +734,27 @@ impl AppView {
                             .child(div().text_color(p.faint).child("·"))
                             .child(div().min_w_0().truncate().text_color(state_color).child(state)),
                     ),
+            )
+            // Close: appears on hover; stops the agent process of this window.
+            .child(
+                div()
+                    .id(SharedString::from(format!("nav-session-close:{ix}")))
+                    .flex_shrink_0()
+                    .size(px(20.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(5.))
+                    .opacity(0.)
+                    .group_hover("nav-session", |s| s.opacity(1.))
+                    .hover(|s| s.bg(p.ink.opacity(0.08)))
+                    .cursor_pointer()
+                    .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Закрыть сессию").build(window, cx))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.close_session(ix, cx);
+                    }))
+                    .child(Icon::new(IconName::Close).xsmall().text_color(p.muted)),
             )
     }
 
@@ -769,34 +830,12 @@ impl AppView {
                     .px(px(4.))
                     .gap(px(10.))
                     .child(
-                        div()
-                            .relative()
-                            .size(px(30.))
-                            .rounded(px(7.))
-                            .bg(p.ink)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(theme.background)
-                            .child("iv3")
-                            .child(
-                                div()
-                                    .absolute()
-                                    .right(px(-3.))
-                                    .bottom(px(-3.))
-                                    .size(px(9.))
-                                    .rounded(px(3.))
-                                    .bg(p.accent.solid)
-                                    .border_2()
-                                    .border_color(p.sunken),
-                            ),
+                        img(crate::icons::LOGO).size(px(34.)).flex_shrink_0(),
                     )
                     .child(
                         v_flex()
                             .gap(px(3.))
-                            .child(div().text_size(px(19.)).line_height(px(19.)).font_weight(FontWeight::BOLD).text_color(p.ink).child("iv3"))
+                            .child(div().text_size(px(19.)).line_height(px(19.)).font_weight(FontWeight::BOLD).text_color(p.ink).child("Stepan"))
                             .child(ui::mono("AGENT CONTROL", &theme).text_size(px(10.5)).text_color(p.muted)),
                     ),
             )
@@ -834,6 +873,7 @@ impl AppView {
                 )
             })
             .when(live_count == 0, |this| this.child(div().flex_1()))
+            .children(update_card(&p, &theme, cx))
             // Footer: autopilot and theme
             .child(
                 h_flex()
@@ -903,7 +943,10 @@ impl Render for AppView {
             Page::Tasks => crate::board::render(self, window, cx).into_any_element(),
             Page::Docs => self.docs.clone().into_any_element(),
             Page::Skills => self.skills_view.clone().into_any_element(),
-            Page::Settings => crate::settings_page::render(self, window, cx).into_any_element(),
+            Page::Settings => {
+                crate::settings_page::ensure_pickers(self, window, cx);
+                crate::settings_page::render(self, window, cx).into_any_element()
+            }
             Page::Session(ix) => match self.open_sessions.get(ix) {
                 Some(view) => view.clone().into_any_element(),
                 None => dashboard::render(self, window, cx).into_any_element(),
@@ -933,4 +976,43 @@ impl Render for AppView {
 
 fn dirs_home() -> PathBuf {
     std::env::var_os("HOME").map(Into::into).unwrap_or_default()
+}
+
+/// «Доступна версия …» above the autopilot card, while there is one.
+fn update_card(p: &Palette, theme: &gpui_kit::component::Theme, cx: &mut Context<AppView>) -> Option<AnyElement> {
+    use crate::update::{self, State};
+    let (title, sub, action): (String, String, Option<&'static str>) = match update::state(cx) {
+        State::Available(r) => (
+            format!("Доступен Stepan {}", r.version),
+            format!("у тебя {}", update::VERSION),
+            Some(if update::running_bundle().is_some() && r.zip.is_some() { "Обновить" } else { "Скачать" }),
+        ),
+        State::Installing(r) => (format!("Ставлю Stepan {}…", r.version), "перезапущусь сам".into(), None),
+        _ => return None,
+    };
+    Some(
+        h_flex()
+            .px(px(10.))
+            .py(px(9.))
+            .gap(px(8.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(ui::mix(p.accent.solid, p.border, 0.45))
+            .bg(p.accent.soft)
+            .child(Icon::new(IconName::ArrowUp).small().text_color(p.accent.text))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(div().truncate().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(p.fg).child(title))
+                    .child(ui::mono(sub, theme).text_size(px(10.5)).text_color(p.muted)),
+            )
+            .map(|row| match action {
+                Some(label) => row.child(
+                    PressButton::new("update-install").xsmall().primary().label(label).on_click(|_, _, cx| crate::update::install(cx)),
+                ),
+                None => row.child(gpui_kit::component::spinner::Spinner::new().xsmall()),
+            })
+            .into_any_element(),
+    )
 }

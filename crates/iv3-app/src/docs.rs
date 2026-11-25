@@ -16,6 +16,7 @@ use gpui_kit::component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     skeleton::Skeleton,
+    spinner::Spinner,
     text::{TextView, TextViewStyle},
     v_flex,
 };
@@ -24,7 +25,7 @@ use gpui_kit::*;
 use gpui_webview::WebView;
 use iv3_core::{
     Home, Provider, SessionSummary,
-    docs::{self, Author, Doc, DocKind, Given, Section},
+    docs::{self, Author, Doc, DocKind, DocType, Given, Section},
 };
 
 use crate::{
@@ -70,6 +71,8 @@ pub struct DocsView {
     docs: Vec<Doc>,
     loaded: bool,
     fingerprint: u64,
+    /// Document to open when the first scan lands.
+    pending_open: Option<String>,
     by_time: bool,
     collapsed: HashSet<String>,
     search: Entity<InputState>,
@@ -98,6 +101,7 @@ impl DocsView {
             docs: Vec::new(),
             loaded: false,
             fingerprint: 0,
+            pending_open: None,
             by_time: false,
             collapsed: HashSet::new(),
             search,
@@ -111,6 +115,7 @@ impl DocsView {
             _search: sub,
         };
         this.rescan(cx);
+        crate::distill::observe(cx);
         this._watch = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(1500)).await;
@@ -123,6 +128,11 @@ impl DocsView {
             }
         });
         this
+    }
+
+    /// Select `rel` once the shelf has loaded (`--doc`).
+    pub fn open_on_load(&mut self, rel: String) {
+        self.pending_open = Some(rel);
     }
 
     pub fn count(&self) -> usize {
@@ -406,6 +416,13 @@ impl Render for DocsView {
         let p = Palette::of(&theme);
         // Rendered only while the Docs page is on screen.
         self.visible = true;
+        // `--doc` wins over the first-visit default.
+        if self.loaded {
+            if let Some(rel) = self.pending_open.take() {
+                self.selected = Some(rel.clone());
+                cx.defer_in(window, move |this, window, cx| this.select(rel, window, cx));
+            }
+        }
         // Open something on first visit: the shelf is for reading.
         if self.loaded && self.open.is_none() && self.selected.is_none() {
             if let Some(first) = self.walkable(cx).into_iter().next() {
@@ -471,7 +488,18 @@ impl DocsView {
                                                 d.child(div().flex_shrink_0().text_color(p.accent.text).font_weight(FontWeight::SEMIBOLD).child(format!("{unread} {}", new_word(unread))))
                                             })
                                             .child(div().min_w_0().truncate().child(format!("{} в {}", self.docs.len(), tilde(&docs_dir)))),
-                                    ),
+                                    )
+                                    .when_some(writing_line(cx), |d, line| {
+                                        d.child(
+                                            h_flex()
+                                                .min_w_0()
+                                                .gap(px(6.))
+                                                .text_size(px(11.5))
+                                                .text_color(p.muted)
+                                                .child(Spinner::new().xsmall().color(p.faint))
+                                                .child(div().min_w_0().truncate().child(line)),
+                                        )
+                                    }),
                             )
                             .child(
                                 PressButton::new("docs-folder")
@@ -617,7 +645,7 @@ impl DocsView {
                 this.select(rel.clone(), window, cx);
             }))
             .when(!d.read, |this| this.child(div().absolute().left(px(-8.)).top(px(16.)).size(px(6.)).rounded_full().bg(p.accent.solid)))
-            .child(kind_box(d.kind, p))
+            .child(kind_box(d, p))
             .child(
                 v_flex()
                     .flex_1()
@@ -635,6 +663,8 @@ impl DocsView {
                         h_flex()
                             .gap(px(6.))
                             .children(d.author.map(|a| author_chip(a, p, theme)))
+                            .when(d.doc_type != DocType::Note, |row| row.child(type_label(d, p, theme)))
+                            .when(d.open_question().is_some(), |row| row.child(question_chip(p, theme)))
                             .child(div().font_family(mono.clone()).text_size(px(11.)).text_color(p.faint).child(docs::short_time(d.modified, chrono::Local::now())))
                             .child(div().flex_1())
                             .when(d.given > 0, |row| {
@@ -793,6 +823,7 @@ impl DocsView {
                     .text_size(px(12.5))
                     .text_color(p.muted)
                     .children(doc.author.map(|a| author_chip(a, p, theme)))
+                    .when(doc.doc_type != DocType::Note, |d| d.child(type_label(doc, p, theme)))
                     .when_some(source.clone(), |d, s| {
                         let open = s.clone();
                         d.child(
@@ -810,6 +841,8 @@ impl DocsView {
                     .when(doc.kind.readable(), |d| d.child(div().text_color(p.faint).child("·")).child(format!("{} мин чтения", doc.read_minutes()))),
             )
             .when_some(doc.summary.clone().filter(|s| !s.is_empty()), |d, s| d.child(div().text_size(px(13.5)).text_color(p.muted).child(s)))
+            .when_some(self.render_question(doc, source.clone(), p, cx), |d, q| d.child(q))
+            .when(doc.doc_type == DocType::Decision && doc.kind == DocKind::Markdown, |d| d.child(self.render_decision_bar(doc, p, theme, cx)))
             .child(
                 h_flex()
                     .relative()
@@ -853,6 +886,107 @@ impl DocsView {
                             })),
                     )
                     .when(self.menu, |d| d.child(deferred(self.render_menu(doc, p, theme, cx)).with_priority(2))),
+            )
+            .into_any_element()
+    }
+
+    /// Rewrite one frontmatter field of the open document; it stays read.
+    fn set_field(&mut self, rel: &str, key: &'static str, value: &'static str, cx: &mut Context<Self>) {
+        let Some(doc) = self.doc(rel).cloned() else { return };
+        if let Err(err) = docs::set_front_field(&doc.path, key, value) {
+            eprintln!("iv3: docs: {}: {err}", doc.rel);
+            return;
+        }
+        if let Ok(modified) = fs::metadata(&doc.path).and_then(|m| m.modified()) {
+            docs::mark_read(&self.home, &Doc { modified: modified.into(), ..doc });
+        }
+        self.rescan(cx);
+    }
+
+    /// «Агент спрашивает»: the document's open question, answered in its session.
+    fn render_question(&self, doc: &Doc, source: Option<SessionSummary>, p: &Palette, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let question = doc.open_question()?.to_owned();
+        let rel = doc.rel.clone();
+        let editable = doc.kind == DocKind::Markdown;
+        Some(
+            h_flex()
+                .mt(px(4.))
+                .p(px(14.))
+                .gap(px(12.))
+                .items_start()
+                .rounded(px(8.))
+                .border_1()
+                .border_color(ui::mix(p.amber.solid, p.border, 0.45))
+                .bg(p.amber.soft)
+                .child(Icon::new(IconName::Info).small().text_color(p.amber.text).mt(px(2.)))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap(px(4.))
+                        .child(div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(p.amber.text).child("Агент спрашивает"))
+                        .child(div().text_size(px(14.)).line_height(px(21.)).text_color(p.ink).child(question)),
+                )
+                .child(
+                    v_flex()
+                        .flex_shrink_0()
+                        .gap(px(6.))
+                        .items_end()
+                        .when_some(source, |d, s| {
+                            d.child(
+                                PressButton::new("doc-answer")
+                                    .small()
+                                    .label("Ответить в сессии")
+                                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(DocsEvent::OpenSession(s.clone())))),
+                            )
+                        })
+                        .when(editable, |d| {
+                            d.child(
+                                PressButton::new("doc-answered")
+                                    .small()
+                                    .ghost()
+                                    .icon(IconName::Check)
+                                    .label("Отвечено")
+                                    .tooltip("Пометить вопрос закрытым (status: answered)")
+                                    .on_click(cx.listener(move |this, _, _, cx| this.set_field(&rel, "status", "answered", cx))),
+                            )
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// A proposed decision can be accepted or rejected right here.
+    fn render_decision_bar(&self, doc: &Doc, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let status = doc.status.as_deref().map(|s| s.trim().to_lowercase()).unwrap_or_default();
+        if !matches!(status.as_str(), "proposed" | "предложено" | "") {
+            return div().into_any_element();
+        }
+        let (accept, reject) = (doc.rel.clone(), doc.rel.clone());
+        h_flex()
+            .mt(px(4.))
+            .px(px(12.))
+            .py(px(8.))
+            .gap(px(10.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(p.border)
+            .bg(p.surface)
+            .child(ui::mono("решение предложено", theme).text_color(p.muted))
+            .child(div().flex_1())
+            .child(
+                PressButton::new("doc-accept")
+                    .small()
+                    .icon(IconName::Check)
+                    .label("Принять")
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_field(&accept, "status", "accepted", cx))),
+            )
+            .child(
+                PressButton::new("doc-reject")
+                    .small()
+                    .ghost()
+                    .label("Отклонить")
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_field(&reject, "status", "rejected", cx))),
             )
             .into_any_element()
     }
@@ -1131,13 +1265,17 @@ fn reader_style() -> TextViewStyle {
     })
 }
 
-fn kind_box(kind: DocKind, p: &Palette) -> impl IntoElement {
-    let icon = match kind {
-        DocKind::Html => IconName::Globe,
-        DocKind::Markdown | DocKind::Text => IconName::FileText,
-        _ => IconName::File,
+fn kind_box(d: &Doc, p: &Palette) -> impl IntoElement {
+    let (icon, color) = match (d.doc_type, d.kind) {
+        (DocType::Facts, _) => (IconName::BookOpen, p.accent.solid),
+        (DocType::Decision, _) => (IconName::CircleCheck, if d.live_decision() { p.green.solid } else { p.faint }),
+        (DocType::Research, _) => (IconName::Search, p.muted),
+        (DocType::Handoff, _) => (IconName::ArrowRight, p.muted),
+        (DocType::Briefing, _) => (IconName::Calendar, p.muted),
+        (_, DocKind::Html) => (IconName::Globe, p.blue.solid),
+        (_, DocKind::Markdown | DocKind::Text) => (IconName::FileText, p.muted),
+        _ => (IconName::File, p.muted),
     };
-    let color = if kind == DocKind::Html { p.blue.solid } else { p.muted };
     div()
         .size(px(24.))
         .flex_shrink_0()
@@ -1149,6 +1287,30 @@ fn kind_box(kind: DocKind, p: &Palette) -> impl IntoElement {
         .items_center()
         .justify_center()
         .child(Icon::new(icon).xsmall().text_color(color))
+}
+
+/// "записываю итоги «…»" while the distiller runs.
+fn writing_line(cx: &App) -> Option<String> {
+    match crate::distill::running(cx).as_slice() {
+        [] => None,
+        [one] => Some(format!("записываю итоги «{}»…", short(one, 36))),
+        many => Some(format!("записываю итоги {} сессий…", many.len())),
+    }
+}
+
+/// "решение · принято", "фактура", "разбор" — mono, quiet.
+fn type_label(d: &Doc, p: &Palette, theme: &Theme) -> impl IntoElement {
+    let status = d.status.as_deref().and_then(docs::status_label).filter(|_| d.doc_type == DocType::Decision);
+    let text = match status {
+        Some(s) => format!("{} · {s}", d.doc_type.label()),
+        None => d.doc_type.label().to_owned(),
+    };
+    let retired = d.doc_type == DocType::Decision && !d.live_decision();
+    ui::mono(text, theme).text_size(px(11.)).text_color(if retired { p.faint } else { p.muted }).when(retired, |t| t.line_through())
+}
+
+fn question_chip(p: &Palette, theme: &Theme) -> impl IntoElement {
+    ui::chip("вопрос", p, theme).text_color(p.amber.text).border_color(ui::mix(p.amber.solid, p.border, 0.4)).bg(p.amber.soft)
 }
 
 fn author_chip(a: Author, p: &Palette, theme: &Theme) -> AnyElement {

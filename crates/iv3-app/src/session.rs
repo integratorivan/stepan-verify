@@ -108,6 +108,7 @@ impl SessionView {
             image_cache: Some(image_cache()),
             env: Vec::new(),
             model: None,
+            instructions: docs_brief(summary.provider, summary.cwd.as_deref(), Some(&summary.id), cx),
         };
         Self::new(summary.provider, summary.title.clone(), summary.project(), spec, window, cx)
     }
@@ -127,6 +128,7 @@ impl SessionView {
             provider: agent_provider(provider),
             native_id: None,
             transcript: None,
+            instructions: docs_brief(provider, Some(cwd.as_path()), None, cx),
             cwd,
             mode: crate::settings::agent_mode(cx),
             image_cache: Some(image_cache()),
@@ -155,6 +157,7 @@ impl SessionView {
             provider: agent_provider(provider),
             native_id: None,
             transcript: None,
+            instructions: docs_brief(provider, Some(cwd.as_path()), None, cx),
             cwd,
             mode: crate::settings::agent_mode(cx),
             image_cache: Some(image_cache()),
@@ -316,6 +319,9 @@ impl SessionView {
             }
             AgentEvent::SessionId(id) => self.native_id = Some(id),
             AgentEvent::TurnStarted => {
+                if let Some(key) = &self.native_id {
+                    crate::distill::turn_started(key, cx);
+                }
                 self.begin_turn(cx);
                 self.error = None;
             }
@@ -361,6 +367,9 @@ impl SessionView {
                 cx.emit(SessionEvent::TurnFinished { error: error.clone() });
                 self.error = error;
                 self.changes_progressed(cx);
+                if self.native_id.is_some() {
+                    crate::distill::turn_finished(self.changes_input(), docs_project(Some(self.cwd.as_path())), cx);
+                }
             }
             AgentEvent::Error(err) => {
                 self.error = Some(err);
@@ -460,6 +469,10 @@ impl SessionView {
         }
         cx.emit(SessionEvent::Busy);
         self.turn_started = Some(Instant::now());
+        // «Было» of the before/after pass: the work tree before the agent's first turn here.
+        if let Some(key) = self.native_id.clone().or_else(|| self.task_id.clone()) {
+            crate::changes::media::turn_started(&key, &self.cwd);
+        }
         self._ticker = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
@@ -1011,8 +1024,12 @@ impl SessionView {
         view
     }
 
-    /// A turn ended: a watched map gets the new part of the session as a batch.
+    /// A turn ended: a watched map gets the new part of the session as a batch,
+    /// and UI edits get a before/after pass (pr-before-after).
     fn changes_progressed(&mut self, cx: &mut Context<Self>) {
+        if self.native_id.is_some() || self.task_id.is_some() {
+            crate::changes::media::turn_finished(self.changes_input(), cx);
+        }
         let view = match &self.changes {
             Some(view) => view.clone(),
             None => {
@@ -1383,6 +1400,22 @@ fn first_line(s: &str, max: usize) -> String {
     }
 }
 
+/// The document rules plus what the shelf knows about the project in `cwd`,
+/// for the agent's system prompt (setting «Документы → Правила агентам»).
+fn docs_brief(provider: Provider, cwd: Option<&std::path::Path>, session: Option<&str>, cx: &App) -> Option<String> {
+    if !crate::settings::config(cx).docs.brief {
+        return None;
+    }
+    let project = docs_project(cwd);
+    Some(iv3_core::docs::agent_brief(&iv3_core::Home::locate(), project.as_deref(), &provider.label().to_lowercase(), session))
+}
+
+/// The docs folder of a session in `cwd`: its last segment, none for $HOME.
+pub(crate) fn docs_project(cwd: Option<&std::path::Path>) -> Option<String> {
+    let cwd = cwd.filter(|c| *c != home_dir())?;
+    cwd.file_name().map(|n| n.to_string_lossy().into_owned())
+}
+
 fn agent_provider(p: Provider) -> iv3_agents::Provider {
     match p {
         Provider::Claude => iv3_agents::Provider::Claude,
@@ -1403,7 +1436,7 @@ fn task_prompt(task: &BoardTask) -> String {
         .collect();
     let files = if files.is_empty() { String::new() } else { format!("\n\nФайлы к задаче:\n{}", files.join("\n")) };
     format!(
-        "Задача с доски iv3: «{title}» (id {id}).\n\n{body}{summary}{files}\n\n\
+        "Задача с доски Stepan: «{title}» (id {id}).\n\n{body}{summary}{files}\n\n\
          Ты уже взял эту задачу. Команда `iv3` есть в PATH, id задачи и твоё имя уже в окружении:\n\
          - коротко отмечай важные шаги: `iv3 task log \"что сделано\"`\n\
          - когда закончишь: `iv3 task complete \"итог; ссылка на PR, если есть\"` — задача уйдёт человеку на ревью\n\

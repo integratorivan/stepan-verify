@@ -3,3 +3,4 @@ target/
 # Claude Code plugin state (session transcripts, checkpoints)
 .omc/
 crates/.omc/
+dist/

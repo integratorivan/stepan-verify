@@ -1,6 +1,11 @@
-//! Settings: agent access mode, default agent, autopilot limit, report model.
+//! Settings: agent access mode, default agent, autopilot limit, report model,
+//! document rules and the post-session distiller, fonts, updates.
 
-use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable as _, Theme, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme, Icon, IconName, IndexPath, Sizable as _, Theme, h_flex,
+    select::{SearchableVec, Select, SelectEvent, SelectState},
+    v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use iv3_core::{AgentMode, Provider, config::ProviderSetting};
@@ -8,8 +13,37 @@ use iv3_core::{AgentMode, Provider, config::ProviderSetting};
 use crate::{
     app::AppView,
     settings,
-    ui::{self, Palette},
+    ui::{self, Palette, PressButton},
 };
+
+/// A searchable list of the machine's font families.
+pub type FontPicker = SelectState<SearchableVec<String>>;
+
+/// Make the text / code font pickers the first time the page shows.
+pub fn ensure_pickers(app: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
+    if app.font_pickers.is_some() {
+        return;
+    }
+    let families = ui::font_families(cx);
+    let config = settings::config(cx).appearance.clone();
+    let mut make = |current: &str, mono: bool| {
+        let selected = families.iter().position(|f| f == current).map(IndexPath::new);
+        let list = families.clone();
+        let state = cx.new(|cx| FontPicker::new(SearchableVec::new(list), selected, window, cx).searchable(true));
+        cx.subscribe(&state, move |_, _, event: &SelectEvent<SearchableVec<String>>, cx| {
+            if let SelectEvent::Confirm(Some(family)) = event {
+                let family = family.clone();
+                settings::update(cx, move |c| if mono { c.appearance.mono_font = family } else { c.appearance.font = family });
+                ui::apply_fonts(cx);
+            }
+        })
+        .detach();
+        state
+    };
+    let text = make(&config.font, false);
+    let mono = make(&config.mono_font, true);
+    app.font_pickers = Some([text, mono]);
+}
 
 pub fn render(app: &AppView, _: &mut Window, cx: &mut Context<AppView>) -> impl IntoElement {
     let theme = cx.theme().clone();
@@ -100,6 +134,156 @@ pub fn render(app: &AppView, _: &mut Window, cx: &mut Context<AppView>) -> impl 
                 }))
         }));
 
+    let media_modes = segmented(
+        &p,
+        iv3_core::config::MediaMode::ALL.map(|m| {
+            let active = config.changes.media == m;
+            segment(SharedString::from(format!("media-mode-{}", m.label())), active, &p)
+                .text_size(px(13.))
+                .font_weight(if active { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+                .text_color(if active { p.ink } else { p.muted })
+                .child(m.label())
+                .on_click(cx.listener(move |_, _, _, cx| settings::update(cx, move |c| c.changes.media = m)))
+                .into_any_element()
+        }),
+    );
+
+    let brief = segmented(
+        &p,
+        [(true, "вкл"), (false, "выкл")].map(|(on, label)| {
+            let active = config.docs.brief == on;
+            segment(SharedString::from(format!("docs-brief-{label}")), active, &p)
+                .text_size(px(13.))
+                .font_weight(if active { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+                .text_color(if active { p.ink } else { p.muted })
+                .child(label)
+                .on_click(cx.listener(move |_, _, _, cx| settings::update(cx, move |c| c.docs.brief = on)))
+                .into_any_element()
+        }),
+    );
+
+    let distill = h_flex()
+        .flex_wrap()
+        .gap(px(10.))
+        .child(segmented(
+            &p,
+            iv3_core::config::DistillMode::ALL.map(|m| {
+                let active = config.docs.distill == m;
+                segment(SharedString::from(format!("distill-{}", m.label())), active, &p)
+                    .text_size(px(13.))
+                    .font_weight(if active { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+                    .text_color(if active { p.ink } else { p.muted })
+                    .child(m.label())
+                    .on_click(cx.listener(move |_, _, _, cx| settings::update(cx, move |c| c.docs.distill = m)))
+                    .into_any_element()
+            }),
+        ))
+        .when(config.docs.distill == iv3_core::config::DistillMode::Auto, |row| {
+            row.child(segmented(
+                &p,
+                [5u64, 10, 20, 30].map(|n| {
+                    let active = config.docs.distill_after_min == n;
+                    segment(SharedString::from(format!("distill-after-{n}")), active, &p)
+                        .justify_center()
+                        .text_size(px(13.))
+                        .font_weight(if active { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+                        .text_color(if active { p.ink } else { p.muted })
+                        .child(format!("{n} мин"))
+                        .on_click(cx.listener(move |_, _, _, cx| settings::update(cx, move |c| c.docs.distill_after_min = n)))
+                        .into_any_element()
+                }),
+            ))
+        });
+
+    // What is in use right now (a missing choice has fallen back).
+    let (text_font, mono_font) = (theme.font_family.clone(), theme.mono_font_family.clone());
+    let font_row = |picker: Option<&Entity<FontPicker>>, id: &'static str, sample: &'static str, family: SharedString, chosen: &str, mono: bool| {
+        v_flex()
+            .gap(px(10.))
+            .w(px(420.))
+            .child(
+                h_flex()
+                    .gap(px(8.))
+                    .children(picker.map(|state| Select::new(state).id(id).w(px(280.)).menu_max_h(px(360.)).placeholder("Шрифт")))
+                    .child(
+                        PressButton::new(SharedString::from(format!("{id}-reset")))
+                            .small()
+                            .ghost()
+                            .label("По умолчанию")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                settings::update(cx, move |c| {
+                                    let d = iv3_core::config::AppearanceConfig::default();
+                                    if mono { c.appearance.mono_font = d.mono_font } else { c.appearance.font = d.font }
+                                });
+                                ui::apply_fonts(cx);
+                                this.font_pickers = None;
+                                ensure_pickers(this, window, cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .px(px(12.))
+                    .py(px(10.))
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(p.border)
+                    .bg(p.surface)
+                    .font_family(family.clone())
+                    .text_size(px(if mono { 12.5 } else { 14. }))
+                    .text_color(p.fg)
+                    .child(sample),
+            )
+            .when(family.as_ref() != chosen, |d| {
+                d.child(div().text_size(px(12.)).text_color(p.amber.text).child(format!("«{chosen}» не найден на этом Mac — сейчас {family}")))
+            })
+    };
+    let pickers = app.font_pickers.clone();
+    let text_fonts = font_row(pickers.as_ref().map(|p| &p[0]), "font-text", "Агент закончил разбор: p95 упал с 182 до 61 мс. Съешь же ещё этих мягких французских булок.", text_font, &config.appearance.font, false);
+    let mono_fonts = font_row(pickers.as_ref().map(|p| &p[1]), "font-mono", "fn search(q: &str) -> Vec<Item> { /* 0O 1lI {} => != */ }", mono_font, &config.appearance.mono_font, true);
+
+    let update_state = crate::update::state(cx);
+    let update_line: String = match &update_state {
+        crate::update::State::Idle => "ещё не проверял".into(),
+        crate::update::State::Checking => "проверяю…".into(),
+        crate::update::State::UpToDate => "это последняя версия".into(),
+        crate::update::State::Available(r) => format!("доступна {} — кнопка в сайдбаре", r.version),
+        crate::update::State::Installing(r) => format!("ставлю {}…", r.version),
+        crate::update::State::Failed(e) => format!("не получилось: {e}"),
+    };
+    let updates = v_flex()
+        .gap(px(10.))
+        .child(
+            h_flex()
+                .gap(px(10.))
+                .child(segmented(
+                    &p,
+                    [(true, "проверять"), (false, "не проверять")].map(|(on, label)| {
+                        let active = config.updates.check == on;
+                        segment(SharedString::from(format!("updates-{label}")), active, &p)
+                            .text_size(px(13.))
+                            .font_weight(if active { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+                            .text_color(if active { p.ink } else { p.muted })
+                            .child(label)
+                            .on_click(cx.listener(move |_, _, _, cx| settings::update(cx, move |c| c.updates.check = on)))
+                            .into_any_element()
+                    }),
+                ))
+                .child(
+                    PressButton::new("updates-check")
+                        .small()
+                        .icon(IconName::RefreshCw)
+                        .label("Проверить сейчас")
+                        .on_click(cx.listener(|_, _, _, cx| crate::update::check(cx))),
+                ),
+        )
+        .child(
+            h_flex()
+                .gap(px(8.))
+                .child(ui::mono(format!("Stepan {}", crate::update::VERSION), &theme).text_size(px(12.)).text_color(p.fg))
+                .child(div().text_size(px(12.5)).text_color(p.muted).child(update_line)),
+        );
+
     div().id("settings").size_full().overflow_y_scroll().child(
         v_flex()
             .w_full()
@@ -139,6 +323,32 @@ pub fn render(app: &AppView, _: &mut Window, cx: &mut Context<AppView>) -> impl 
                 codex_models,
                 &p,
             ))
+            .child(row(
+                "Before / after",
+                "После хода агента с правками интерфейса агент той же семьи снимает «Было → Стало» скиллом pr-before-after: скриншоты, пары, GIF. Хранится в ~/.iv3/tmp/sessions. В «Изменениях» всегда есть кнопка «Снять before/after».",
+                media_modes,
+                &p,
+            ))
+            .child(row("Шрифт текста", "Интерфейс, документы, сообщения. Instrument Sans встроен в Stepan и есть всегда; остальные — из шрифтов этого Mac.", text_fonts, &p))
+            .child(row("Шрифт кода", "Код, диффы, пути, команды, метки. Моноширинный — иначе колонки поедут.", mono_fonts, &p))
+            .child(row(
+                "Обновления",
+                "Новые версии приходят из GitHub Releases (репозиторий публичный). Установленное приложение обновляется само и перезапускается; запущенное из cargo — открывает страницу релиза.",
+                updates,
+                &p,
+            ))
+            .child(row(
+                "Документы · правила агентам",
+                "Каждая сессия из Stepan получает правила полки (разборы, решения, фактура проекта, вопросы тебе) и то, что полка уже знает о проекте: project.md, решения в силе, открытые вопросы.",
+                brief,
+                &p,
+            ))
+            .child(row(
+                "Документы · итоги сессий",
+                "Когда сессия затихла, агент той же семьи (модель — как у «Изменений») читает новое в ней и записывает решения, фактуру проекта и открытые вопросы. Чаще всего записывать нечего — тогда он ничего не пишет.",
+                distill,
+                &p,
+            ))
             .child(
                 h_flex()
                     .pt(px(22.))
@@ -146,7 +356,7 @@ pub fn render(app: &AppView, _: &mut Window, cx: &mut Context<AppView>) -> impl 
                     .border_color(p.border)
                     .gap(px(24.))
                     .child(ui::mono(format!("Хранится в {home}/config.toml"), &theme).min_w_0().truncate().text_size(px(11.)).text_color(p.faint))
-                    .child(ui::mono(format!("iv3 {} · gpui-kit", env!("CARGO_PKG_VERSION")), &theme).flex_shrink_0().text_size(px(11.)).text_color(p.faint)),
+                    .child(ui::mono(format!("Stepan {} · gpui-kit", env!("CARGO_PKG_VERSION")), &theme).flex_shrink_0().text_size(px(11.)).text_color(p.faint)),
             ),
     )
 }

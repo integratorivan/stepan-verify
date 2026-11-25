@@ -36,7 +36,15 @@ fn listed(s: &SessionSummary) -> bool {
     let tmp = s.cwd.as_ref().is_some_and(|c| {
         c.starts_with("/private/tmp") || c.starts_with("/tmp") || c.starts_with("/private/var/folders") || c.starts_with("/var/folders")
     });
-    !tmp && !s.title.starts_with("Ты — ревьюер изменений")
+    !tmp && !is_internal(&s.title)
+}
+
+/// iv3's own helper sessions (change reviewer, map batches, before/after media):
+/// their first prompt starts with one of these.
+pub fn is_internal(title: &str) -> bool {
+    const PREFIXES: [&str; 4] = ["[iv3", "Ты — ревьюер изменений", "Ты ведёшь карту изменений", "Ты — фотограф изменений"];
+    let t = title.trim_start();
+    PREFIXES.iter().any(|p| t.starts_with(p))
 }
 
 pub fn render(app: &AppView, window: &mut Window, cx: &mut Context<AppView>) -> impl IntoElement {
@@ -44,7 +52,12 @@ pub fn render(app: &AppView, window: &mut Window, cx: &mut Context<AppView>) -> 
     let theme = &theme;
     let p = Palette::of(theme);
     let p = &p;
-    let sessions: Vec<&SessionSummary> = app.sessions.iter().filter(|s| listed(s)).collect();
+    // «Недавние» shows either the live list or the archive.
+    let archive_toggle = window.use_keyed_state("dash-archive-view", cx, |_, _| false);
+    let archive_view = *archive_toggle.read(cx);
+    let sessions: Vec<&SessionSummary> = app.sessions.iter().filter(|s| listed(s) && !app.archive.contains(s.provider, &s.id)).collect();
+    let archived: Vec<&SessionSummary> = app.sessions.iter().filter(|s| app.archive.contains(s.provider, &s.id)).collect();
+    let archived_count = archived.len();
     let now = chrono::Utc::now();
     let today = sessions.iter().filter(|s| s.updated_at > now - chrono::Duration::hours(24)).count();
     let yesterday = sessions
@@ -67,7 +80,7 @@ pub fn render(app: &AppView, window: &mut Window, cx: &mut Context<AppView>) -> 
     let mut by_project: BTreeMap<String, Vec<&SessionSummary>> = BTreeMap::new();
     // Codex Desktop keeps each chat in its own dir: one group, not fifty projects.
     let codex_chats = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Documents/Codex"));
-    for s in &sessions {
+    for s in if archive_view { &archived } else { &sessions } {
         let chat = matches!((&s.cwd, &codex_chats), (Some(c), Some(root)) if c.starts_with(root));
         let name = if chat { "Чаты Codex".to_owned() } else { s.project() };
         by_project.entry(name).or_default().push(s);
@@ -177,7 +190,7 @@ pub fn render(app: &AppView, window: &mut Window, cx: &mut Context<AppView>) -> 
                     .gap_3()
                     .child(div().flex_1().child(ui::section_title("Сейчас", (!cards.is_empty()).then(|| cards.len().to_string()), p, theme)))
                     .when(!cards.is_empty(), |this| {
-                        this.child(ui::eyebrow(format!("сначала то, что ждёт тебя · {inside} в iv3 · {outside} вне iv3"), p, theme).text_color(p.faint))
+                        this.child(ui::eyebrow(format!("сначала то, что ждёт тебя · {inside} в Stepan · {outside} вне Stepan"), p, theme).text_color(p.faint))
                     }),
             )
             .map(|this| {
@@ -203,7 +216,32 @@ pub fn render(app: &AppView, window: &mut Window, cx: &mut Context<AppView>) -> 
                 div()
                     .mt(px(30.))
                     .mb(px(12.))
-                    .child(ui::section_title("Недавние", (!loading).then(|| project_count.to_string()), p, theme)),
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .child(div().flex_1().child(ui::section_title(
+                                if archive_view { "Архив" } else { "Недавние" },
+                                (!loading).then(|| if archive_view { archived_count } else { project_count }.to_string()),
+                                p,
+                                theme,
+                            )))
+                            .when(archive_view || archived_count > 0, |this| {
+                                let toggle = archive_toggle.clone();
+                                this.child(
+                                    PressButton::new("dash-archive-toggle")
+                                        .ghost()
+                                        .small()
+                                        .icon(Icon::empty().path(if archive_view { "icons/arrow-left.svg" } else { "icons/archive.svg" }))
+                                        .label(if archive_view { "К недавним".to_owned() } else { format!("Архив · {archived_count}") })
+                                        .on_click(move |_, _, cx| {
+                                            toggle.update(cx, |v, cx| {
+                                                *v = !*v;
+                                                cx.notify();
+                                            })
+                                        }),
+                                )
+                            }),
+                    ),
             )
             .map(|this| {
                 if loading {
@@ -217,8 +255,11 @@ pub fn render(app: &AppView, window: &mut Window, cx: &mut Context<AppView>) -> 
                 }
                 let mut left = v_flex().flex_1().min_w_0().gap(px(14.));
                 let mut right = v_flex().flex_1().min_w_0().gap(px(14.));
+                if archive_view && projects.is_empty() {
+                    return this.child(div().text_size(px(13.)).text_color(p.muted).child("Архив пуст"));
+                }
                 for (i, (project, list)) in projects.into_iter().take(PROJECTS).enumerate() {
-                    let panel = project_panel(project, list, p, theme, cx);
+                    let panel = project_panel(project, list, archive_view, p, theme, cx);
                     if i % 2 == 0 {
                         left = left.child(panel);
                     } else {
@@ -632,6 +673,15 @@ fn external_card(e: &ExternalLive, p: &Palette, theme: &Theme, window: &mut Wind
             cx.stop_propagation();
             this.open_session(&open, window, cx);
         }));
+    let (provider, id) = (e.summary.provider, e.summary.id.clone());
+    let put_away = PressButton::new(SharedString::from(format!("ext-archive:{}", e.summary.id)))
+        .xsmall()
+        .icon(Icon::empty().path("icons/archive.svg"))
+        .tooltip("В архив: скрыть с дашборда")
+        .on_click(cx.listener(move |this, _, window, cx| {
+            cx.stop_propagation();
+            this.set_archived(provider, &id, true, window, cx);
+        }));
     let key = format!("ext-{}", e.summary.id);
     let fold = fold_row(&key, &e.card, p, theme, window, cx);
     let head = CardHead {
@@ -641,7 +691,7 @@ fn external_card(e: &ExternalLive, p: &Palette, theme: &Theme, window: &mut Wind
         project: e.summary.project().into(),
         outside: true,
     };
-    run_card(key, head, &e.card, footer, vec![action], None, fold, None, None, p, theme)
+    run_card(key, head, &e.card, footer, vec![put_away, action], None, fold, None, None, p, theme)
         .on_click(cx.listener(move |this, _, window, cx| this.open_session(&summary, window, cx)))
 }
 
@@ -703,7 +753,7 @@ fn short_path(path: &std::path::Path) -> String {
     }
 }
 
-fn project_panel(project: String, list: Vec<&SessionSummary>, p: &Palette, theme: &Theme, cx: &mut Context<AppView>) -> impl IntoElement {
+fn project_panel(project: String, list: Vec<&SessionSummary>, archived: bool, p: &Palette, theme: &Theme, cx: &mut Context<AppView>) -> impl IntoElement {
     let total = list.len();
     let hidden = total.saturating_sub(ROWS_PER_PROJECT);
     let path = if project == "Чаты Codex" {
@@ -746,7 +796,7 @@ fn project_panel(project: String, list: Vec<&SessionSummary>, p: &Palette, theme
                 )
                 .child(div().flex_shrink_0().font_family(mono.clone()).text_size(px(11.5)).text_color(p.muted).child(sessions_word(total))),
         )
-        .children(list.into_iter().take(ROWS_PER_PROJECT).enumerate().map(|(i, s)| session_row(i, s, p, theme, cx)))
+        .children(list.into_iter().take(ROWS_PER_PROJECT).enumerate().map(|(i, s)| session_row(i, s, archived, p, theme, cx)))
         .when(hidden > 0, |this| {
             this.child(
                 div()
@@ -763,11 +813,13 @@ fn project_panel(project: String, list: Vec<&SessionSummary>, p: &Palette, theme
         })
 }
 
-fn session_row(i: usize, s: &SessionSummary, p: &Palette, theme: &Theme, cx: &mut Context<AppView>) -> impl IntoElement {
+fn session_row(i: usize, s: &SessionSummary, archived: bool, p: &Palette, theme: &Theme, cx: &mut Context<AppView>) -> impl IntoElement {
     let open = s.clone();
+    let (provider, id) = (s.provider, s.id.clone());
     let active = (chrono::Utc::now() - s.updated_at).num_seconds() < ACTIVE_WINDOW_SECS;
     h_flex()
         .id(SharedString::from(format!("{}:{}", s.provider.label(), s.id)))
+        .group(SharedString::from("session-row"))
         .h(px(36.))
         .px(px(14.))
         .gap(px(10.))
@@ -790,6 +842,33 @@ fn session_row(i: usize, s: &SessionSummary, p: &Palette, theme: &Theme, cx: &mu
         .child(div().w(px(56.)).flex_shrink_0().child(ui::provider_chip(s.provider, p, theme).whitespace_nowrap()))
         .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).text_color(p.fg).child(s.title.clone()))
         .child(div().flex_shrink_0().font_family(theme.mono_font_family.clone()).text_size(px(11.5)).text_color(p.faint).child(ago(s.updated_at)))
+        // Archive (or restore): shows on hover so the list stays calm.
+        .child(
+            div()
+                .id(SharedString::from(format!("archive:{}:{}", s.provider.label(), s.id)))
+                .flex_shrink_0()
+                .size(px(22.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.))
+                .when(!archived, |d| d.opacity(0.).group_hover("session-row", |st| st.opacity(1.)))
+                .hover(|st| st.bg(p.ink.opacity(0.08)))
+                .cursor_pointer()
+                .tooltip(move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(if archived { "Вернуть из архива" } else { "В архив" }).build(window, cx)
+                })
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.set_archived(provider, &id, !archived, window, cx);
+                }))
+                .child(
+                    Icon::empty()
+                        .path(if archived { "icons/archive-restore.svg" } else { "icons/archive.svg" })
+                        .xsmall()
+                        .text_color(p.muted),
+                ),
+        )
 }
 
 fn sessions_word(n: usize) -> String {

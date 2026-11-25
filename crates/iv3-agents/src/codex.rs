@@ -127,12 +127,13 @@ fn session(
 
     let thread_id = match &spec.native_id {
         Some(id) => {
-            rpc.request("thread/resume", json!({"threadId": id, "excludeTurns": true}))?;
+            rpc.request("thread/resume", json!({"threadId": id, "excludeTurns": true, "developerInstructions": spec.instructions}))?;
             events.emit(AgentEvent::History(load_history(rpc, id, store)?));
             id.clone()
         }
         None => {
-            let started = rpc.request("thread/start", json!({"cwd": spec.cwd, "model": spec.model}))?;
+            let started =
+                rpc.request("thread/start", json!({"cwd": spec.cwd, "model": spec.model, "developerInstructions": spec.instructions}))?;
             let id = started.pointer("/thread/id").and_then(Value::as_str).context("thread/start без id")?;
             events.emit(AgentEvent::History(Vec::new()));
             id.to_owned()

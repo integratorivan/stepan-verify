@@ -20,3 +20,13 @@ serde.workspace = true
 serde_json.workspace = true
 # Image dimensions from the file header, to reserve layout space before decoding.
 imagesize = "0.14"
+# Word diff of node signatures on the change map (same crate iv3-agents uses for hunks).
+similar = "2"
+# Release versions from GitHub tags (updates).
+semver = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Dock icon when running as a bare binary (dev builds); bundles use AppIcon.icns.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSData"] }
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSResponder"] }

@@ -1,6 +1,7 @@
 //! iv3 core: the ~/.iv3 home (skills, tasks, docs, automations) and an index
 //! of agent sessions from Claude Code and Codex.
 
+pub mod archive;
 pub mod cli;
 pub mod config;
 pub mod docs;

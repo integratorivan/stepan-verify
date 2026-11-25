@@ -4,11 +4,15 @@
 //! (`~/.iv3/state/changes/<session>/runs/<n>/`), so the map keeps its history:
 //! you can step through iterations and see which decisions the agent took.
 
+mod canvas;
 mod map;
+pub mod media;
 mod runs;
 
 use std::{
+    cell::Cell,
     collections::HashSet,
+    rc::Rc,
     fs,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -47,6 +51,7 @@ pub enum LogItem {
 }
 
 /// What the session did, handed to the reviewer.
+#[derive(Clone)]
 pub struct ChangesInput {
     /// Cache key: the native session id.
     pub key: String,
@@ -83,6 +88,8 @@ pub struct Report {
     pub summary: String,
     pub flow: Option<Diagram>,
     pub structure: Option<Diagram>,
+    /// Extra diagrams of whatever type tells the story best: sequence, state, ER, class, …
+    pub diagrams: Vec<Diagram>,
     pub code: CodeChanges,
     /// Links the session removed (they existed before, not after).
     pub removed_edges: Vec<EdgeRef>,
@@ -91,6 +98,97 @@ pub struct Report {
     pub check: Vec<Check>,
     /// What the agent decided and why (per batch; a full run: the whole session).
     pub decisions: Vec<Decision>,
+    /// Data passed between the nodes: props, arguments, API payloads, events.
+    pub dtos: Vec<Dto>,
+    /// What the entries do together: user features, helpers, infra (canvas groups).
+    pub features: Vec<Feature>,
+    /// Tests and the entries they verify.
+    pub tests: Vec<TestRef>,
+}
+
+/// A group on the canvas: «эти штуки делают функционал X», «эти помогают».
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Feature {
+    pub id: String,
+    pub title: String,
+    pub summary: String,
+    /// feature | helper | infra | tests
+    pub kind: String,
+    /// Entry ids/names in this group.
+    pub nodes: Vec<String>,
+}
+
+/// A test and what it checks.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct TestRef {
+    pub id: String,
+    pub title: String,
+    pub file: String,
+    /// Entry ids/names it verifies.
+    pub verifies: Vec<String>,
+    /// unit | e2e | snapshot | manual
+    pub kind: String,
+    /// added | changed | existing
+    pub status: String,
+    /// pass | fail | not_run
+    pub result: String,
+}
+
+/// A structure that travels between nodes, with its fields.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Dto {
+    pub id: String,
+    pub name: String,
+    /// props | args | response | request | event | type | state | other
+    pub kind: String,
+    pub file: String,
+    /// added | changed | removed | context
+    pub status: String,
+    pub note: String,
+    pub fields: Vec<DtoField>,
+    /// Node ids/names that take or return it.
+    pub used_by: Vec<String>,
+}
+
+/// `{"name", "type", "status", "note"}` or a plain `"flyToHub?: boolean"`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(from = "FieldRepr")]
+pub struct DtoField {
+    pub name: String,
+    pub ty: String,
+    pub status: String,
+    pub note: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FieldRepr {
+    Text(String),
+    Obj {
+        #[serde(default)]
+        name: String,
+        #[serde(default, rename = "type")]
+        ty: String,
+        #[serde(default)]
+        status: String,
+        #[serde(default)]
+        note: String,
+    },
+}
+
+impl From<FieldRepr> for DtoField {
+    fn from(r: FieldRepr) -> Self {
+        match r {
+            FieldRepr::Text(t) => match t.split_once(':') {
+                Some((name, ty)) => DtoField { name: name.trim().into(), ty: ty.trim().into(), ..Default::default() },
+                None => DtoField { name: t.trim().into(), ..Default::default() },
+            },
+            FieldRepr::Obj { name, ty, status, note } => DtoField { name, ty, status, note },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -119,15 +217,65 @@ pub struct Entry {
     pub id: String,
     pub name: String,
     pub kind: String,
+    /// component | function | hook | type | dto | config | test | api | store | style | script | other
+    pub role: String,
+    /// Human name of the thing: «Диалог выбора Джокера».
+    pub entity: String,
     pub file: String,
     pub note: String,
-    /// What this entry calls, renders or depends on: ids or names.
-    pub uses: Vec<String>,
+    /// Pseudocode of the interface: `takeFlight(card: JokerCard, from: Rect) → Promise<void>`.
+    pub signature: String,
+    /// The interface before the session, when it changed.
+    pub signature_before: String,
+    /// DTO ids/names it takes and returns.
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+    /// What this entry calls, renders or depends on: ids or names, optionally
+    /// with the DTO passed along (`{"to": "id", "via": "dto id"}`).
+    pub uses: Vec<UseRef>,
     /// Hunks of this entry: full hunk text, or the `@@ … @@` header to find it.
     pub hunks: Vec<String>,
     pub line: Option<u32>,
     pub risk_ids: Vec<String>,
     pub check_ids: Vec<String>,
+}
+
+/// A `uses` link: `"id"` or `{"to": "id", "via": "dto id", "note": "…"}`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(from = "UseRepr")]
+pub struct UseRef {
+    pub to: String,
+    pub via: String,
+    pub note: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum UseRepr {
+    Text(String),
+    Obj {
+        #[serde(default, alias = "id", alias = "name")]
+        to: String,
+        #[serde(default, alias = "dto", alias = "passes")]
+        via: String,
+        #[serde(default)]
+        note: String,
+    },
+}
+
+impl From<UseRepr> for UseRef {
+    fn from(r: UseRepr) -> Self {
+        match r {
+            UseRepr::Text(to) => UseRef { to, ..Default::default() },
+            UseRepr::Obj { to, via, note } => UseRef { to, via, note },
+        }
+    }
+}
+
+impl From<&str> for UseRef {
+    fn from(to: &str) -> Self {
+        UseRef { to: to.to_owned(), ..Default::default() }
+    }
 }
 
 /// `["from", "to"]` or `{"from": …, "to": …}`.
@@ -288,6 +436,8 @@ struct Running {
 #[derive(Clone, PartialEq)]
 enum Panel {
     Node(String),
+    Dto(String),
+    Group(String),
     Checks,
     Return,
 }
@@ -304,6 +454,8 @@ pub struct ChangesView {
     follow: bool,
     mode: MapMode,
     hovered: Option<String>,
+    /// DTO under the pointer on the map: its users light up.
+    hovered_dto: Option<String>,
     panel: Option<Panel>,
     /// Show the added / changed / removed columns instead of the map.
     show_list: bool,
@@ -318,6 +470,19 @@ pub struct ChangesView {
     news: bool,
     /// The work tree diff now, for runs from before git.patch existed.
     live_git: Option<Vec<(String, String)>>,
+    /// Canvas pan and zoom.
+    view: canvas::View,
+    /// What the view was last fitted to ("run-mode"); a change refits.
+    fit_key: Option<String>,
+    drag: Option<canvas::Drag>,
+    /// Viewport size of the last fit, and whether you moved the view since:
+    /// an untouched view refits when the window resizes.
+    fit_size: (f32, f32),
+    touched: bool,
+    /// The last press moved the canvas: the click that ends it is not a click.
+    dragged: bool,
+    /// Canvas viewport on screen, written while painting.
+    viewport: Rc<Cell<Option<Bounds<Pixels>>>>,
     _ticker: Task<()>,
 }
 
@@ -341,6 +506,7 @@ impl ChangesView {
             follow,
             mode: MapMode::Diff,
             hovered: None,
+            hovered_dto: None,
             panel: None,
             show_list: false,
             checked: HashSet::new(),
@@ -349,8 +515,16 @@ impl ChangesView {
             git_patches: Default::default(),
             news: false,
             live_git: None,
+            view: canvas::View::default(),
+            fit_key: None,
+            drag: None,
+            fit_size: (0., 0.),
+            touched: false,
+            dragged: false,
+            viewport: Rc::new(Cell::new(None)),
             _ticker: Task::ready(()),
         };
+        media::observe(cx);
         this.reload(None);
         if this.runs.is_empty() {
             this.start(cx);
@@ -479,6 +653,7 @@ impl ChangesView {
             image_cache: Some(iv3_core::Home::locate().state().join("images")),
             env: vec![("IV3_CHANGES_OUT".into(), dir.display().to_string())],
             model,
+            instructions: None,
         };
         let (handle, events) = iv3_agents::open(spec);
         handle.send(match kind {
@@ -673,6 +848,35 @@ impl ChangesView {
         n.and_then(|n| self.git_patches.get(&n)).filter(|p| !p.is_empty()).or(self.live_git.as_ref()).cloned().unwrap_or_default()
     }
 
+    /// A press on the canvas: it may become a pan.
+    fn drag_start(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        self.drag = Some(canvas::Drag::new((f32::from(at.x), f32::from(at.y)), self.view));
+        self.dragged = false;
+        cx.notify();
+    }
+
+    /// A window position relative to the canvas viewport.
+    fn local(&self, at: Point<Pixels>) -> (f32, f32) {
+        let o = self.viewport.get().map(|b| b.origin).unwrap_or_default();
+        (f32::from(at.x - o.x), f32::from(at.y - o.y))
+    }
+
+    fn zoom_center(&mut self, factor: f32, cx: &mut Context<Self>) {
+        let center = self.viewport.get().map_or((400., 300.), |b| (f32::from(b.size.width) / 2., f32::from(b.size.height) / 2.));
+        self.view = self.view.zoom_at(factor, center);
+        self.touched = true;
+        cx.notify();
+    }
+
+    fn fit(&mut self, world: (f32, f32), cx: &mut Context<Self>) {
+        if let Some(b) = self.viewport.get() {
+            self.fit_size = (f32::from(b.size.width), f32::from(b.size.height));
+            self.view = canvas::View::fit(world, self.fit_size);
+            self.touched = false;
+            cx.notify();
+        }
+    }
+
     fn remark_text(&self, graph: &Graph, note: &str) -> String {
         let title = self.report().map(|r| r.title.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| self.input.title.clone());
         let mut text = format!("Ревью изменений «{title}» — верни на доработку:\n");
@@ -711,9 +915,18 @@ fn find_skill() -> Option<PathBuf> {
 const SCHEMA: &str = "{\"title\": \"заголовок изменений\", \"summary\": \"2–4 предложения простым языком: что изменилось для продукта и пользователя\",\n\
  \"flow\": {\"title\": \"…\", \"image\": \"flow.png\", \"mermaid\": \"исходник\", \"caption\": \"одна фраза\"} или null,\n\
  \"structure\": {\"title\": \"…\", \"image\": \"structure.png\", \"caption\": \"…\"} или null,\n\
+ \"diagrams\": [{\"title\": \"…\", \"image\": \"lifecycle.png\", \"mermaid\": \"исходник\", \"caption\": \"…\"}],\n\
  \"code\": {\"added\": [{\"id\": \"короткий_id\", \"name\": \"имя как в коде\", \"kind\": \"function|component|hook|endpoint|route|type|table|config|test|file|other\", \
-\"file\": \"путь от корня проекта\", \"line\": 42, \"note\": \"зачем, одной фразой\", \"uses\": [\"id или имя\"], \
+\"role\": \"component|function|hook|type|dto|config|test|api|store|style|script|other\", \"entity\": \"человеческое имя сущности\", \
+\"file\": \"путь от корня проекта\", \"line\": 42, \"note\": \"зачем, одной фразой\", \
+\"signature\": \"takeFlight(card: JokerCard, from: Rect) → Promise<void>\", \"signature_before\": \"только если интерфейс менялся\", \
+\"inputs\": [\"id DTO\"], \"outputs\": [\"id DTO\"], \"uses\": [\"id\", {\"to\": \"id\", \"via\": \"id DTO\", \"note\": \"что и зачем передаёт\"}], \
 \"hunks\": [\"@@ -41,19 +46,33 @@\"], \"risk_ids\": [\"r1\"], \"check_ids\": [\"c1\"]}], \"removed\": [], \"changed\": [], \"context\": []},\n\
+ \"dtos\": [{\"id\": \"joker_props\", \"name\": \"JokerPickDialogProps\", \"kind\": \"props|args|response|request|event|state|type\", \"file\": \"путь\", \
+\"status\": \"added|changed|removed|context\", \"note\": \"что это за данные\", \"fields\": [{\"name\": \"flyToHub\", \"type\": \"boolean?\", \"status\": \"added|changed|removed|context\", \"note\": \"зачем\"}], \
+\"used_by\": [\"id узла\"]}],\n\
+ \"features\": [{\"id\": \"f1\", \"title\": \"функционал простыми словами\", \"summary\": \"что он даёт пользователю\", \"kind\": \"feature|helper|infra|tests\", \"nodes\": [\"id\"]}],\n\
+ \"tests\": [{\"id\": \"t1\", \"title\": \"что проверяет\", \"file\": \"путь\", \"verifies\": [\"id узла\"], \"kind\": \"unit|e2e|snapshot|manual\", \"status\": \"added|changed|existing\", \"result\": \"pass|fail|not_run\"}],\n\
  \"removed_edges\": [[\"id откуда\", \"id куда\"]],\n\
  \"ui\": [{\"title\": \"экран/элемент\", \"before\": null, \"after\": \"путь\", \"note\": \"что поменялось\"}],\n\
  \"risks\": [{\"id\": \"r1\", \"severity\": \"high|mid|low\", \"title\": \"что может сломаться\", \"detail\": \"когда и почему\", \"fix\": \"как поправить\", \"nodes\": [\"id\"]}],\n\
@@ -723,14 +936,24 @@ const SCHEMA: &str = "{\"title\": \"заголовок изменений\", \"s
 const MAP_RULES: &str = "Карта — главное в отчёте: приложение само рисует граф из `code`. Для каждой записи выпиши `uses` (что она вызывает, рендерит, использует — id других записей или имена), \
 у удалённых — какими были. Связи, которые сессия убрала у оставшихся записей, перечисли в `removed_edges`. Неизменённый код рядом (кто вызывает новое, что использует изменённое) — в `code.context`, 3–10 узлов. \
 `hunks` — заголовки ханков из диффа (строка `@@ … @@`), которые относятся к записи. Риски и проверки привязывай к узлам (`nodes`, `risk_ids`, `check_ids`). \
-Если session.patch пуст, агент правил файлы командами — бери изменения из git.patch.";
+`signature` — у КАЖДОЙ записи: интерфейс псевдокодом в стиле TypeScript, суть входа и выхода, а не копия кода (компонент: `Name({ a, b? }: Props) → JSX`, функция: `name(x: T, y: U) → R`, эндпоинт: `POST /path (Body) → Response`, конфиг: `NAME: Type = значение`). \
+Если интерфейс поменялся — прежний в `signature_before`. `dtos` — все данные, которые передаются между узлами карты: пропсы компонентов, аргументы, тела и ответы API, события, куски состояния; \
+у каждой структуры поля с типами, изменённые поля помечай `status`. В `uses` указывай `via` — какой DTO едет по связи; `inputs`/`outputs` у записи — какие DTO она принимает и отдаёт. \
+Если session.patch пуст, агент правил файлы командами — бери изменения из git.patch. \
+Человек смотрит на карту как на канвас смыслов, а не реализации: сгруппируй записи в `features` по смыслу — функциональность для пользователя (kind `feature`, «эти штуки делают функционал X», 1–5 групп), \
+то, что ей помогает (`helper`: утилиты, константы, стили, обёртки, типы), инфраструктура и конфиг (`infra`). Каждая запись — ровно в одной группе; группы называй по-человечески, не по файлам; \
+`summary` группы — одна фраза, что она даёт. У каждой записи `role` (кто это: компонент, функция, хук, тип, конфиг…) и `entity` — короткое человеческое имя («Диалог выбора Джокера», «Полёт карты в альбом»). \
+Низкоуровневые мелочи не плоди отдельными узлами — сворачивай в helper-группу. `tests` — тесты, которые сессия добавила или поменяла, и существующие, что проверяют изменённое (поищи в проекте рядом с файлами); \
+`verifies` — id узлов, которые тест проверяет; `result` — только если видно, что тест запускали. Если тестов нет — оставь `tests` пустым, это тоже сигнал.";
 
 fn prompt_full(out: &Path) -> String {
     let skill = find_skill().unwrap_or_default();
     let renderer = if skill.join("scripts/diagram.mjs").exists() {
         format!(
-            "Схему флоу рендери скриптом скилла pr-before-after: `node {s}/scripts/diagram.mjs --src {out}/flow.mmd --out {out}/flow.png --lang ru --theme light --title \"…\"`; \
-             было/стало структуры модулей — `--before {out}/before.mmd --after {out}/after.mmd --out {out}/structure.png`. Открой PNG и проверь, что подписи читаются.",
+            "Схемы рендери скриптом скилла pr-before-after (рендерер pele, синтаксис Mermaid, любой тип; каталог «когда какой» — {s}/references/diagram-types.md): \
+             `node {s}/scripts/diagram.mjs --src {out}/flow.mmd --out {out}/flow.png --lang ru --theme both --title \"…\"`; \
+             было/стало — `--before {out}/before.mmd --after {out}/after.mmd --out {out}/structure.png --lang ru --theme both` (дифф считается для любого типа, если обе стороны одного типа). \
+             `--theme both` даёт ещё *-dark.png для тёмной темы; в report.json пиши путь светлой. Если скрипт упал с ошибкой синтаксиса — поправь исходник и запусти снова. Открой PNG и проверь, что подписи читаются.",
             s = skill.display(),
             out = out.display()
         )
@@ -738,13 +961,16 @@ fn prompt_full(out: &Path) -> String {
         "Скрипта рендера диаграмм нет: положи Mermaid-исходник в поле `mermaid`, `image` оставь null.".to_owned()
     };
     format!(
-        "Ты — ревьюер изменений. Задача: показать человеку, что изменила сессия агента, так, чтобы он понял это за минуту, не читая код.\n\n\
+        "[iv3 changes] Ты — ревьюер изменений. Задача: показать человеку, что изменила сессия агента, так, чтобы он понял это за минуту, не читая код.\n\n\
          Папка для результата: {out} (дальше $OUT). Там лежат context.md (что просили, что ответил агент, файлы, команды, скриншоты), \
          session.patch (правки инструментами) и git.patch (git diff рабочего дерева). Текущая папка — проект.\n\n\
          Шаги:\n\
          1. Прочитай $OUT/context.md, $OUT/session.patch и $OUT/git.patch.\n\
          2. Что добавлено, удалено и изменено на уровне функций, компонентов, хуков, эндпоинтов, роутов, типов, таблиц, конфигов. Имена — как в коде. {MAP_RULES}\n\
-         3. Флоу: схема Mermaid, как теперь работает то, что делала сессия: 5–12 узлов, подписи по-русски, в $OUT/flow.mmd. Если поменялась структура модулей — before.mmd/after.mmd, иначе пропусти.\n\
+         3. Флоу: схема, как теперь работает то, что делала сессия: 5–12 узлов, подписи по-русски, в $OUT/flow.mmd. Тип выбирай под историю, а не всегда flowchart: \
+поток запроса — sequenceDiagram, кто что делает — swimlane-beta, жизненный цикл — stateDiagram-v2. Если поменялась структура модулей — before.mmd/after.mmd (тем же типом), иначе пропусти. \
+Если сессия меняла то, что лучше видно другой схемой (схема БД — erDiagram, классы/интерфейсы — classDiagram, статусы — stateDiagram-v2, папки — treeView-beta, план — gantt), \
+добавь 0–3 такие в `diagrams` (было/стало, если это изменение, иначе одна). Не рисуй схему ради схемы.\n\
          4. UI: скриншоты из context.md — как «Стало». «Было» — только если это дёшево и честно, иначе null. Никогда не подделывай «Было».\n\
          5. Решения: 3–7 главных решений агента за сессию (`decisions`) — что выбрал и почему, к каким узлам.\n\
          {renderer}\n\
@@ -757,14 +983,14 @@ fn prompt_full(out: &Path) -> String {
 
 fn prompt_batch(out: &Path) -> String {
     format!(
-        "Ты ведёшь карту изменений длинной сессии агента и обновляешь её очередной порцией.\n\n\
+        "[iv3 changes] Ты ведёшь карту изменений длинной сессии агента и обновляешь её очередной порцией.\n\n\
          Папка: {out} ($OUT). $OUT/base.json — карта на прошлом шаге (полный отчёт). $OUT/context.md — что произошло с тех пор: \
          сообщения человека и агента, команды, правки. $OUT/session.patch — новые правки инструментами, $OUT/git.patch — изменения рабочего дерева с прошлого шага. Текущая папка — проект.\n\n\
          Сделай:\n\
          1. Прочитай base.json и дельту. Не перечитывай весь проект: только то, что нужно, чтобы понять новые правки.\n\
          2. Обнови карту: сохрани id и записи из base.json, добавь новые узлы, поменяй статус/описание/связи затронутых, перенеси откаты. {MAP_RULES}\n\
          3. `decisions` — ТОЛЬКО решения из этой порции: что агент выбрал и почему, к каким узлам; `at` — момент в сессии.\n\
-         4. title/summary/риски/проверки обнови под итог на сейчас. Поля flow/structure/ui скопируй из base.json как есть (схемы не перерисовывай).\n\
+         4. title/summary/риски/проверки обнови под итог на сейчас. Поля flow/structure/diagrams/ui скопируй из base.json как есть (схемы не перерисовывай).\n\
          5. Запиши ПОЛНЫЙ обновлённый $OUT/report.json по той же схеме:\n{SCHEMA}\n\n\
          Ничего не меняй в проекте, пиши только в $OUT, уложись в 2–3 минуты. Когда записал — ответь: готово.",
         out = out.display(),
@@ -810,6 +1036,15 @@ fn dirs_home() -> PathBuf {
 fn resolve(out: &Path, p: &str) -> PathBuf {
     let path = PathBuf::from(p);
     if path.is_absolute() { path } else { out.join(path) }
+}
+
+/// `flow.png` → `flow-dark.png` in a dark theme, when diagram.mjs rendered one (`--theme both`).
+fn themed_image(path: &Path, dark: bool) -> PathBuf {
+    let dark_twin = path.extension().filter(|_| dark).and_then(|ext| {
+        let stem = path.file_stem()?.to_string_lossy();
+        Some(path.with_file_name(format!("{stem}-dark.{}", ext.to_string_lossy())))
+    });
+    dark_twin.filter(|twin| twin.exists()).unwrap_or_else(|| path.to_path_buf())
 }
 
 /// Lines added / removed across patches.
@@ -955,26 +1190,54 @@ fn edits_word(n: usize) -> &'static str {
 
 // ---------------------------------------------------------------- rendering
 
-const NODE_W: f32 = 150.;
-const NODE_H: f32 = 46.;
-const COL_GAP: f32 = 44.;
-const ROW_GAP: f32 = 14.;
-const PAD: f32 = 16.;
-const HEAD: f32 = 26.;
 
 impl Render for ChangesView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let p = Palette::of(&theme);
-        let graph = self.report().map(|r| map::build(&r.code, &r.removed_edges));
+        let graph = self.report().map(|r| map::build_report(r));
         // Drop a panel that points at a node this iteration does not have.
         if let (Some(Panel::Node(key)), Some(g)) = (&self.panel, &graph) {
             if g.index(key).is_none() {
                 self.panel = None;
             }
         }
+        if let (Some(Panel::Dto(key)), Some(g)) = (&self.panel, &graph) {
+            if g.dto_index(key).is_none() {
+                self.panel = None;
+            }
+        }
+        if let (Some(Panel::Group(key)), Some(g)) = (&self.panel, &graph) {
+            if g.group_index(key).is_none() {
+                self.panel = None;
+            }
+        }
+        // Fit the canvas to its content when the map on screen changes.
+        if let Some(g) = &graph {
+            let run = self.selected.and_then(|i| self.runs.get(i)).map_or(0, |r| r.n);
+            let key = format!("{run}-{:?}", self.mode);
+            let size = self.viewport.get().map(|b| (f32::from(b.size.width), f32::from(b.size.height)));
+            let resized = size.is_some_and(|(w, h)| (w - self.fit_size.0).abs() > 1. || (h - self.fit_size.1).abs() > 1.);
+            if self.fit_key.as_deref() != Some(key.as_str()) || (resized && !self.touched) {
+                match size {
+                    Some(size) => {
+                        let c = map::canvas_layout(g, self.mode);
+                        self.view = canvas::View::fit((c.width, c.height), size);
+                        self.fit_key = Some(key);
+                        self.fit_size = size;
+                        self.touched = false;
+                    }
+                    // Not painted yet: fit on the next frame, when the size is known.
+                    None => cx.on_next_frame(window, |_, _, cx| cx.notify()),
+                }
+            }
+        }
         let body: AnyElement = match (&graph, self.selected.and_then(|i| self.runs.get(i)), &self.running) {
-            (Some(g), _, _) => self.render_report(g, &p, &theme, cx).into_any_element(),
+            (Some(g), _, _) => {
+                // The canvas takes most of the window height; the page scrolls around it.
+                let canvas_h = (f32::from(window.viewport_size().height) - 340.).max(440.);
+                self.render_report(g, canvas_h, &p, &theme, cx).into_any_element()
+            }
             (None, _, Some(r)) if self.selected.is_none() || self.selected.and_then(|i| self.runs.get(i)).is_some_and(|run| run.n == r.n) => {
                 self.render_running(&p, &theme, cx).into_any_element()
             }
@@ -988,15 +1251,14 @@ impl Render for ChangesView {
                 div().id("changes").flex_1().min_h_0().overflow_y_scroll().child(
                     v_flex()
                         .w_full()
-                        .max_w(px(1120.))
-                        .mx_auto()
-                        .px(px(28.))
+                        .px(px(24.))
                         .pt(px(20.))
                         .pb(px(32.))
                         .gap(px(22.))
                         .child(self.render_header(&p, &theme, cx))
                         .when(self.runs.len() > 1 || self.running.is_some() && !self.runs.is_empty(), |this| this.child(self.render_iterations(&p, &theme, cx)))
-                        .child(body),
+                        .child(body)
+                        .child(media::render(&self.input, window, cx)),
                 ),
             )
             .when_some(graph.as_ref(), |this, g| this.child(self.render_bar(g, &p, &theme, cx)));
@@ -1196,7 +1458,7 @@ impl ChangesView {
         )
     }
 
-    fn render_report(&self, g: &Graph, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_report(&self, g: &Graph, canvas_h: f32, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(r) = self.report() else { return div().into_any_element() };
         let patches = self.patches();
         let files = patches.iter().map(|(f, _)| f.as_str()).collect::<std::collections::BTreeSet<_>>().len();
@@ -1206,7 +1468,7 @@ impl ChangesView {
         let fresh: HashSet<String> = self
             .selected
             .and_then(|i| self.runs[..i].iter().rev().find_map(Run::ok))
-            .map(|prev| g.changed_since(&map::build(&prev.code, &prev.removed_edges)))
+            .map(|prev| g.changed_since(&map::build_report(prev)))
             .unwrap_or_default();
         v_flex()
             .gap(px(22.))
@@ -1225,6 +1487,8 @@ impl ChangesView {
                         .child(format!("Батч #{} собирается · {} · {}", run.n, run.model, run.steps.last().cloned().unwrap_or_else(|| "читает новые ходы".into()))),
                 )
             })
+            // The canvas first: it is what you look at; the summary and numbers follow.
+            .child(self.render_map_section(g, r, &fresh, canvas_h, p, theme, cx))
             .when(!r.summary.is_empty(), |this| {
                 this.child(
                     div()
@@ -1236,7 +1500,7 @@ impl ChangesView {
                 )
             })
             .child(metrics(files, plus, minus, &r.code, r.risks.len(), p, theme))
-            .child(self.render_map_section(g, r, &fresh, p, theme, cx))
+
             .when_some(self.render_decisions(g, p, theme, cx), |this, d| this.child(d))
             .child(
                 h_flex()
@@ -1245,8 +1509,9 @@ impl ChangesView {
                     .child(div().flex_1().min_w_0().child(self.render_files(g, &patches, p, theme, cx)))
                     .child(div().flex_1().min_w_0().child(self.render_risks(g, r, p, theme, cx))),
             )
-            .when_some(r.flow.clone(), |this, d| this.child(self.render_diagram("flow", &d, &dir, p, theme)))
-            .when_some(r.structure.clone(), |this, d| this.child(self.render_diagram("structure", &d, &dir, p, theme)))
+            .when_some(r.flow.clone(), |this, d| this.child(self.render_diagram("flow".into(), &d, &dir, p, theme)))
+            .when_some(r.structure.clone(), |this, d| this.child(self.render_diagram("structure".into(), &d, &dir, p, theme)))
+            .children(r.diagrams.iter().enumerate().map(|(i, d)| self.render_diagram(format!("extra-{i}"), d, &dir, p, theme)))
             .when(!r.ui.is_empty(), |this| {
                 this.child(
                     v_flex()
@@ -1258,7 +1523,7 @@ impl ChangesView {
             .into_any_element()
     }
 
-    fn render_map_section(&self, g: &Graph, r: &Report, fresh: &HashSet<String>, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_map_section(&self, g: &Graph, r: &Report, fresh: &HashSet<String>, canvas_h: f32, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let mode_btn = |key: &'static str, label: &'static str, mode: MapMode, cx: &mut Context<Self>| {
             let active = self.mode == mode && !self.show_list;
             h_flex()
@@ -1335,83 +1600,145 @@ impl ChangesView {
                         d.child(h_flex().gap(px(5.)).text_size(px(12.)).text_color(p.blue.text).child(div().size(px(8.)).rounded_full().bg(p.blue.solid)).child(format!("новое в итерации · {}", fresh.len())))
                     }),
             )
-            .child(ui::mono("наведи — связи узла, клик — подробности и дифф справа", theme).text_color(p.faint))
             .map(|this| {
                 if self.show_list || !has_nodes {
                     this.child(render_columns(&r.code, p, theme))
                 } else {
-                    this.child(self.render_map(g, r, fresh, p, theme, cx))
+                    let dtos: Vec<(usize, &map::MapDto)> = g.visible_dtos(self.mode).collect();
+                    let dto_focus = self
+                        .hovered_dto
+                        .as_ref()
+                        .or(match &self.panel {
+                            Some(Panel::Dto(k)) => Some(k),
+                            _ => None,
+                        })
+                        .and_then(|k| g.dto_index(k));
+                    this.child(self.render_map(g, r, fresh, canvas_h, p, theme, cx))
+                        .when(!dtos.is_empty(), |this| this.child(self.render_dto_lane(&dtos, g, fresh, dto_focus, p, theme, cx)))
                 }
             })
     }
 
-    /// The graph: column headers, curved links on a canvas, node cards on top.
-    fn render_map(&self, g: &Graph, r: &Report, fresh: &HashSet<String>, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let l = map::layout(g);
+    /// The canvas: frames by meaning, cards inside, curved links (dashed
+    /// «проверяет» from tests) with DTO labels. Drag to pan, ⌘/Ctrl + wheel or
+    /// pinch to zoom around the pointer, double click to fit.
+    fn render_map(&self, g: &Graph, r: &Report, fresh: &HashSet<String>, height: f32, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        use map::NODE_W;
         let mode = self.mode;
-        let width = PAD * 2. + l.cols as f32 * NODE_W + (l.cols.saturating_sub(1)) as f32 * COL_GAP;
-        let height = PAD * 2. + HEAD + l.rows as f32 * NODE_H + (l.rows.saturating_sub(1)) as f32 * ROW_GAP;
-        let origin = |i: usize| {
-            let (c, row) = l.pos[i];
-            (PAD + c as f32 * (NODE_W + COL_GAP), PAD + HEAD + row as f32 * (NODE_H + ROW_GAP))
-        };
+        let cv = map::canvas_layout(g, mode);
+        let v = self.view;
+        let z = v.zoom;
+        let sx = move |x: f32| v.x + x * z;
+        let sy = move |y: f32| v.y + y * z;
+        let zl = move |l: f32| l * z;
+        // Level of detail: small zoom drops the fine print.
+        let detail = z >= 0.42;
+        let text = z >= 0.3;
         let selected = match &self.panel {
             Some(Panel::Node(k)) => Some(k.clone()),
             _ => None,
         };
+        let group_focus: Option<usize> = match &self.panel {
+            Some(Panel::Group(k)) => g.group_index(k),
+            _ => None,
+        };
+        let dto_focus: Option<usize> = self
+            .hovered_dto
+            .as_ref()
+            .or(match &self.panel {
+                Some(Panel::Dto(k)) => Some(k),
+                _ => None,
+            })
+            .and_then(|k| g.dto_index(k));
         let focus = self.hovered.clone().or(selected.clone());
-        let focus_ix = focus.as_ref().and_then(|k| g.index(k));
-        let linked: HashSet<usize> = focus_ix
-            .map(|f| {
+        let focus_ix = if dto_focus.is_some() { None } else { focus.as_ref().and_then(|k| g.index(k)) };
+        let lit: Option<HashSet<usize>> = match (dto_focus, focus_ix, group_focus) {
+            (Some(d), _, _) => Some(g.dtos[d].users.iter().copied().collect()),
+            (None, Some(f), _) => {
                 let mut s: HashSet<usize> = g.edges.iter().filter(|e| (e.from == f || e.to == f) && g.edge_visible(e, mode)).flat_map(|e| [e.from, e.to]).collect();
                 s.insert(f);
-                s
-            })
-            .unwrap_or_default();
+                Some(s)
+            }
+            (None, None, Some(gi)) => {
+                let members: HashSet<usize> = g.groups[gi].nodes.iter().copied().collect();
+                let mut s = members.clone();
+                s.extend(g.edges.iter().filter(|e| members.contains(&e.from) || members.contains(&e.to)).flat_map(|e| [e.from, e.to]));
+                Some(s)
+            }
+            _ => None,
+        };
         let risk_count = |n: &map::MapNode| r.risks.iter().filter(|risk| risk.nodes.iter().any(|k| map::normalize(k) == n.key) || (!risk.id.is_empty() && n.risk_ids.contains(&risk.id))).count();
+        let mono = theme.mono_font_family.clone();
+        let has_tests = g.has_tests();
 
-        // Links: (from, to, color, width, dashed).
-        let mut lines: Vec<(Point<Pixels>, Point<Pixels>, Hsla, f32, bool)> = Vec::new();
+        // Links in screen space: (curve, color, width, dashed); DTO labels at their middle.
+        let mut lines: Vec<([(f32, f32); 4], Hsla, f32, bool)> = Vec::new();
+        let mut labels: Vec<((f32, f32), usize, bool, bool)> = Vec::new();
         for e in &g.edges {
-            if !g.edge_visible(e, mode) || !g.node_visible(e.from, mode) || !g.node_visible(e.to, mode) {
+            if !g.edge_visible(e, mode) {
                 continue;
             }
-            let (fx, fy) = origin(e.from);
-            let (tx, ty) = origin(e.to);
-            let (a, b) = if l.pos[e.to].0 > l.pos[e.from].0 {
-                (point(px(fx + NODE_W), px(fy + NODE_H / 2.)), point(px(tx), px(ty + NODE_H / 2.)))
-            } else {
-                // Same column or backwards: leave from the bottom, enter at the top.
-                (point(px(fx + NODE_W / 2.), px(fy + NODE_H)), point(px(tx + NODE_W / 2.), px(ty)))
-            };
-            let base = match (mode, e.kind) {
-                (MapMode::Diff, EdgeKind::New) => p.green.solid,
-                (MapMode::Diff, EdgeKind::Removed) => p.red.solid,
+            let (Some(from), Some(to)) = (cv.boxes[e.from], cv.boxes[e.to]) else { continue };
+            let world = map::link_curve(from, to);
+            let curve = world.map(|(x, y)| (sx(x), sy(y)));
+            let base = match (mode, e.kind, e.verify) {
+                (_, _, true) => p.blue.solid.opacity(0.75),
+                (MapMode::Diff, EdgeKind::New, _) => p.green.solid,
+                (MapMode::Diff, EdgeKind::Removed, _) => p.red.solid,
                 _ => p.border_strong,
             };
-            let dashed = mode == MapMode::Diff && e.kind == EdgeKind::Removed;
-            let hot = focus_ix.is_some_and(|f| e.from == f || e.to == f);
-            let color = match focus_ix {
-                Some(_) if hot => if base == p.border_strong { p.ink.opacity(0.7) } else { base },
-                Some(_) => base.opacity(0.2),
-                None => base,
+            let dashed = e.verify || (mode == MapMode::Diff && e.kind == EdgeKind::Removed);
+            let hot = match dto_focus {
+                Some(d) => e.via == Some(d),
+                None => match (focus_ix, group_focus) {
+                    (Some(f), _) => e.from == f || e.to == f,
+                    (None, Some(gi)) => g.nodes[e.from].group == gi || g.nodes[e.to].group == gi,
+                    _ => false,
+                },
             };
-            lines.push((a, b, color, if hot { 2.2 } else { 1.5 }, dashed));
+            let any_focus = dto_focus.is_some() || focus_ix.is_some() || group_focus.is_some();
+            let color = match (any_focus, hot) {
+                (true, true) if base == p.border_strong => p.ink.opacity(0.7),
+                (true, true) => base,
+                (true, false) => base.opacity(0.18),
+                _ => base,
+            };
+            lines.push((curve, color, if hot { 2.2 } else { 1.4 }, dashed));
+            if let Some(d) = e.via.filter(|&d| g.dtos[d].visible(mode) && text) {
+                labels.push((map::curve_mid(&curve), d, hot, any_focus && !hot));
+            }
         }
+        let viewport = self.viewport.clone();
+        let dot = p.border_strong.opacity(0.35);
+        let grid = (v.x, v.y, z);
         let links = canvas(
-            move |_, _, _| lines,
+            move |bounds, _, _| {
+                viewport.set(Some(bounds));
+                lines
+            },
             move |bounds, lines, window, _| {
                 let o = bounds.origin;
-                for (a, b, color, width, dashed) in lines {
-                    let (a, b) = (a + o, b + o);
-                    let horizontal = (b.x - a.x).abs() > (b.y - a.y).abs() || b.x > a.x + px(20.);
-                    let (c1, c2) = if horizontal {
-                        let dx = ((b.x - a.x).abs() / 2.).max(px(24.));
-                        (point(a.x + dx, a.y), point(b.x - dx, b.y))
-                    } else {
-                        let dy = ((b.y - a.y).abs() / 2.).max(px(16.));
-                        (point(a.x, a.y + dy), point(b.x, b.y - dy))
-                    };
+                // Dot grid that moves with the canvas (every 24 world px, thinned when zoomed out).
+                let (gx, gy, gz) = grid;
+                let mut step = 24. * gz;
+                while step < 14. {
+                    step *= 2.;
+                }
+                let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                let (mut x, start_y) = (gx.rem_euclid(step), gy.rem_euclid(step));
+                if (w / step) * (h / step) < 6000. {
+                    while x < w {
+                        let mut y = start_y;
+                        while y < h {
+                            window.paint_quad(fill(Bounds::new(point(px(x - 0.75), px(y - 0.75)) + o, size(px(1.5), px(1.5))), dot));
+                            y += step;
+                        }
+                        x += step;
+                    }
+                }
+                let pt = |(x, y): (f32, f32)| point(px(x), px(y)) + o;
+                for (c, color, width, dashed) in lines {
+                    let (a, c1, c2, b) = (pt(c[0]), pt(c[1]), pt(c[2]), pt(c[3]));
                     let mut path = PathBuilder::stroke(px(width));
                     if dashed {
                         path = path.dash_array(&[px(4.), px(3.)]);
@@ -1421,7 +1748,6 @@ impl ChangesView {
                     if let Ok(path) = path.build() {
                         window.paint_path(path, color);
                     }
-                    // Arrowhead along the last tangent.
                     let (dx, dy) = (f32::from(b.x - c2.x), f32::from(b.y - c2.y));
                     let len = (dx * dx + dy * dy).sqrt().max(0.001);
                     let (ux, uy) = (dx / len, dy / len);
@@ -1443,36 +1769,123 @@ impl ChangesView {
         .left_0()
         .size_full();
 
-        let mono = theme.mono_font_family.clone();
-        let nodes = g.nodes.iter().enumerate().filter(|(i, _)| g.node_visible(*i, mode)).map(|(i, n)| {
-            let (x, y) = origin(i);
+        // Frames: what the cards do together.
+        let frames = g.groups.iter().enumerate().filter_map(|(gi, gr)| cv.groups[gi].map(|b| (gi, gr, b))).map(|(gi, gr, b)| {
+            let (tone, dashed) = match gr.kind {
+                map::GroupKind::Feature => (Some(p.accent), false),
+                map::GroupKind::Tests => (Some(p.blue), false),
+                map::GroupKind::Helper | map::GroupKind::Infra | map::GroupKind::File => (None, false),
+                map::GroupKind::Context => (None, true),
+            };
+            let border = tone.map_or(p.border_strong, |t| ui::mix(t.solid, p.border, 0.45));
+            let bg = match (gr.kind, tone) {
+                (map::GroupKind::Context, _) => transparent_black(),
+                (_, Some(t)) => ui::mix(t.soft, p.sunken, 0.32),
+                _ => ui::mix(p.surface, p.sunken, 0.35),
+            };
+            let key = gr.key.clone();
+            let picked = group_focus == Some(gi);
+            let count = gr.nodes.iter().filter(|&&i| cv.boxes[i].is_some()).count();
+            div()
+                .id(SharedString::from(format!("frame-{gi}-{}", gr.key)))
+                .absolute()
+                .left(px(sx(b.x)))
+                .top(px(sy(b.y)))
+                .w(px(zl(b.w)))
+                .h(px(zl(b.h)))
+                .rounded(px(zl(14.).max(4.)))
+                .border_1()
+                .when(dashed, |d| d.border_dashed())
+                .border_color(if picked { p.ink } else { border })
+                .bg(bg)
+                .when(text, |d| {
+                    d.child(
+                        v_flex()
+                            .id(SharedString::from(format!("frame-head-{gi}")))
+                            .absolute()
+                            .left(px(zl(map::GROUP_PAD)))
+                            .right(px(zl(map::GROUP_PAD)))
+                            .top(px(zl(12.)))
+                            .gap(px(zl(3.)))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if this.dragged {
+                                    return;
+                                }
+                                cx.stop_propagation();
+                                this.panel = Some(Panel::Group(key.clone()));
+                                cx.notify();
+                            }))
+                            .child(
+                                h_flex()
+                                    .gap(px(zl(7.)))
+                                    .h(px(zl(20.)))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(px(zl(15.)))
+                                            .line_height(px(zl(20.)))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(tone.map_or(p.ink, |t| t.text))
+                                            .child(gr.title.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .px(px(zl(5.)))
+                                            .rounded(px(zl(4.)))
+                                            .border_1()
+                                            .border_color(border)
+                                            .font_family(mono.clone())
+                                            .text_size(px(zl(10.)))
+                                            .text_color(tone.map_or(p.muted, |t| t.text))
+                                            .child(format!("{} · {count}", gr.kind.label())),
+                                    ),
+                            )
+                            .when(!gr.summary.is_empty(), |d| {
+                                d.child(div().text_size(px(zl(12.))).line_height(px(zl(16.))).line_clamp(2).text_color(p.muted).child(gr.summary.clone()))
+                            }),
+                    )
+                })
+        });
+
+        let nodes = g.nodes.iter().enumerate().filter_map(|(i, n)| cv.boxes[i].map(|b| (i, n, b))).map(|(i, n, (x, y, h))| {
             let tone = if mode == MapMode::Diff || (mode == MapMode::After && n.status == NodeStatus::Added) || (mode == MapMode::Before && n.status == NodeStatus::Removed) {
                 status_tone(n.status, p)
             } else {
                 None
             };
             let is_sel = selected.as_deref() == Some(n.key.as_str());
-            let dim = focus_ix.is_some() && !linked.contains(&i);
-            let ctx = n.status == NodeStatus::Context;
+            let dim = lit.as_ref().is_some_and(|s| !s.contains(&i));
+            let ctx = n.status == NodeStatus::Context && n.test.is_none();
             let risks = risk_count(n);
             let is_fresh = fresh.contains(&n.key);
             let key = n.key.clone();
             let hover_key = n.key.clone();
-            let subtitle = [kind_label(&n.kind), n.file.rsplit('/').next().unwrap_or_default().to_owned()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
+            let role = n.role();
+            let sig = map::signature_parts(n, mode);
+            let sig_changed = mode == MapMode::Diff && n.signature_changed();
+            let untested = has_tests && g.untested(i);
+            let file = n.file.rsplit('/').next().unwrap_or_default().to_owned();
+            let test_result = n.test.as_ref().map(|t| t.result.clone()).filter(|r| !r.is_empty());
             div()
                 .id(SharedString::from(format!("node-{i}-{}", n.key)))
                 .absolute()
-                .left(px(x))
-                .top(px(y))
-                .w(px(NODE_W))
-                .h(px(NODE_H))
-                .rounded(px(8.))
+                .left(px(sx(x)))
+                .top(px(sy(y)))
+                .w(px(zl(NODE_W)))
+                .h(px(zl(h)))
+                .rounded(px(zl(9.).max(3.)))
                 .border_1()
-                .pl(px(11.))
-                .pr(px(8.))
-                .pt(px(6.))
+                .overflow_hidden()
+                .px(px(zl(11.)))
+                .pt(px(zl(8.)))
+                .flex()
+                .flex_col()
+                .gap(px(zl(4.)))
                 .cursor_pointer()
-                .when(dim, |d| d.opacity(0.28))
+                .when(dim, |d| d.opacity(0.25))
                 .map(|d| {
                     if ctx {
                         d.border_dashed().border_color(p.border_strong).bg(ui::mix(p.surface, p.sunken, 0.55))
@@ -1486,6 +1899,9 @@ impl ChangesView {
                 .when(is_sel, |d| d.border_color(p.ink).shadow(vec![BoxShadow { color: p.ink.opacity(0.12), offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(3.), inset: false }]))
                 .hover(|s| s.border_color(p.border_strong))
                 .on_hover(cx.listener(move |this, on: &bool, _, cx| {
+                    if this.drag.is_some_and(|d| d.moved) {
+                        return;
+                    }
                     if *on {
                         this.hovered = Some(hover_key.clone());
                     } else if this.hovered.as_deref() == Some(hover_key.as_str()) {
@@ -1494,69 +1910,372 @@ impl ChangesView {
                     cx.notify();
                 }))
                 .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.dragged {
+                        return;
+                    }
+                    cx.stop_propagation();
                     this.panel = Some(Panel::Node(key.clone()));
                     cx.notify();
                 }))
-                .when_some(tone.filter(|_| !ctx), |d, t| d.child(div().absolute().left(px(-1.)).top(px(-1.)).bottom(px(-1.)).w(px(4.)).rounded_l(px(8.)).bg(t.solid)))
-                .child(
-                    div()
-                        .truncate()
-                        .font_family(mono.clone())
-                        .text_size(px(11.))
-                        .line_height(px(16.))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(if ctx { p.muted } else { p.ink })
-                        .when(n.status == NodeStatus::Removed, |d| d.line_through())
-                        .child(n.name.clone()),
-                )
-                .child(div().truncate().text_size(px(10.5)).text_color(p.muted).child(subtitle))
-                .when(risks > 0, |d| {
+                .when_some(tone.filter(|_| !ctx), |d, t| d.child(div().absolute().left_0().top_0().bottom_0().w(px(zl(4.).max(2.))).bg(t.solid)))
+                .when(text, |d| {
                     d.child(
-                        div()
-                            .absolute()
-                            .right(px(-6.))
-                            .top(px(-6.))
-                            .min_w(px(15.))
-                            .h(px(15.))
-                            .px(px(3.))
-                            .rounded_full()
-                            .bg(p.red.solid)
-                            .border_2()
-                            .border_color(p.sunken)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .font_family(mono.clone())
-                            .text_size(px(9.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(gpui_kit::white())
-                            .child(risks.to_string()),
+                        h_flex()
+                            .h(px(zl(15.)))
+                            .gap(px(zl(5.)))
+                            // New in this iteration.
+                            .when(is_fresh, |d| d.child(div().flex_shrink_0().size(px(zl(7.)).max(px(4.))).rounded_full().bg(p.blue.solid)))
+                            .child(Icon::empty().path(role.icon()).with_size(px(zl(12.))).text_color(if role == map::Role::Test { p.blue.solid } else { p.muted }))
+                            .child(div().flex_1().min_w_0().truncate().font_family(mono.clone()).text_size(px(zl(10.))).text_color(p.muted).child(role.label().to_uppercase()))
+                            .when_some(status_tone(n.status, p).filter(|_| n.status != NodeStatus::Context), |d, t| {
+                                d.child(div().flex_shrink_0().px(px(zl(5.))).rounded(px(zl(4.))).bg(t.soft).text_size(px(zl(10.))).font_weight(FontWeight::SEMIBOLD).text_color(t.text).child(status_label(n.status)))
+                            })
+                            .when(risks > 0, |d| {
+                                d.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .px(px(zl(5.)))
+                                        .rounded(px(zl(4.)))
+                                        .bg(p.red.solid)
+                                        .font_family(mono.clone())
+                                        .text_size(px(zl(10.)))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(gpui_kit::white())
+                                        .child(format!("⚠ {risks}")),
+                                )
+                            })
+                            .when_some(test_result.clone(), |d, res| {
+                                let (label, t) = match res.as_str() {
+                                    "pass" | "passed" | "ok" => ("✓ проходит", p.green),
+                                    "fail" | "failed" => ("✕ падает", p.red),
+                                    _ => ("не запускался", p.amber),
+                                };
+                                d.child(div().flex_shrink_0().px(px(zl(5.))).rounded(px(zl(4.))).bg(t.soft).text_size(px(zl(10.))).text_color(t.text).child(label))
+                            }),
                     )
+                    .child(
+                        div()
+                            .text_size(px(zl(13.)))
+                            .line_height(px(zl(map::TITLE_LINE)))
+                            .line_clamp(map::TITLE_MAX_LINES)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if ctx { p.muted } else { p.ink })
+                            .when(n.status == NodeStatus::Removed, |d| d.line_through())
+                            .child(n.title().to_owned()),
+                    )
+                    .when(map::shows_code_name(n), |d| {
+                        d.child(div().mt(px(zl(-2.))).truncate().font_family(mono.clone()).text_size(px(zl(11.))).line_height(px(zl(map::NAME_LINE))).text_color(p.muted).child(n.name.clone()))
+                    })
+                    .when(!sig.is_empty() && detail, |d| {
+                        d.child(
+                            div()
+                                .mt(px(zl(1.)))
+                                .font_family(mono.clone())
+                                .text_size(px(zl(10.5)))
+                                .line_height(px(zl(map::SIG_LINE)))
+                                .line_clamp(map::SIG_MAX_LINES)
+                                .text_color(if sig_changed { p.fg } else { p.faint })
+                                .child(signature_text(&sig, p)),
+                        )
+                    })
+                    .when(detail, |d| {
+                        d.child(
+                            h_flex()
+                                .mt(px(zl(1.)))
+                                .h(px(zl(15.)))
+                                .gap(px(zl(6.)))
+                                .text_size(px(zl(10.5)))
+                                .child(div().flex_1().min_w_0().truncate().text_color(p.faint).child(file))
+                                .when(untested, |d| {
+                                    d.child(div().flex_shrink_0().px(px(zl(5.))).rounded(px(zl(4.))).border_1().border_dashed().border_color(p.amber.solid).text_color(p.amber.text).child("без тестов"))
+                                }),
+                        )
+                    })
                 })
-                .when(is_fresh, |d| {
-                    d.child(div().absolute().left(px(-5.)).top(px(-5.)).size(px(10.)).rounded_full().bg(p.blue.solid).border_2().border_color(p.sunken))
-                })
+
         });
-        let headers = l.headers.iter().enumerate().map(|(c, h)| {
+
+        // DTO labels on links: what travels along them.
+        let pills = labels.into_iter().enumerate().map(|(li, ((mx, my), d, hot, dim))| {
+            let dto = &g.dtos[d];
+            let tone = status_tone(dto.status, p).filter(|_| mode != MapMode::Before || dto.status == NodeStatus::Removed);
+            let w = zl(map::pill_width(&dto.name));
+            let key = dto.key.clone();
+            let hover_key = dto.key.clone();
             div()
+                .id(SharedString::from(format!("via-{li}-{}", dto.key)))
                 .absolute()
-                .left(px(PAD + c as f32 * (NODE_W + COL_GAP)))
-                .top(px(PAD - 2.))
-                .w(px(NODE_W))
-                .truncate()
-                .font_family(theme.mono_font_family.clone())
-                .text_size(px(10.))
-                .text_color(p.faint)
-                .child(SharedString::from(h.to_uppercase()))
+                .left(px(mx - w / 2.))
+                .top(px(my - zl(9.)))
+                .w(px(w))
+                .h(px(zl(18.)))
+                .px(px(zl(6.)))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(zl(4.)))
+                .border_1()
+                .cursor_pointer()
+                .when(dim, |d| d.opacity(0.3))
+                .map(|d| match tone {
+                    Some(t) => d.bg(t.soft).border_color(ui::mix(t.solid, p.border, 0.5)).text_color(t.text),
+                    None => d.bg(p.surface).border_color(p.border_strong).text_color(p.fg),
+                })
+                .when(hot, |d| d.border_color(p.ink))
+                .font_family(mono.clone())
+                .text_size(px(zl(10.)))
+                .font_weight(FontWeight::MEDIUM)
+                .on_hover(cx.listener(move |this, on: &bool, _, cx| {
+                    if *on {
+                        this.hovered_dto = Some(hover_key.clone());
+                    } else if this.hovered_dto.as_deref() == Some(hover_key.as_str()) {
+                        this.hovered_dto = None;
+                    }
+                    cx.notify();
+                }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.dragged {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    this.panel = Some(Panel::Dto(key.clone()));
+                    cx.notify();
+                }))
+                .child(div().truncate().child(dto.name.clone()))
         });
+
+        let pct = (z * 100.).round() as i32;
+        let world = (cv.width, cv.height);
+        let controls = h_flex()
+            .absolute()
+            .right(px(12.))
+            .top(px(8.))
+            .gap(px(4.))
+            .p(px(4.))
+            .rounded(px(9.))
+            .border_1()
+            .border_color(p.border)
+            .bg(p.surface)
+            .shadow(ui::card_shadow())
+            .child(PressButton::new("zoom-out").ghost().xsmall().icon(IconName::Minus).tooltip("Уменьшить (⌘ + колесо)").on_click(cx.listener(|this, _, _, cx| this.zoom_center(1. / 1.25, cx))))
+            .child(
+                div()
+                    .id("zoom-100")
+                    .w(px(46.))
+                    .text_center()
+                    .cursor_pointer()
+                    .font_family(mono.clone())
+                    .text_size(px(11.5))
+                    .text_color(p.fg)
+                    .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("100%").build(window, cx))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let f = 1. / this.view.zoom;
+                        this.zoom_center(f, cx);
+                    }))
+                    .child(format!("{pct}%")),
+            )
+            .child(PressButton::new("zoom-in").ghost().xsmall().icon(IconName::Plus).tooltip("Увеличить").on_click(cx.listener(|this, _, _, cx| this.zoom_center(1.25, cx))))
+            .child(div().w(px(1.)).h(px(16.)).bg(p.border))
+            .child(PressButton::new("zoom-fit").ghost().xsmall().icon(Icon::empty().path("icons/scan.svg")).label("Вписать").on_click(cx.listener(move |this, _, _, cx| this.fit(world, cx))));
+        let legend_role = |role: map::Role| h_flex().gap(px(4.)).child(Icon::empty().path(role.icon()).xsmall().text_color(p.muted)).child(role.label());
+        let swatch = |bg: Hsla, border: Hsla, label: &'static str| h_flex().gap(px(4.)).child(div().size(px(9.)).rounded(px(2.)).bg(bg).border_1().border_color(border)).child(label);
+        let legend = v_flex()
+            .absolute()
+            .left(px(12.))
+            .bottom(px(12.))
+            .gap(px(6.))
+            .px(px(10.))
+            .py(px(8.))
+            .rounded(px(9.))
+            .border_1()
+            .border_color(p.border)
+            .bg(p.surface.opacity(0.94))
+            .text_size(px(11.))
+            .text_color(p.muted)
+            .child(
+                h_flex()
+                    .gap(px(10.))
+                    .child(legend_role(map::Role::Component))
+                    .child(legend_role(map::Role::Function))
+                    .child(legend_role(map::Role::Hook))
+                    .child(legend_role(map::Role::Type))
+                    .child(legend_role(map::Role::Api))
+                    .child(legend_role(map::Role::Test)),
+            )
+            .child(
+                h_flex()
+                    .gap(px(10.))
+                    .child(swatch(p.accent.soft, p.accent.solid, "функционал"))
+                    .child(swatch(p.surface, p.border_strong, "помогает"))
+                    .child(swatch(p.blue.soft, p.blue.solid, "тесты"))
+                    .child(h_flex().gap(px(4.)).child(div().w(px(14.)).h(px(0.)).border_t_1().border_dashed().border_color(p.blue.solid)).child("проверяет")),
+            );
+        let hint = h_flex()
+            .absolute()
+            .left(px(12.))
+            .top(px(10.))
+            .gap(px(8.))
+            .child(ui::mono("тащи — двигать · ⌘ + колесо или щипок — масштаб · двойной клик — вписать", theme).text_size(px(10.5)).text_color(p.faint))
+            .when(!has_tests && g.nodes.iter().any(|n| !n.implicit && n.status != NodeStatus::Context), |d| {
+                d.child(ui::badge("тестов нет — изменения ничем не проверены", p.amber).text_size(px(10.5)))
+            });
+        let grabbing = self.drag.is_some_and(|d| d.moved);
+
         div()
-            .id("map-frame")
+            .id("map-canvas")
+            .relative()
+            .w_full()
+            .h(px(height))
             .rounded(px(12.))
             .border_1()
             .border_color(p.border)
             .bg(p.sunken)
-            .overflow_x_scroll()
-            .child(div().relative().w(px(width)).h(px(height)).child(links).children(headers).children(nodes))
+            .overflow_hidden()
+            .cursor(if grabbing { CursorStyle::ClosedHand } else { CursorStyle::OpenHand })
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, _, cx| this.drag_start(e.position, cx)))
+            .on_mouse_down(MouseButton::Middle, cx.listener(|this, e: &MouseDownEvent, _, cx| this.drag_start(e.position, cx)))
+            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
+                let Some(mut drag) = this.drag else { return };
+                if e.pressed_button.is_none() {
+                    this.drag = None;
+                    cx.notify();
+                    return;
+                }
+                this.view = drag.update((f32::from(e.position.x), f32::from(e.position.y)));
+                this.dragged = drag.moved;
+                this.touched |= drag.moved;
+                this.drag = Some(drag);
+                if drag.moved {
+                    this.hovered = None;
+                }
+                cx.notify();
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                this.drag = None;
+                cx.notify();
+            }))
+            .on_mouse_up(MouseButton::Middle, cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                this.drag = None;
+                cx.notify();
+            }))
+            .on_scroll(cx.listener(|this, e: &ScrollEvent, _, cx| {
+                // The canvas owns the wheel: the page does not scroll under it.
+                cx.stop_propagation();
+                let delta = match e.delta {
+                    ScrollDelta::Pixels(d) => (f32::from(d.x), f32::from(d.y)),
+                    ScrollDelta::Lines(l) => (l.x * 24., l.y * 24.),
+                };
+                let at = this.local(e.position);
+                this.touched = true;
+                this.view = if e.modifiers.platform || e.modifiers.control {
+                    this.view.zoom_at(canvas::wheel_zoom(-delta.1), at)
+                } else {
+                    this.view.pan(delta.0, delta.1)
+                };
+                cx.notify();
+            }))
+            .on_pinch(cx.listener(|this, e: &PinchEvent, _, cx| {
+                cx.stop_propagation();
+                let at = this.local(e.position);
+                this.touched = true;
+                this.view = this.view.zoom_at(1. + e.delta, at);
+                cx.notify();
+            }))
+            .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
+                if this.dragged {
+                    return;
+                }
+                if e.click_count() >= 2 {
+                    this.fit(world, cx);
+                } else if matches!(this.panel, Some(Panel::Group(_))) {
+                    this.panel = None;
+                    cx.notify();
+                }
+            }))
+            .child(links)
+            .children(frames)
+            .children(nodes)
+            .children(pills)
+            .child(hint)
+            .child(legend)
+            .child(controls)
+    }
+
+    /// «Данные»: every DTO as a small structure card with its fields.
+    fn render_dto_lane(&self, dtos: &[(usize, &map::MapDto)], g: &Graph, fresh: &HashSet<String>, focus: Option<usize>, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let mode = self.mode;
+        let mono = theme.mono_font_family.clone();
+        v_flex()
+            .pt(px(4.))
+            .gap(px(8.))
+            .child(
+                h_flex()
+                    .gap(px(8.))
+                    .child(ui::mono("ДАННЫЕ · ЧТО ПЕРЕДАЁТСЯ", theme).text_size(px(10.)).text_color(p.faint))
+                    .child(div().flex_1().h(px(1.)).bg(p.border)),
+            )
+            .child(h_flex().flex_wrap().items_start().gap(px(10.)).children(dtos.iter().map(|&(di, d)| {
+                let tone = if mode == MapMode::Diff || (mode == MapMode::After && d.status == NodeStatus::Added) { status_tone(d.status, p) } else { None };
+                let key = d.key.clone();
+                let hover_key = d.key.clone();
+                let dim = focus.is_some_and(|f| f != di);
+                let is_fresh = fresh.contains(&format!("dto:{}", d.key));
+                let users = d.users.iter().filter(|&&u| g.node_visible(u, mode)).count();
+                let shown: Vec<&map::MapField> = d.fields_in(mode).collect();
+                let more = shown.len().saturating_sub(7);
+                v_flex()
+                    .id(SharedString::from(format!("dto-{di}-{}", d.key)))
+                    .relative()
+                    .w(px(232.))
+                    .rounded(px(8.))
+                    .border_1()
+                    .bg(p.surface)
+                    .shadow(ui::card_shadow())
+                    .border_color(tone.map_or(p.border, |t| ui::mix(t.solid, p.border, 0.5)))
+                    .when(focus == Some(di), |d| d.border_color(p.ink))
+                    .when(dim, |d| d.opacity(0.35))
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(p.border_strong))
+                    .on_hover(cx.listener(move |this, on: &bool, _, cx| {
+                        if *on {
+                            this.hovered_dto = Some(hover_key.clone());
+                        } else if this.hovered_dto.as_deref() == Some(hover_key.as_str()) {
+                            this.hovered_dto = None;
+                        }
+                        cx.notify();
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.panel = Some(Panel::Dto(key.clone()));
+                        cx.notify();
+                    }))
+                    .child(
+                        h_flex()
+                            .px(px(10.))
+                            .pt(px(7.))
+                            .pb(px(6.))
+                            .gap(px(6.))
+                            .border_b_1()
+                            .border_color(p.border)
+                            .child(div().flex_1().min_w_0().truncate().font_family(mono.clone()).text_size(px(11.5)).font_weight(FontWeight::SEMIBOLD).text_color(p.ink).when(d.status == NodeStatus::Removed, |d| d.line_through()).child(d.name.clone()))
+                            .child(div().flex_shrink_0().font_family(mono.clone()).text_size(px(10.)).text_color(p.faint).child(dto_kind_label(&d.kind))),
+                    )
+                    .child(v_flex().px(px(10.)).py(px(6.)).gap(px(2.)).children(shown.iter().take(7).map(|f| field_row(f, mode, p, theme))).when(more > 0, |v| {
+                        v.child(div().font_family(mono.clone()).text_size(px(10.)).text_color(p.faint).child(format!("ещё {more} полей")))
+                    }).when(shown.is_empty(), |v| v.child(div().text_size(px(11.)).text_color(p.faint).child("поля не описаны"))))
+                    .child(
+                        h_flex()
+                            .px(px(10.))
+                            .pb(px(7.))
+                            .gap(px(6.))
+                            .font_family(mono.clone())
+                            .text_size(px(10.))
+                            .text_color(p.faint)
+                            .child(format!("узлов: {users}"))
+                            .when(d.touched() > 0, |h| h.child(format!("· полей изменено: {}", d.touched())))
+                            .when(!d.file.is_empty(), |h| h.child(div().min_w_0().truncate().child(format!("· {}", d.file.rsplit('/').next().unwrap_or_default())))),
+                    )
+                    .when(is_fresh, |d| d.child(div().absolute().left(px(-5.)).top(px(-5.)).size(px(10.)).rounded_full().bg(p.blue.solid).border_2().border_color(p.sunken)))
+            })))
     }
 
     fn render_decisions(&self, g: &Graph, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -1716,8 +2435,9 @@ impl ChangesView {
             })))
     }
 
-    fn render_diagram(&self, key: &'static str, d: &Diagram, dir: &Path, p: &Palette, theme: &Theme) -> impl IntoElement {
-        let image = d.image.as_ref().map(|path| resolve(dir, path)).filter(|path| path.exists());
+    fn render_diagram(&self, key: String, d: &Diagram, dir: &Path, p: &Palette, theme: &Theme) -> impl IntoElement {
+        let dark = theme.is_dark();
+        let image = d.image.as_ref().map(|path| themed_image(&resolve(dir, path), dark)).filter(|path| path.exists());
         let root = self.input.cwd.clone();
         v_flex()
             .gap(px(12.))
@@ -1730,7 +2450,7 @@ impl ChangesView {
                             .id(SharedString::from(format!("diagram-{key}")))
                             .p(px(10.))
                             .items_center()
-                            .bg(gpui_kit::white())
+                            .when(!dark, |card| card.bg(gpui_kit::white()))
                             .cursor_pointer()
                             .hover(|s| s.border_color(p.border_strong))
                             .on_click(move |_, window, cx| crate::preview::open_in_app(open.clone(), Some(root.clone()), window, cx))
@@ -1856,6 +2576,14 @@ impl ChangesView {
                 Some(i) => (g.nodes[i].name.clone().into(), self.render_node_panel(i, g, p, theme, cx).into_any_element()),
                 None => ("Узел".into(), div().into_any_element()),
             },
+            Panel::Dto(key) => match g.dto_index(key) {
+                Some(d) => (g.dtos[d].name.clone().into(), self.render_dto_panel(d, g, p, theme, cx).into_any_element()),
+                None => ("Данные".into(), div().into_any_element()),
+            },
+            Panel::Group(key) => match g.group_index(key) {
+                Some(gi) => (g.groups[gi].title.clone().into(), self.render_group_panel(gi, g, p, theme, cx).into_any_element()),
+                None => ("Группа".into(), div().into_any_element()),
+            },
             Panel::Checks => ("Проверь руками".into(), self.render_checks_panel(p, theme, cx).into_any_element()),
             Panel::Return => ("Вернуть с замечанием".into(), self.render_return_panel(g, p, theme, window, cx).into_any_element()),
         };
@@ -1882,6 +2610,58 @@ impl ChangesView {
             .child(div().id("changes-panel").flex_1().min_h_0().overflow_y_scroll().child(v_flex().p(px(16.)).gap(px(14.)).child(body)))
     }
 
+    /// A frame: what it does, its entities by role, the tests that check them.
+    fn render_group_panel(&self, gi: usize, g: &Graph, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let gr = &g.groups[gi];
+        let members: Vec<usize> = gr.nodes.iter().copied().filter(|&i| g.node_visible(i, self.mode)).collect();
+        let mut tests: Vec<usize> = members.iter().flat_map(|&i| g.tests_of(i)).collect();
+        tests.sort_unstable();
+        tests.dedup();
+        let untested: Vec<usize> = if g.has_tests() { members.iter().copied().filter(|&i| g.untested(i)).collect() } else { Vec::new() };
+        let label = |t: &str| ui::eyebrow(t.to_owned(), p, theme);
+        let row = |i: usize, cx: &mut Context<Self>| {
+            let n = &g.nodes[i];
+            let role = n.role();
+            let key = n.key.clone();
+            h_flex()
+                .id(SharedString::from(format!("group-member-{i}")))
+                .gap(px(8.))
+                .py(px(5.))
+                .cursor_pointer()
+                .hover(|s| s.bg(p.surface2))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.panel = Some(Panel::Node(key.clone()));
+                    cx.notify();
+                }))
+                .child(Icon::empty().path(role.icon()).small().text_color(p.muted))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().truncate().text_size(px(13.)).font_weight(FontWeight::MEDIUM).text_color(p.ink).child(n.title().to_owned()))
+                        .child(div().truncate().font_family(theme.mono_font_family.clone()).text_size(px(11.)).text_color(p.faint).child(format!("{} · {}", role.label(), n.name))),
+                )
+                .when_some(status_tone(n.status, p).filter(|_| n.status != NodeStatus::Context), |d, t| d.child(ui::badge(status_label(n.status), t)))
+        };
+        v_flex()
+            .gap(px(14.))
+            .child(h_flex().gap(px(8.)).child(ui::chip(gr.kind.label(), p, theme)).child(ui::mono(format!("{} сущностей", members.len()), theme).text_color(p.faint)))
+            .when(!gr.summary.is_empty(), |d| d.child(div().text_size(px(13.5)).line_height(px(20.)).text_color(p.fg).child(gr.summary.clone())))
+            .child(v_flex().gap(px(2.)).child(label("Сущности")).children(members.iter().map(|&i| row(i, cx).into_any_element()).collect::<Vec<_>>()))
+            .when(!tests.is_empty(), |d| d.child(v_flex().gap(px(2.)).child(label("Проверяют тесты")).children(tests.iter().map(|&i| row(i, cx).into_any_element()).collect::<Vec<_>>())))
+            .when(!untested.is_empty(), |d| {
+                d.child(
+                    v_flex()
+                        .gap(px(4.))
+                        .p(px(10.))
+                        .rounded(px(8.))
+                        .bg(p.amber.soft)
+                        .child(div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(p.amber.text).child(format!("Без тестов: {}", untested.len())))
+                        .child(div().text_size(px(12.)).text_color(p.amber.text).child(untested.iter().map(|&i| g.nodes[i].title().to_owned()).collect::<Vec<_>>().join(", "))),
+                )
+            })
+    }
+
     fn render_node_panel(&self, i: usize, g: &Graph, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let n = &g.nodes[i];
         let r = self.report();
@@ -1903,7 +2683,32 @@ impl ChangesView {
                 .gap(px(8.))
                 .items_start()
                 .child(div().w(px(70.)).flex_shrink_0().pt(px(2.)).text_size(px(12.)).text_color(tone.map_or(p.muted, |t| t.text)).child(label))
-                .child(h_flex().flex_1().gap(px(5.)).flex_wrap().children(list.iter().enumerate().map(|(li, &j)| self.node_chip(SharedString::from(format!("panel-{label}-{li}")), &g.nodes[j].key, g, p, theme, cx))))
+                .child(v_flex().flex_1().gap(px(5.)).children(list.iter().enumerate().map(|(li, &j)| {
+                    // What travels along this link.
+                    let edge = g.edges.iter().find(|e| (e.from == i && e.to == j) || (e.from == j && e.to == i));
+                    let via = edge.and_then(|e| e.via).map(|d| g.dtos[d].name.clone());
+                    let note = g.notes.get(&(i, j)).or_else(|| g.notes.get(&(j, i))).cloned();
+                    h_flex()
+                        .gap(px(6.))
+                        .flex_wrap()
+                        .child(self.node_chip(SharedString::from(format!("panel-{label}-{li}")), &g.nodes[j].key, g, p, theme, cx))
+                        .when_some(via, |h, v| h.child(div().text_size(px(11.5)).text_color(p.muted).child("передаёт")).child(ui::chip(v, p, theme)))
+                        .when_some(note, |h, n| h.child(div().text_size(px(11.5)).text_color(p.muted).child(n)))
+                })))
+        };
+        let io = |label: &'static str, list: &[usize]| {
+            v_flex().gap(px(6.)).child(ui::eyebrow(label, p, theme)).children(list.iter().map(|&d| {
+                let dto = &g.dtos[d];
+                v_flex()
+                    .gap(px(2.))
+                    .p(px(8.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(p.border)
+                    .bg(p.surface2)
+                    .child(h_flex().gap(px(6.)).child(div().font_family(mono.clone()).text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(p.ink).child(dto.name.clone())).child(div().text_size(px(11.)).text_color(p.faint).child(dto_kind_label(&dto.kind))))
+                    .children(dto.fields_in(self.mode).map(|f| field_row(f, MapMode::Diff, p, theme)))
+            }))
         };
         v_flex()
             .gap(px(14.))
@@ -1946,6 +2751,42 @@ impl ChangesView {
                 )
             })
             .when(!n.note.is_empty(), |v| v.child(div().text_size(px(13.5)).line_height(px(20.)).text_color(p.fg).child(n.note.clone())))
+            .when(!n.signature.is_empty() || !n.signature_before.is_empty(), |v| {
+                let changed = n.signature_changed();
+                v.child(
+                    v_flex()
+                        .gap(px(6.))
+                        .child(ui::eyebrow(if changed { "сигнатура · было → стало" } else { "сигнатура" }, p, theme))
+                        .when(changed, |v| {
+                            v.child(
+                                div()
+                                    .p(px(8.))
+                                    .rounded(px(6.))
+                                    .bg(ui::mix(p.red.soft, p.surface, 0.5))
+                                    .font_family(mono.clone())
+                                    .text_size(px(12.))
+                                    .line_height(px(18.))
+                                    .text_color(p.fg)
+                                    .child(signature_text(&map::sig_diff(&n.signature_before, &n.signature), p)),
+                            )
+                        })
+                        .child(
+                            div()
+                                .p(px(8.))
+                                .rounded(px(6.))
+                                .border_1()
+                                .border_color(p.border)
+                                .bg(p.surface2)
+                                .font_family(mono.clone())
+                                .text_size(px(12.))
+                                .line_height(px(18.))
+                                .text_color(p.ink)
+                                .child(if n.signature.is_empty() { n.signature_before.clone() } else { n.signature.clone() }),
+                        ),
+                )
+            })
+            .when(!n.inputs.is_empty(), |v| v.child(io("принимает", &n.inputs)))
+            .when(!n.outputs.is_empty(), |v| v.child(io("возвращает / отдаёт дальше", &n.outputs)))
             .when(!incoming.is_empty() || !outgoing.is_empty() || !gone.is_empty(), |v| {
                 v.child(
                     v_flex()
@@ -1999,6 +2840,81 @@ impl ChangesView {
                     .when(hunks.is_empty(), |v| v.child(div().text_size(px(12.5)).text_color(p.faint).child(if n.status == NodeStatus::Context { "Этот узел сессия не меняла" } else { "Ханки этого узла не нашлись в диффе" })))
                     .children(hunks.into_iter().take(4).enumerate().map(|(hi, h)| render_hunk(hi, &h, p, theme))),
             )
+    }
+
+    fn render_dto_panel(&self, d: usize, g: &Graph, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let dto = &g.dtos[d];
+        let mono = theme.mono_font_family.clone();
+        let carried: Vec<(usize, usize)> = g.edges.iter().filter(|e| e.via == Some(d)).map(|e| (e.from, e.to)).collect();
+        let file_path = self.input.cwd.join(&dto.file);
+        let root = self.input.cwd.clone();
+        v_flex()
+            .gap(px(14.))
+            .child(
+                h_flex()
+                    .gap(px(8.))
+                    .child(match status_tone(dto.status, p) {
+                        Some(t) => ui::dot_badge(status_label(dto.status), t).into_any_element(),
+                        None => ui::chip(status_label(dto.status), p, theme).into_any_element(),
+                    })
+                    .child(div().text_size(px(12.)).text_color(p.muted).child(dto_kind_label(&dto.kind))),
+            )
+            .child(div().font_family(mono.clone()).text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).text_color(p.ink).when(dto.status == NodeStatus::Removed, |d| d.line_through()).child(dto.name.clone()))
+            .when(!dto.file.is_empty(), |v| {
+                v.child(
+                    div()
+                        .id("dto-file")
+                        .cursor_pointer()
+                        .font_family(mono.clone())
+                        .text_size(px(11.5))
+                        .text_color(p.blue.text)
+                        .hover(|s| s.text_color(p.blue.solid))
+                        .on_click(move |_, window, cx| crate::preview::open_in_app(file_path.clone(), Some(root.clone()), window, cx))
+                        .child(dto.file.clone()),
+                )
+            })
+            .when(!dto.note.is_empty(), |v| v.child(div().text_size(px(13.5)).line_height(px(20.)).text_color(p.fg).child(dto.note.clone())))
+            .child(
+                v_flex()
+                    .gap(px(4.))
+                    .child(ui::eyebrow(format!("поля · {}", dto.fields.len()), p, theme))
+                    .child(
+                        v_flex()
+                            .p(px(10.))
+                            .gap(px(4.))
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(p.border)
+                            .bg(p.surface2)
+                            .when(dto.fields.is_empty(), |v| v.child(div().text_size(px(12.)).text_color(p.faint).child("Ревьюер не описал поля")))
+                            .children(dto.fields.iter().map(|f| {
+                                v_flex()
+                                    .gap(px(1.))
+                                    .child(field_row(f, MapMode::Diff, p, theme))
+                                    .when(!f.note.is_empty(), |v| v.child(div().pl(px(12.)).text_size(px(11.5)).text_color(p.muted).child(f.note.clone())))
+                            })),
+                    ),
+            )
+            .when(!dto.users.is_empty(), |v| {
+                v.child(
+                    v_flex()
+                        .gap(px(6.))
+                        .child(ui::eyebrow("кто использует", p, theme))
+                        .child(h_flex().gap(px(5.)).flex_wrap().children(dto.users.iter().enumerate().map(|(ui_, &n)| self.node_chip(SharedString::from(format!("dto-user-{ui_}")), &g.nodes[n].key, g, p, theme, cx)))),
+                )
+            })
+            .when(!carried.is_empty(), |v| {
+                v.child(
+                    v_flex().gap(px(6.)).child(ui::eyebrow("едет по связям", p, theme)).children(carried.iter().enumerate().map(|(ci, &(a, b))| {
+                        h_flex()
+                            .gap(px(6.))
+                            .flex_wrap()
+                            .child(self.node_chip(SharedString::from(format!("dto-from-{ci}")), &g.nodes[a].key, g, p, theme, cx))
+                            .child(Icon::new(IconName::ArrowRight).xsmall().text_color(p.faint))
+                            .child(self.node_chip(SharedString::from(format!("dto-to-{ci}")), &g.nodes[b].key, g, p, theme, cx))
+                    })),
+                )
+            })
     }
 
     fn render_checks_panel(&self, p: &Palette, _theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2066,7 +2982,7 @@ impl ChangesView {
                         .icon(IconName::ArrowUp)
                         .label("Отправить агенту")
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            let graph = this.report().map(|r| map::build(&r.code, &r.removed_edges)).unwrap_or_default();
+                            let graph = this.report().map(|r| map::build_report(r)).unwrap_or_default();
                             let text = this.remark_text(&graph, &send.read(cx).value());
                             cx.emit(ChangesEvent::Return(text));
                             send.update(cx, |s, cx| s.set_value("", window, cx));
@@ -2077,6 +2993,66 @@ impl ChangesView {
                 ),
             )
     }
+}
+
+/// Signature runs as text: added parts green, removed ones red and struck.
+fn signature_text(parts: &[(String, map::Part)], p: &Palette) -> StyledText {
+    let mut text = String::new();
+    let mut highlights = Vec::new();
+    for (t, part) in parts {
+        let range = text.len()..text.len() + t.len();
+        text.push_str(t);
+        match part {
+            map::Part::Same => {}
+            map::Part::Added => highlights.push((range, HighlightStyle { color: Some(p.green.text), background_color: Some(p.green.soft), ..Default::default() })),
+            map::Part::Removed => highlights.push((
+                range,
+                HighlightStyle { color: Some(p.red.text), strikethrough: Some(StrikethroughStyle { thickness: px(1.), color: Some(p.red.text) }), ..Default::default() },
+            )),
+        }
+    }
+    StyledText::new(text).with_highlights(highlights)
+}
+
+fn dto_kind_label(kind: &str) -> String {
+    match kind.trim().to_lowercase().as_str() {
+        "props" => "пропсы",
+        "args" | "arguments" | "params" => "аргументы",
+        "response" => "ответ API",
+        "request" | "body" => "запрос API",
+        "event" | "payload" => "событие",
+        "state" | "store" => "состояние",
+        "type" | "interface" | "struct" => "тип",
+        "" => "данные",
+        other => return other.to_owned(),
+    }
+    .to_owned()
+}
+
+/// `+ flyToHub?: boolean` — a DTO field with its change mark.
+fn field_row(f: &map::MapField, mode: MapMode, p: &Palette, theme: &Theme) -> impl IntoElement {
+    let show = mode == MapMode::Diff || (mode == MapMode::After && f.status == NodeStatus::Added) || (mode == MapMode::Before && f.status == NodeStatus::Removed);
+    let (mark, tone) = match (show || f.status == NodeStatus::Changed, f.status) {
+        (true, NodeStatus::Added) => ("+", Some(p.green)),
+        (true, NodeStatus::Removed) => ("−", Some(p.red)),
+        (true, NodeStatus::Changed) => ("~", Some(p.amber)),
+        _ => (" ", None),
+    };
+    h_flex()
+        .gap(px(4.))
+        .min_w_0()
+        .font_family(theme.mono_font_family.clone())
+        .text_size(px(10.5))
+        .line_height(px(15.))
+        .child(div().w(px(8.)).flex_shrink_0().text_color(tone.map_or(p.faint, |t| t.text)).child(mark))
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_color(tone.map_or(p.fg, |t| t.text))
+                .when(f.status == NodeStatus::Removed && tone.is_some(), |d| d.line_through())
+                .child(f.name.clone()),
+        )
+        .when(!f.ty.is_empty(), |h| h.child(div().min_w_0().truncate().text_color(p.muted).child(format!(": {}", f.ty))))
 }
 
 fn render_hunk(i: usize, hunk: &str, p: &Palette, theme: &Theme) -> impl IntoElement {
@@ -2200,10 +3176,22 @@ mod tests {
     use super::*;
 
     #[core::prelude::v1::test]
+    fn dark_theme_picks_dark_diagram_when_rendered() {
+        let dir = std::env::temp_dir().join(format!("iv3-themed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let light = dir.join("flow.png");
+        assert_eq!(themed_image(&light, true), light);
+        std::fs::write(dir.join("flow-dark.png"), b"").unwrap();
+        assert_eq!(themed_image(&light, true), dir.join("flow-dark.png"));
+        assert_eq!(themed_image(&light, false), light);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[core::prelude::v1::test]
     fn report_tolerates_old_and_new_shapes() {
         let r: Report = serde_json::from_str(r#"{"title":"t","code":{"added":[{"name":"div","kind":"function"}]},"risks":["Высокий: падает"],"check":["открой"]}"#).unwrap();
         assert_eq!(r.code.added[0].name, "div");
-        assert!(r.flow.is_none() && r.ui.is_empty() && r.decisions.is_empty());
+        assert!(r.flow.is_none() && r.diagrams.is_empty() && r.ui.is_empty() && r.decisions.is_empty());
         assert_eq!(r.risks[0].severity, "high");
         assert_eq!(r.check[0].title, "открой");
         let r: Report = serde_json::from_str(
@@ -2223,9 +3211,8 @@ mod tests {
     #[core::prelude::v1::test]
     fn node_hunks_by_header_or_name() {
         let patches = vec![("src/m.js".to_owned(), "@@ -1,2 +1,3 @@ function sum\n a\n+b\n@@ -10,2 +11,4 @@ function sub\n+export function sub(a, b) {\n+}\n".to_owned())];
-        let g = map::build(
-            &serde_json::from_str::<Report>(r#"{"code":{"added":[{"name":"sub","file":"m.js"}],"changed":[{"name":"sum","file":"m.js","hunks":["@@ -1,2 +1,3 @@"]}]}}"#).unwrap().code,
-            &[],
+        let g = map::build_report(
+            &serde_json::from_str::<Report>(r#"{"code":{"added":[{"name":"sub","file":"m.js"}],"changed":[{"name":"sum","file":"m.js","hunks":["@@ -1,2 +1,3 @@"]}]}}"#).unwrap(),
         );
         let sub = &g.nodes[g.index("sub").unwrap()];
         assert!(node_hunks(sub, &patches)[0].contains("export function sub"));

@@ -1,0 +1,64 @@
+# Push a tag `vX.Y.Z` (matching `version` in Cargo.toml) → a GitHub Release
+# with Stepan for Apple Silicon and Intel. Installed apps find it on their own.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.2.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Version matches the tag
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "v$VERSION" = "$TAG" ] || { echo "Cargo.toml says $VERSION, tag is $TAG"; exit 1; }
+      - name: Toolchain
+        run: rustup show && rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Bundle
+        run: scripts/bundle.sh ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stepan-${{ matrix.target }}
+          path: |
+            dist/*.zip
+            dist/*.dmg
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          ls -lh dist
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* --generate-notes --title "Stepan ${TAG#v}" --repo "$GITHUB_REPOSITORY"
+          fi

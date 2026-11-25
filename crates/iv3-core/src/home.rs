@@ -32,6 +32,8 @@ impl Home {
     pub fn docs(&self) -> PathBuf { self.root.join("docs") }
     pub fn automations(&self) -> PathBuf { self.root.join("automations") }
     pub fn state(&self) -> PathBuf { self.root.join("state") }
+    /// Scratch output per session (before/after media and the like).
+    pub fn tmp(&self) -> PathBuf { self.root.join("tmp") }
 
     /// Create the folder layout if missing. Never overwrites existing files.
     pub fn ensure(&self) -> Result<()> {
@@ -43,7 +45,8 @@ impl Home {
             fs::write(&config, DEFAULT_CONFIG)?;
         }
         let readme = self.docs().join("README.md");
-        if !readme.exists() {
+        // A README you edited stays; the stock one is upgraded.
+        if fs::read_to_string(&readme).map_or(true, |t| t == DOCS_README_V1) {
             fs::write(&readme, DOCS_README)?;
         }
         Ok(())
@@ -63,8 +66,42 @@ impl Home {
     }
 }
 
-/// Written once into a fresh docs/ folder; explains the format to people and agents.
-const DOCS_README: &str = r#"# Документы iv3
+/// Written into a fresh docs/ folder (and over the previous stock README);
+/// explains the layout to people and agents.
+const DOCS_README: &str = r#"# Документы Stepan
+
+Сюда агенты и ты кладёте документы по проектам — они появляются в разделе
+«Документы» сами. Агенты видят эту папку как `$IV3_DOCS`; каждая сессия,
+запущенная из Stepan, получает правила ниже и то, что полка знает о проекте.
+
+```
+<проект>/
+  project.md                 фактура: как запускать, где что, инварианты, грабли
+  decisions/ГГГГ-ММ-ДД-x.md  решения: что выбрали, что отвергли, почему
+  research/x.md              разборы: замеры, причины, варианты, вопрос тебе
+  handoff/x.md               передача незаконченной работы
+```
+
+```markdown
+---
+title: Разбор /events/search
+kind: research         # facts | decision | research | handoff | briefing | note
+status: open           # решения: proposed | accepted | superseded; вопросы: open | answered
+question: Убрать fuzzy-поиск? Я бы оставил…
+project: outpoll-web   # если файл не в папке проекта
+author: codex          # claude | codex | ты | авто
+session: <id сессии>   # откуда документ
+task: <id задачи>      # к какой задаче
+summary: одна строка о сути
+---
+```
+
+`kind` можно не писать — он угадывается по папке. В HTML то же самое —
+тегами `<meta name="iv3:kind" content="…">`.
+"#;
+
+/// The README `ensure` wrote before document kinds existed; replaced on start.
+const DOCS_README_V1: &str = r#"# Документы iv3
 
 Сюда агенты и ты кладёте отчёты, спеки и HTML-разборы — они появляются в
 разделе «Документы» сами. Агенты видят эту папку как `$IV3_DOCS`.

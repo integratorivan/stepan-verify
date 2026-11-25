@@ -14,6 +14,8 @@ fn main() {
         image_cache: Some(std::env::temp_dir().join("iv3-probe-images")),
         env: Vec::new(),
         model: std::env::var("PROBE_MODEL").ok(),
+        // PROBE_INSTRUCTIONS=… goes to the system prompt / developer instructions.
+        instructions: std::env::var("PROBE_INSTRUCTIONS").ok(),
     };
     let message = opt(4);
     let (handle, rx) = iv3_agents::open(spec);
