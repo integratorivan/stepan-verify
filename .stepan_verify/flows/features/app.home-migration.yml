@@ -1,0 +1,11 @@
+feature: Общая папка ~/.stepan_verify и перенос из ~/.iv3
+area: Приложение: настройки, обновления, запуск
+summary: При первом запуске создаётся общая папка и переносятся данные из старой ~/.iv3
+aliases: [перенос данных, миграция iv3, домашняя папка]
+
+paths:
+  Первый запуск:
+    - Запуск приложения: Открыть Stepan впервые -> Создаются skills, tasks, docs, automations, state; старая ~/.iv3 переезжает и остаётся доступной  [Home::locate, Home::ensure, crates/stepan_verify_core/src/home.rs, crates/stepan_verify_app/src/main.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/home.rs  covers: 1  at: 2026-11-25T08:41:08Z  title: Старая папка переезжает и остаётся доступной

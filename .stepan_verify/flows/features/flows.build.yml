@@ -1,0 +1,13 @@
+feature: Построить / обновить карту флоу агентом
+area: Флоу (карта пользовательских путей)
+summary: Кнопка запускает агента, который изучает проект и пишет .stepan_verify/flows.yaml; предложения сессий принимаются отдельно
+aliases: [построить карту, обновить карту, --build-flows]
+
+paths:
+  Из экрана «Флоу»:
+    - Флоу: Нажать «Построить карту» (или «Обновить карту») -> Показывается экран сборки, агент пишет файл карты  [FlowsView::render_building, flows::prompt, crates/stepan_verify_app/src/flows.rs]
+    - Флоу, блок предложений: Нажать «Принять» или «Отклонить» у предложения сессии -> Карта правится или предложение снимается  [FlowsView::decide, FlowProposal, crates/stepan_verify_app/src/flows.rs, crates/stepan_verify_core/src/flows.rs]
+
+proofs:
+  - test: crates/stepan_verify_app/src/flows.rs  covers: 1  at: 2026-11-25T08:41:08Z  title: Промпт несёт маркер и схему
+  - test: crates/stepan_verify_core/src/flows.rs  covers: 2  at: 2026-11-25T08:41:08Z  title: Предложения применяются

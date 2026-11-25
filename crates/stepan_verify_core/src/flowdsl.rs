@@ -949,6 +949,46 @@ pub fn fmt(repo: &Path) -> Result<usize> {
     Ok(map.features.len())
 }
 
+/// `stepan_verify flows check|fmt [<repo>]`. Returns (output, ok). The repo
+/// defaults to the current folder or its nearest parent with `.stepan_verify/flows`.
+pub fn cli(args: &[String]) -> Result<(String, bool)> {
+    let repo = |arg: Option<&String>| -> PathBuf {
+        if let Some(a) = arg {
+            return PathBuf::from(a);
+        }
+        let cwd = std::env::current_dir().unwrap_or_default();
+        cwd.ancestors().find(|d| dir(d).is_dir() || d.join(crate::flows::FILE).is_file()).map(Path::to_path_buf).unwrap_or(cwd)
+    };
+    match args.first().map(String::as_str) {
+        Some("check") => {
+            let r = repo(args.get(1));
+            // An old single-file map is migrated first, like the app does.
+            crate::flows::FlowMap::load(&r).ok();
+            let diags = check(&r)?;
+            let errors = diags.iter().filter(|d| d.error).count();
+            let warnings = diags.len() - errors;
+            let mut out: Vec<String> = diags.iter().map(|d| d.to_string()).collect();
+            out.push(match (errors, warnings) {
+                (0, 0) => format!("ok: {} — ошибок нет", dir(&r).display()),
+                (0, w) => format!("ok: ошибок нет, предупреждений: {w}"),
+                (e, w) => format!("ошибок: {e}, предупреждений: {w}"),
+            });
+            Ok((out.join("\n"), errors == 0))
+        }
+        Some("fmt") => {
+            let r = repo(args.get(1));
+            let n = fmt(&r)?;
+            Ok((format!("переписано в каноническом виде: {n} фич + app.yml ({})", dir(&r).display()), true))
+        }
+        _ => Ok((
+            "stepan_verify flows check [<repo>]  — проверить карту флоу (.stepan_verify/flows), ошибки с файлом и строкой\n\
+             stepan_verify flows fmt [<repo>]    — переписать файлы карты в каноническом виде"
+                .into(),
+            args.first().is_none_or(|a| a == "help" || a == "--help"),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

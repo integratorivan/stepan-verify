@@ -1,0 +1,17 @@
+feature: Живые карточки сессий («Пульт»)
+area: Дашборд («Пульт»)
+summary: Карточка работающей сессии показывает шаги плана, текущий шаг, «Шаг N из M», статус «ждёт подтверждения / ответа»
+aliases: [пульт, живая карточка, блок «Сейчас», карточка агента]
+
+paths:
+  Следить за агентом с дашборда:
+    - Дашборд: Запустить или продолжить сессию и вернуться на дашборд -> Карточка сессии со шагами, текущим действием и прогрессом «Шаг N из M»  [LiveSession, live_card::Card, dashboard::live_card, crates/stepan_verify_app/src/live_card.rs, crates/stepan_verify_app/src/dashboard.rs]
+    - Дашборд: Запустить агента вне Stepan (терминал, Codex Desktop) -> Появляется карточка с плашкой «ВНЕ STEPAN» и статусом «Работает» / «Ждёт тебя», собранная по хвосту файла сессии  [ExternalLive, agents::peek, crates/stepan_verify_agents/src/peek.rs, crates/stepan_verify_app/src/app.rs]
+  Решить прямо на карточке:
+    - Карточка сессии: Нажать «Разрешить» или «Отклонить» на запросе подтверждения -> Агент продолжает или получает отказ без открытия сессии  [dashboard::live_card, AppView::decide, crates/stepan_verify_app/src/dashboard.rs, crates/stepan_verify_app/src/app.rs]
+    - Карточка сессии: Ввести ответ в поле и нажать «Отправить» -> Ответ уходит в сессию агента  [dashboard::live_card, crates/stepan_verify_app/src/dashboard.rs]
+    - Карточка сессии: Нажать «Пауза» -> Текущий ход агента останавливается  [AppView::pause_session, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/dashboard.rs]
+
+proofs:
+  - test: crates/stepan_verify_app/src/live_card.rs  covers: 1  at: 2026-11-25T08:41:08Z  title: Окно шагов вокруг текущего, прогресс «Шаг N из M»
+  - test: crates/stepan_verify_agents/src/peek.rs  covers: 2  at: 2026-11-25T08:41:08Z  title: Чтение хвоста файла внешней сессии

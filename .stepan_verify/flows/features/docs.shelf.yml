@@ -1,0 +1,13 @@
+feature: Полка документов
+area: Документы («Полка»)
+summary: Список документов из ~/.stepan_verify/docs по проектам или по времени, поиск, закреплённые
+aliases: [полка, документы, доки, разборы]
+
+paths:
+  Найти документ:
+    - Левый сайдбар: Нажать «Документы» -> Открывается полка; если пусто — подсказка как её наполнить и «Открыть папку»  [DocsView, Page::Docs, crates/stepan_verify_app/src/docs.rs, crates/stepan_verify_app/src/app.rs]
+    - Полка: Переключить «По проектам» / «По времени», ввести запрос в поиск -> Список перегруппировывается и фильтруется  [DocsView::segment, scan, crates/stepan_verify_app/src/docs.rs, crates/stepan_verify_core/src/docs.rs]
+    - Просмотр документа: Нажать «Закрепить» -> Документ попадает в группу «Закреплённые»  [Doc::pinned, front_field_edit, crates/stepan_verify_app/src/docs.rs, crates/stepan_verify_core/src/docs.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/docs.rs  covers: 2, 3  at: 2026-11-25T08:41:08Z  title: Frontmatter, разделы, группы, закрепление

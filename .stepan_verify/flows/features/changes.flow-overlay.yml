@@ -1,0 +1,11 @@
+feature: Затронутые флоу в отчёте
+area: Изменения («Карта»)
+summary: Отчёт показывает, какие пути пользовательской карты задела сессия, и предлагает принять предложения в карту
+aliases: [предложения в карту, затронутые флоу]
+
+paths:
+  Принять предложение в карту:
+    - Вкладка «Изменения»: Нажать «Принять в карту» или «Отклонить» у предложения -> Карта флоу обновляется или предложение снимается  [FlowProposal, FlowMap::apply, crates/stepan_verify_app/src/changes/mod.rs, crates/stepan_verify_core/src/flows.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/flows.rs  covers: 1  at: 2026-11-25T08:41:08Z  title: Предложения применяются и удаляются

@@ -1,0 +1,12 @@
+feature: Автопилот
+area: Задачи (доска)
+summary: Приложение само берёт готовые задачи в работу, до лимита одновременных агентов; сданное идёт на ревью автоматически
+aliases: [автопилот, автозапуск задач]
+
+paths:
+  Автопилот берёт задачи:
+    - Настройки: Выбрать лимит автопилота -> Автопилот держит в работе не больше N агентов  [Config::autopilot_limit, AppView::autopilot_step, crates/stepan_verify_app/src/settings_page.rs, crates/stepan_verify_app/src/app.rs]
+    - Доска задач: Положить задачу в «К работе» -> Автопилот стартует агента по свободной задаче, зависимости учитываются  [AppView::autopilot_step, autopilot_busy, crates/stepan_verify_app/src/app.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/tasks.rs  covers: 2  at: 2026-11-25T08:41:08Z  title: Просроченная аренда возвращает задачу в очередь

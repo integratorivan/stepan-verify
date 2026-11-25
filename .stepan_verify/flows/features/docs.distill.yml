@@ -1,0 +1,13 @@
+feature: Итоги сессии в документы
+area: Документы («Полка»)
+summary: Когда сессия затихла, агент той же семьи записывает решения, факты проекта и вопросы в ~/.stepan_verify/docs
+aliases: [дистиллятор, итоги сессии, post-session distiller]
+
+paths:
+  Автоматически после сессии:
+    - Фон (любой экран): Сессия затихает после содержательного разговора -> Запускается проход агента, в полке появляются новые документы  [distill, DistillMode, crates/stepan_verify_app/src/distill.rs, crates/stepan_verify_core/src/config.rs]
+    - Настройки, «Документы · итоги сессий»: Переключить режим -> Проход включается или выключается  [settings_page, DistillMode, crates/stepan_verify_app/src/settings_page.rs]
+
+proofs:
+  - test: crates/stepan_verify_app/src/distill.rs  covers: 1  at: 2026-11-25T08:41:08Z  title: Якорь чтения, отсев болтовни, контекст прохода
+  - test: crates/stepan_verify_core/src/docs.rs  covers: 1  at: 2026-11-25T08:41:08Z  title: Агентам даётся бриф по знаниям проекта

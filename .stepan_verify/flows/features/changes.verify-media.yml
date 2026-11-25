@@ -1,0 +1,11 @@
+feature: Проверка запуском и скриншоты «Было → Стало»
+area: Изменения («Карта»)
+summary: После хода с правками UI агент снимает скриншоты/видео до и после; запуски проверки видны в отчёте
+aliases: [скриншоты до после, before/after, media, проверка запуском]
+
+paths:
+  Автоматически после хода:
+    - Экран сессии: Агент закончил ход с правками интерфейса -> Запускается съёмка «Было → Стало», в «Изменениях» виден прогресс и кнопка «Остановить»  [media::turn_finished, media::classify, Run, crates/stepan_verify_app/src/changes/media.rs, crates/stepan_verify_app/src/changes/mod.rs]
+
+proofs:
+  - test: crates/stepan_verify_app/src/changes/media.rs  covers: 1  at: 2026-11-25T08:41:08Z  title: Какие файлы требуют съёмки, манифест, очередь

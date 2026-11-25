@@ -1,0 +1,13 @@
+feature: Скиллы («Связи»)
+area: Скиллы («Связи»)
+summary: Какие скиллы есть, кто их видит и как Claude/Codex их реально вызывали за последние 30 дней
+aliases: [скиллы, связи, использование скиллов]
+
+paths:
+  Смотреть скиллы:
+    - Левый сайдбар: Нажать «Скиллы» -> Открывается список скиллов со счётчиками на вкладках  [SkillsView, Page::Skills, crates/stepan_verify_app/src/skills.rs, crates/stepan_verify_app/src/app.rs]
+    - Скиллы: Переключить вкладку «Вызывались» / «Без дела 2 нед» / «Проблемы» и чип агента -> Список фильтруется  [Tab, AgentFilter, crates/stepan_verify_app/src/skills.rs]
+    - Скиллы: Раскрыть скилл (Enter / пробел) -> Видны вызовы за 30 дней, где лежит скилл, «Как исправить» для проблем, «Папка» и «Открыть»  [SkillsView::on_key, crates/stepan_verify_app/src/skills.rs, crates/stepan_verify_core/src/skills.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/skills.rs  covers: 2, 3  at: 2026-11-25T08:41:08Z  title: Разбор вызовов Claude/Codex и проблем скиллов

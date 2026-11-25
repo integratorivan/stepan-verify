@@ -1,0 +1,12 @@
+feature: Архив сессий
+area: Дашборд («Пульт»)
+summary: Скрыть старую сессию с дашборда в архив и вернуться к ней через «Архив»
+aliases: [скрыть сессию, архив]
+
+paths:
+  В архив и обратно:
+    - Дашборд, список «Недавние»: Нажать значок «В архив» у сессии -> Сессия пропадает из «Недавние»  [Archive, dashboard::render, crates/stepan_verify_core/src/archive.rs, crates/stepan_verify_app/src/dashboard.rs]
+    - Дашборд: Нажать «Архив · N» -> Заголовок меняется на «Архив», видны скрытые сессии; кнопка «К недавним» возвращает  [dash-archive-view, crates/stepan_verify_app/src/dashboard.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/archive.rs  covers: 1  at: 2026-11-25T08:41:08Z  title: Архив сохраняется и читается

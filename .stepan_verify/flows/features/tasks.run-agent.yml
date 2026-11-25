@@ -1,0 +1,11 @@
+feature: Запуск агента из карточки задачи
+area: Задачи (доска)
+summary: Кнопка «▶ Claude / Codex» на карточке стартует сессию по задаче с её описанием и файлами
+aliases: [запустить задачу, ▶ Claude, отдать задачу агенту]
+
+paths:
+  Из карточки:
+    - Карточка задачи: Нажать «▶ Claude» или «▶ Codex» -> Открывается сессия, задача переходит в «В работе», в промпте — описание и «Файлы к задаче»  [AppView::start_task, task_prompt, SessionView::start_task, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/session.rs]
+
+proofs:
+  - test: crates/stepan_verify_app/src/session.rs  covers: 1  at: 2026-11-25T08:41:08Z  title: Промпт задачи перечисляет файлы, но не картинки

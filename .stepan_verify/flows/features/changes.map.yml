@@ -1,0 +1,14 @@
+feature: Карта функций «было / стало / разница»
+area: Изменения («Карта»)
+summary: Нативный граф-холст: узлы функций и DTO, рёбра вызовов, режимы было/стало/разница, итерации сессии
+aliases: [карта, граф, холст, было стало, map]
+
+paths:
+  Исследовать карту:
+    - Вкладка «Изменения», «Карта»: Тянуть холст, зумить, нажать «Вписать» -> Холст двигается и масштабируется; «Вписать» центрирует карту  [Canvas, zoom-fit, crates/stepan_verify_app/src/changes/canvas.rs, crates/stepan_verify_app/src/changes/mod.rs]
+    - Карта: Нажать на узел -> Справа панель узла — сигнатура, дифф, сущности, «Что доказывает»  [Panel::Node, Panel::Dto, Panel::Group, crates/stepan_verify_app/src/changes/mod.rs, crates/stepan_verify_app/src/changes/map.rs]
+    - Карта: Переключить на «Списком» -> Те же изменения списком вместо холста  [ChangesView, crates/stepan_verify_app/src/changes/mod.rs]
+
+proofs:
+  - test: crates/stepan_verify_app/src/changes/canvas.rs  covers: 1  at: 2026-11-25T08:41:08Z  title: Холст: зум, подгонка, перетаскивание
+  - test: crates/stepan_verify_app/src/changes/map.rs  covers: 2  at: 2026-11-25T08:41:08Z  title: Раскладка карты, рёбра, итерации, сигнатуры

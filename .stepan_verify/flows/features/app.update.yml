@@ -1,0 +1,11 @@
+feature: Автообновление
+area: Приложение: настройки, обновления, запуск
+summary: Приложение проверяет GitHub Releases, в сайдбаре появляется «Обновить», оно скачивает и заменяет себя
+aliases: [обновить, апдейт, обновления]
+
+paths:
+  Обновиться:
+    - Левый сайдбар: Нажать «Обновить» (или «Проверить сейчас» в Настройках) -> Скачивается новая версия, бандл заменяется, приложение перезапускается  [update::init, running_bundle, crates/stepan_verify_app/src/update.rs, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/settings_page.rs]
+
+proofs:
+  - test: crates/stepan_verify_app/src/update.rs  covers: 1  at: 2026-11-25T08:41:08Z  title: Разбор release.json и подмена бандла

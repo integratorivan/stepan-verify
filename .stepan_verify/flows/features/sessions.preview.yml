@@ -1,0 +1,11 @@
+feature: Превью файлов справа
+area: Сессии агентов
+summary: Файл из ленты открывается в панели справа — HTML в WKWebView, код с подсветкой, markdown, картинки, папки
+aliases: [правая панель, превью, просмотр файла]
+
+paths:
+  Открыть файл из ленты:
+    - Лента сессии: Нажать «Открыть» у файла или картинки -> Справа открывается панель превью с кнопками «Назад», «Открыть в системе», «Показать в Finder», «Закрыть»  [PreviewView, AppView::open_preview, crates/stepan_verify_app/src/preview.rs, crates/stepan_verify_app/src/app.rs]
+
+proofs:
+  - test: crates/stepan_verify_app/src/preview.rs  covers: 1  at: 2026-11-25T08:41:08Z  title: Типы по расширению, бинарные и обрезанные файлы

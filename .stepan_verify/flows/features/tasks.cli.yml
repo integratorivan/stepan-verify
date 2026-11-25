@@ -1,0 +1,13 @@
+feature: CLI доски `stepan_verify task …`
+area: Задачи (доска)
+summary: Агенты и скрипты управляют задачами из терминала — list, create, claim, complete, block, status и др.
+aliases: [task cli, консоль задач, stepan_verify task]
+
+paths:
+  Цикл агента:
+    - Терминал агента: Выполнить stepan_verify task claim --ready -> Агент получает задачу с арендой  [cli::run, Board::claim, crates/stepan_verify_core/src/cli.rs, crates/stepan_verify_app/src/main.rs]
+    - Терминал агента: Выполнить stepan_verify task complete <summary> -> Задача уходит на ревью человеку  [cli::run, Board::complete, crates/stepan_verify_core/src/cli.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/cli.rs  at: 2026-11-25T08:41:08Z  title: Прогон CLI целиком
+  - cli: ./target/debug/stepan_verify task list  covers: 1  at: 2026-11-25T08:41:08Z  title: Справка по командам

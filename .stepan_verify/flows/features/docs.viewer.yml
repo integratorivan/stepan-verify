@@ -1,0 +1,12 @@
+feature: Просмотр документа (md и html)
+area: Документы («Полка»)
+summary: Нативный рендер markdown и HTML с оглавлением, кнопки «Исходник» и «Открыть папку»
+aliases: [чтение документа, рендер markdown]
+
+paths:
+  Открыть документ:
+    - Полка: Выбрать документ в списке (клавиши Enter / ↓) -> Документ отрисован, виден список разделов  [DocsView, Body, crates/stepan_verify_app/src/docs.rs]
+    - Просмотр документа: Нажать «Исходник» -> Файл открывается в панели превью справа  [PreviewView, crates/stepan_verify_app/src/docs.rs, crates/stepan_verify_app/src/preview.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/docs.rs  covers: 1  at: 2026-11-25T08:41:08Z  title: HTML meta, разделы и оглавление

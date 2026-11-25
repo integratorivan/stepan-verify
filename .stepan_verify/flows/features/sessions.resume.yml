@@ -1,0 +1,8 @@
+feature: Продолжить сессию из истории
+area: Сессии агентов
+summary: Открыть старую сессию Claude или Codex внутри приложения с историей и продолжить диалог
+aliases: [продолжить, открыть сессию, resume]
+
+paths:
+  Из списка на дашборде:
+    - Дашборд, «Недавние»: Нажать «Открыть» у сессии -> Открывается экран сессии с загруженной историей (скелетоны пока грузится)  [AppView::open_session, SessionView::resume, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/session.rs, crates/stepan_verify_app/src/loading.rs]

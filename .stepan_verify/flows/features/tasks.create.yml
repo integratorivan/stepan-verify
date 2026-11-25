@@ -1,0 +1,12 @@
+feature: Создание задачи
+area: Задачи (доска)
+summary: Диалог «Новая задача» — название, описание, вложения, проект, метки и куда положить (К работе / Входящие)
+aliases: [новая задача, добавить задачу]
+
+paths:
+  Через диалог:
+    - Доска задач: Нажать «Новая задача» -> Открывается диалог с полями «Задача», «Описание», «Вложения», «Проект», «Метки», «Куда»  [NewTaskDialog, crates/stepan_verify_app/src/new_task.rs, crates/stepan_verify_app/src/board.rs]
+    - Диалог «Новая задача»: Заполнить, выбрать «К работе — агенты могут брать» или «Во входящие — разберу сам», нажать «Создать» -> Карточка появляется в выбранной колонке, вложения копируются рядом с задачей  [Board::create, copy_attachments, crates/stepan_verify_core/src/tasks.rs, crates/stepan_verify_app/src/new_task.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/tasks.rs  covers: 2  at: 2026-11-25T08:41:08Z  title: Вложения копируются рядом с задачей

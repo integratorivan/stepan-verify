@@ -1,0 +1,13 @@
+feature: Настройки
+area: Приложение: настройки, обновления, запуск
+summary: Режим агентов, агент по умолчанию, лимит автопилота, модели отчётов, шрифты, правила документов
+aliases: [настройки, конфиг, config.toml, режим агентов]
+
+paths:
+  Поменять настройку:
+    - Левый сайдбар: Нажать «Настройки» -> Открывается экран настроек  [SettingsPage, Page::Settings, crates/stepan_verify_app/src/settings_page.rs, crates/stepan_verify_app/src/app.rs]
+    - Настройки: Выбрать «Режим агентов» (по умолчанию полный доступ) -> Новые процессы агентов стартуют в этом режиме, значение пишется в config.toml  [Config, Mode, crates/stepan_verify_app/src/settings.rs, crates/stepan_verify_core/src/config.rs]
+    - Настройки: Выбрать шрифт текста или кода -> Интерфейс сразу перерисовывается новым шрифтом  [ui::apply_fonts, crates/stepan_verify_app/src/ui.rs, crates/stepan_verify_app/src/settings_page.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/config.rs  covers: 2  at: 2026-11-25T08:41:08Z  title: Нет файла — полный доступ, частичный файл сохраняет умолчания

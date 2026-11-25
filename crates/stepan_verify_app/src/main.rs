@@ -28,7 +28,7 @@ use gpui_kit::*;
 fn main() {
     let home = stepan_verify_core::Home::locate();
 
-    // `stepan_verify task …` (the board) and `stepan_verify memory …` are CLIs for agents and scripts; no window.
+    // `stepan_verify task …` (the board), `stepan_verify memory …` and `stepan_verify flows check|fmt` are CLIs for agents and scripts; no window.
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("memory") {
         match stepan_verify_core::memory::run(&home, &args[1..]) {
@@ -39,6 +39,18 @@ fn main() {
             }
         }
         return;
+    }
+    if args.first().map(String::as_str) == Some("flows") {
+        match stepan_verify_core::flowdsl::cli(&args[1..]) {
+            Ok((out, ok)) => {
+                println!("{out}");
+                std::process::exit(if ok { 0 } else { 1 });
+            }
+            Err(err) => {
+                eprintln!("stepan_verify: {err:#}");
+                std::process::exit(1);
+            }
+        }
     }
     if args.first().map(String::as_str) == Some("task") {
         match stepan_verify_core::cli::run(&home, &args[1..]) {

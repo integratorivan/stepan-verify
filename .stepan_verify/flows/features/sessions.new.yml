@@ -1,0 +1,12 @@
+feature: Новая сессия
+area: Сессии агентов
+summary: Запуск Claude Code или Codex на проекте с первой задачей, вложениями и скриншотом
+aliases: [запустить агента, новый агент, новая сессия Claude]
+
+paths:
+  Через диалог «Новая сессия»:
+    - Дашборд / сайдбар: Нажать «Новая сессия» -> Открывается диалог с полями «Проект», «Агент», «Задача»  [NewSessionDialog, ProjectPicker, crates/stepan_verify_app/src/new_session.rs, crates/stepan_verify_app/src/project_picker.rs]
+    - Диалог «Новая сессия»: Выбрать недавний проект или «Другая папка…» -> Проект выбран, папка запоминается в недавних  [ProjectPicker, crates/stepan_verify_app/src/project_picker.rs]
+    - Диалог «Новая сессия»: Выбрать Claude/Codex, написать задачу и нажать «Запустить» (или Enter) -> Открывается экран сессии, агент начинает работать  [AppView::start_session, SessionView::start, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/session.rs]
+  Из командной строки:
+    - Терминал: Запустить stepan_verify --new / --start claude --cwd <папка> --send <текст> -> Приложение открывается сразу с диалогом или с запущенной сессией  [Launch::from_args, crates/stepan_verify_app/src/app.rs]

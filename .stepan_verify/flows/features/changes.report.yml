@@ -1,0 +1,10 @@
+feature: Вкладка «Изменения» — отчёт по сессии
+area: Изменения («Карта»)
+summary: Субагент читает сессию и собирает флоу-схему, что добавлено/изменено/удалено, было→стало, риски и что проверить
+aliases: [изменения, отчёт, ревью сессии, вкладка изменений]
+
+paths:
+  Собрать отчёт:
+    - Экран сессии: Открыть вкладку «Изменения» и нажать «Собрать карту» -> Запускается сабагент-ревьюер, идёт прогресс «Читает сессию…»  [ChangesView, changes::runs, ChangesInput, crates/stepan_verify_app/src/changes/mod.rs, crates/stepan_verify_app/src/changes/runs.rs, crates/stepan_verify_app/src/session.rs]
+    - Вкладка «Изменения»: Нажать «Отменить» -> Сборка прекращается  [ChangesView::cancel, crates/stepan_verify_app/src/changes/mod.rs]
+    - Вкладка «Изменения»: Нажать «Дополнить» или «Пересобрать» -> Отчёт обновляется по новым ходам сессии (батч-обновление)  [ChangesView, changes::runs, crates/stepan_verify_app/src/changes/mod.rs, crates/stepan_verify_app/src/changes/runs.rs]

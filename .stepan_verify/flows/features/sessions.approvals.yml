@@ -1,0 +1,9 @@
+feature: Подтверждения действий агента
+area: Сессии агентов
+summary: Агент просит разрешение на команду или правку; пользователь нажимает «Разрешить» или «Отклонить»
+aliases: [апрув, разрешить, permission prompt]
+
+paths:
+  В экране сессии:
+    - Экран сессии: Агент запрашивает разрешение -> В ленте появляется запрос с кнопками «Разрешить» и «Отклонить»  [SessionView, can_use_tool, requestApproval, crates/stepan_verify_app/src/session.rs, crates/stepan_verify_agents/src/claude.rs, crates/stepan_verify_agents/src/codex.rs]
+    - Экран сессии: Нажать «Разрешить» или «Отклонить» -> Агент продолжает работу или получает отказ  [SessionView::decide, crates/stepan_verify_app/src/session.rs]

@@ -1,0 +1,15 @@
+feature: Карта флоу
+area: Флоу (карта пользовательских путей)
+summary: Холст с областями, фичами, путями и доказательствами проекта по .stepan_verify/flows.yaml; поиск и выбор проекта
+aliases: [флоу, карта фич, feature map, карта пользовательских путей]
+
+paths:
+  Открыть карту:
+    - Левый сайдбар: Нажать «Флоу» -> Открывается холст карты выбранного проекта  [FlowsView, Page::Flows, flows::layout, crates/stepan_verify_app/src/flows.rs, crates/stepan_verify_app/src/app.rs]
+    - Флоу: Выбрать проект чипом -> Показывается карта этого проекта  [FlowsView::select_project, crates/stepan_verify_app/src/flows.rs]
+    - Флоу: Нажать на фичу -> Справа панель — пути, шаги, сущности, файлы и доказательства  [FlowsView::render_feature, Selection, crates/stepan_verify_app/src/flows.rs]
+    - Флоу: Ввести запрос в поиск -> Остаются фичи, подходящие по названию и алиасам  [flows::matches, crates/stepan_verify_app/src/flows.rs]
+
+proofs:
+  - test: crates/stepan_verify_app/src/flows.rs  covers: 3, 4  at: 2026-11-25T08:41:08Z  title: Раскладка по колонкам и поиск
+  - test: crates/stepan_verify_core/src/flows.rs  covers: 1  at: 2026-11-25T08:41:08Z  title: Разбор yaml и свежесть карты

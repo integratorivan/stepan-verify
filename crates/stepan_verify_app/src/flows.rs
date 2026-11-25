@@ -1,7 +1,9 @@
-//! «Флоу»: the project's user-flow map on a canvas — what features exist,
-//! how a user reaches them, what proves they work (the feature map from the
-//! «All Code Is Slop» talk). The map is `.stepan_verify/flows.yaml` in the
-//! project repo: an agent builds it, sessions propose changes, you accept them.
+//! «Флоу»: the project's user-flow map — the whole app's navigation from an
+//! explicit start («Приложение»), the catalog of features with their step
+//! flows («Фичи»), and what proves they work («Доказательства», the feature
+//! map from the «All Code Is Slop» talk). The map is `.stepan_verify/flows/`
+//! in the project repo, written in the flow language (`docs/FLOWS.md`): an
+//! agent builds it in passes, sessions propose changes, you accept them.
 
 use std::{
     cell::Cell,
@@ -23,6 +25,7 @@ use gpui_kit::*;
 use stepan_verify_agents::{AgentEvent, AgentHandle, ItemKind, Mode, Provider, SessionSpec};
 use stepan_verify_core::{
     Home,
+    flowdsl,
     flows::{self, Decisions, Feature, FlowMap, FlowProposal, Freshness, ProofKind, SessionFlows},
     flowscan::{self, EntryPoint, Inventory},
     flowsync::{self, Lag},
@@ -209,6 +212,137 @@ pub fn matches(f: &Feature, query: &str) -> bool {
         || f.steps().any(|s| hay(&s.screen) || hay(&s.action) || hay(&s.result) || s.entities.iter().any(|e| hay(e)))
 }
 
+// ------------------------------------------------------------------ navigation layout
+
+/// The three ways to look at the map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tab {
+    /// The whole app from its start: screens and transitions (`app.yml`).
+    App,
+    /// Catalog of features; one feature's flow step by step.
+    Features,
+    /// Feature → paths → proofs (the original three-column canvas).
+    Proofs,
+}
+
+pub const SCREEN_W: f32 = 220.;
+pub const SCREEN_H: f32 = 78.;
+pub const START_H: f32 = 98.;
+pub const NAV_COL_GAP: f32 = 150.;
+pub const NAV_ROW_GAP: f32 = 40.;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NavEdge {
+    pub from: usize,
+    /// Index of the edge in `screens[from].edges`.
+    pub edge: usize,
+    pub to: usize,
+    /// Bezier control points, world coordinates.
+    pub curve: [(f32, f32); 4],
+    /// Where the label (action, feature chip) sits.
+    pub label: (f32, f32),
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NavLayout {
+    pub screens: Vec<(usize, Rect)>,
+    pub edges: Vec<NavEdge>,
+    pub size: (f32, f32),
+}
+
+/// Left to right by steps from the start: column = BFS level from `start`.
+/// Forward transitions go right-to-left-mid; back and same-column ones dip below.
+pub fn nav_layout(nav: &flows::AppNav) -> NavLayout {
+    let mut out = NavLayout::default();
+    let mut rects: Vec<Option<Rect>> = vec![None; nav.screens.len()];
+    let start = nav.screens.iter().position(|s| s.name == nav.start);
+    let mut max_x: f32 = 0.;
+    let mut max_y: f32 = 0.;
+    let mut level_of = vec![0usize; nav.screens.len()];
+    for (l, level) in nav.levels().iter().enumerate() {
+        let mut y = 0.;
+        for &i in level {
+            level_of[i] = l;
+            let h = if Some(i) == start { START_H } else { SCREEN_H };
+            let r = Rect { x: l as f32 * (SCREEN_W + NAV_COL_GAP), y, w: SCREEN_W, h };
+            y += h + NAV_ROW_GAP;
+            max_x = max_x.max(r.x + r.w);
+            max_y = max_y.max(r.y + r.h);
+            rects[i] = Some(r);
+            out.screens.push((i, r));
+        }
+    }
+    let mut seen: HashMap<(usize, usize), usize> = HashMap::new();
+    for (from, s) in nav.screens.iter().enumerate() {
+        let Some(a) = rects[from] else { continue };
+        for (ei, e) in s.edges.iter().enumerate() {
+            let Some(to) = nav.screens.iter().position(|x| x.name == e.to) else { continue };
+            if to == from {
+                continue;
+            }
+            let Some(b) = rects[to] else { continue };
+            let k = seen.entry((from.min(to), from.max(to))).or_insert(0);
+            let shift = *k as f32 * 16.;
+            *k += 1;
+            let (curve, label) = if level_of[to] > level_of[from] {
+                let p0 = (a.x + a.w, a.y + a.h / 2.);
+                let p3 = (b.x, b.y + b.h / 2.);
+                let mid = (p0.0 + p3.0) / 2.;
+                ([p0, (mid, p0.1), (mid, p3.1), p3], (mid, (p0.1 + p3.1) / 2. + shift))
+            } else {
+                // Back or sideways: leave from the bottom, arrive at the bottom.
+                let p0 = (a.x + a.w * 0.6, a.y + a.h);
+                let p3 = (b.x + b.w * 0.4, b.y + b.h);
+                let dip = p0.1.max(p3.1) + 56. + shift;
+                ([p0, (p0.0, dip), (p3.0, dip), p3], ((p0.0 + p3.0) / 2., dip - 12.))
+            };
+            max_y = max_y.max(label.1 + 30.);
+            out.edges.push(NavEdge { from, edge: ei, to, curve, label });
+        }
+    }
+    out.size = (max_x, max_y);
+    out
+}
+
+fn kind_icon(kind: &str, start: bool) -> &'static str {
+    if start {
+        return "icons/rocket.svg";
+    }
+    match kind {
+        "dialog" => "icons/message-square.svg",
+        "sheet" => "icons/panel-bottom.svg",
+        "tab" => "icons/panels-top-left.svg",
+        "panel" => "icons/panel-right.svg",
+        "external" => "icons/external-link.svg",
+        _ => "icons/app-window.svg",
+    }
+}
+
+fn kind_label(kind: &str) -> &'static str {
+    match kind {
+        "dialog" => "диалог",
+        "sheet" => "шторка",
+        "tab" => "вкладка",
+        "panel" => "панель",
+        "external" => "снаружи",
+        _ => "экран",
+    }
+}
+
+/// Status of a feature as shown: label and tone.
+fn status_tone(status: &str, p: &Palette) -> (Tone, &'static str) {
+    match status {
+        "done" => (p.green, "готово"),
+        "in_progress" => (p.blue, "в работе"),
+        "planned" => (Tone { solid: p.faint, soft: p.surface2, text: p.muted }, "запланировано"),
+        "broken" => (p.red, "сломано"),
+        "draft" => (p.blue, "описывается"),
+        _ => (Tone { solid: p.faint, soft: p.surface2, text: p.muted }, "статус не указан"),
+    }
+}
+
+pub const STATUS_FILTERS: [(&str, &str); 5] = [("done", "Готово"), ("in_progress", "В работе"), ("planned", "Запланировано"), ("broken", "Сломано"), ("draft", "Описывается")];
+
 // ------------------------------------------------------------------ view
 
 pub enum FlowsEvent {
@@ -223,6 +357,7 @@ impl EventEmitter<FlowsEvent> for FlowsView {}
 #[derive(Clone, PartialEq)]
 enum Selection {
     Feature(usize),
+    Screen(usize),
     Proposals,
 }
 
@@ -234,18 +369,21 @@ enum Selection {
 pub enum Stage {
     Inventory,
     Details,
+    /// `app.yml`: start, screens, transitions — the whole app as one flow.
+    Navigation,
     Proofs,
     Coverage,
     Done,
 }
 
 impl Stage {
-    const PIPELINE: [Stage; 4] = [Stage::Inventory, Stage::Details, Stage::Proofs, Stage::Coverage];
+    const PIPELINE: [Stage; 5] = [Stage::Inventory, Stage::Details, Stage::Navigation, Stage::Proofs, Stage::Coverage];
 
     fn title(self) -> &'static str {
         match self {
             Stage::Inventory => "Опись",
             Stage::Details => "Детали",
+            Stage::Navigation => "Навигация",
             Stage::Proofs => "Доказательства",
             Stage::Coverage => "Сверка",
             Stage::Done => "Готово",
@@ -378,6 +516,13 @@ pub struct FlowsView {
     lag: Option<Lag>,
     /// When the changed files were last touched: auto-sync waits for quiet.
     lag_seen: Option<(usize, Instant)>,
+    tab: Tab,
+    /// «Фичи»: status filter (None = all) and the feature whose flow is open.
+    status_filter: Option<&'static str>,
+    feature_open: Option<usize>,
+    /// «Приложение»: a feature whose path lights up (hover on a chip, or pinned from «Фичи»).
+    hover_feature: Option<String>,
+    pinned_feature: Option<String>,
     _poll: Task<()>,
     _ticker: Task<()>,
 }
@@ -417,11 +562,25 @@ impl FlowsView {
             build_error: None,
             lag: None,
             lag_seen: None,
+            // Screenshots / debugging: STEPAN_VERIFY_FLOWS_TAB=app|features|proofs.
+            tab: match std::env::var("STEPAN_VERIFY_FLOWS_TAB").as_deref() {
+                Ok("features") => Tab::Features,
+                Ok("proofs") => Tab::Proofs,
+                _ => Tab::App,
+            },
+            status_filter: None,
+            feature_open: None,
+            hover_feature: None,
+            pinned_feature: None,
             _poll: Task::ready(()),
             _ticker: Task::ready(()),
         };
         if let Some(p) = project {
             this.select_project(p, cx);
+        }
+        // STEPAN_VERIFY_FLOWS_SELECT=<feature id>: open that feature's flow.
+        if let (Ok(id), Some(map)) = (std::env::var("STEPAN_VERIFY_FLOWS_SELECT"), this.map.as_ref()) {
+            this.feature_open = map.features.iter().position(|f| f.id == id);
         }
         // The file is edited by agents (and you): follow it; proposals arrive with sessions.
         this._poll = cx.spawn(async move |this, cx| {
@@ -431,7 +590,7 @@ impl FlowsView {
                 n += 1;
                 let alive = this.update(cx, |this, cx| {
                     let Some(repo) = this.project.clone() else { return };
-                    let mtime = fs::metadata(flows::path(&repo)).and_then(|m| m.modified()).ok();
+                    let mtime = flows::stamp(&repo);
                     if mtime != this.mtime && !this.is_building() {
                         this.load(cx);
                     } else if n % 10 == 0 {
@@ -469,6 +628,8 @@ impl FlowsView {
         let _ = fs::write(self.home.state().join("flows/last-project"), repo.display().to_string());
         self.project = Some(repo);
         self.selected = None;
+        self.feature_open = None;
+        self.pinned_feature = None;
         self.build_error = None;
         self.placed = false;
         self.load(cx);
@@ -476,7 +637,7 @@ impl FlowsView {
 
     fn load(&mut self, cx: &mut Context<Self>) {
         let Some(repo) = self.project.clone() else { return };
-        self.mtime = fs::metadata(flows::path(&repo)).and_then(|m| m.modified()).ok();
+        self.mtime = flows::stamp(&repo);
         match FlowMap::load(&repo) {
             Ok(map) => {
                 self.fresh = map.as_ref().map(|m| m.features.iter().map(|f| f.freshness(&repo)).collect()).unwrap_or_default();
@@ -589,7 +750,7 @@ impl FlowsView {
             who: crate::changes::reviewer_name(provider, model.as_deref()),
             provider,
             model,
-            update: flows::path(&repo).exists(),
+            update: flows::exists(&repo),
             stage: Stage::Inventory,
             inventory: None,
             batches: Vec::new(),
@@ -772,6 +933,10 @@ impl FlowsView {
         if pipe.stopped {
             return;
         }
+        // Detail batches and the navigation pass write the flow language, not JSON.
+        if key == NAV_KEY || pipe.batches.iter().any(|b| b.batch.id == key) {
+            return self.flow_files_done(key, secs, error, cx);
+        }
         let part = parts_dir(&repo).join(format!("{key}.json"));
         let archive = builds_dir(&self.home, &repo).join(pipe.n.to_string()).join("parts");
         let text = fs::read_to_string(&part).ok();
@@ -846,20 +1011,7 @@ impl FlowsView {
                 pipe.stage = Stage::Coverage;
                 Ok(())
             }
-            batch => {
-                let Some(run) = pipe.batches.iter_mut().find(|b| b.batch.id == batch) else { return };
-                match text.as_deref().map(read_part::<FlowProposal>) {
-                    Some(Ok(prop)) => {
-                        merge_details(&mut map, &prop, pipe.sync);
-                        run.state = BatchState::Done(secs);
-                    }
-                    Some(Err(e)) => run.state = BatchState::Failed(format!("ответ не читается: {e}")),
-                    None => run.state = BatchState::Failed(missing(error)),
-                }
-                let line = format!("Пачка «{}»: {:?}", run.batch.title, run.state);
-                pipe.note(line);
-                Ok(())
-            }
+            other => Err(format!("неизвестный проход {other}")),
         };
         if let Err(e) = parsed {
             pipe.error = Some(format!("{}: {e}", key));
@@ -877,6 +1029,136 @@ impl FlowsView {
             self.placed = false;
         }
         self.advance(cx);
+    }
+
+    /// A detail batch (`features/*.yml`) or the navigation pass (`app.yml`)
+    /// finished: check the files with the flow-language parser, merge, move on.
+    /// Files with errors get one repair round with the exact file:line messages.
+    fn flow_files_done(&mut self, key: &str, secs: u64, error: Option<String>, cx: &mut Context<Self>) {
+        let Some(repo) = self.project.clone() else { return };
+        let Some(pipe) = self.pipeline.as_mut() else { return };
+        let dir = parts_dir(&repo).join(key);
+        let mut map = self.map.clone().unwrap_or_else(|| FlowMap {
+            version: 1,
+            project: repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            ..Default::default()
+        });
+        let missing = error.clone().unwrap_or_else(|| format!("агент не записал {}", dir.strip_prefix(&repo).unwrap_or(&dir).display()));
+        // Ok(note) | Err((message, fixable by the agent))
+        let parsed: Result<String, (String, bool)> = if key == NAV_KEY {
+            let file = dir.join(flowdsl::APP);
+            if !file.exists() {
+                Err((missing, false))
+            } else {
+                match flowdsl::read_app(&file) {
+                    Ok((nav, diags)) => match flowdsl::errors_text(&diags) {
+                        Some(e) => Err((e, true)),
+                        None => {
+                            let edges: usize = nav.screens.iter().map(|s| s.edges.len()).sum();
+                            let note = format!("Навигация: {} экранов, {} переходов, старт «{}»", nav.screens.len(), edges, nav.start);
+                            map.nav = nav;
+                            Ok(note)
+                        }
+                    },
+                    Err(e) => Err((format!("{e:#}"), false)),
+                }
+            }
+        } else {
+            let (features, diags) = flowdsl::read_features(&dir);
+            let remove: Vec<String> = fs::read_to_string(dir.join("REMOVE")).unwrap_or_default().lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect();
+            if !dir.exists() || (features.is_empty() && remove.is_empty() && diags.is_empty()) {
+                Err((missing, false))
+            } else if let Some(e) = flowdsl::errors_text(&diags) {
+                Err((e, true))
+            } else {
+                let n = features.len();
+                let prop = FlowProposal { upsert: features, remove, ..Default::default() };
+                merge_details(&mut map, &prop, pipe.sync);
+                Ok(format!("{n} фич"))
+            }
+        };
+        if let Err((e, true)) = &parsed {
+            if pipe.repaired.insert(key.to_owned()) {
+                pipe.note(format!("{key}: ошибки языка карты — прошу агента починить:\n{e}"));
+                let prompt = flow_repair_prompt(&dir, e);
+                self.start_job(key.to_owned(), prompt, cx);
+                self.save_log();
+                cx.notify();
+                return;
+            }
+        }
+        // Keep what the agent wrote in the build log, then clear the scratch folder.
+        let archive = builds_dir(&self.home, &repo).join(pipe.n.to_string()).join("parts").join(key);
+        copy_dir(&dir, &archive);
+        let _ = fs::remove_dir_all(&dir);
+        let nav = key == NAV_KEY;
+        match (&parsed, nav) {
+            (Ok(note), true) => pipe.note(note.clone()),
+            // Navigation is a bonus over features: a miss does not stop the build.
+            (Err((e, _)), true) => pipe.note(format!("Навигация не построена: {e}")),
+            (result, false) => {
+                if let Some(run) = pipe.batches.iter_mut().find(|b| b.batch.id == key) {
+                    run.state = match result {
+                        Ok(_) => BatchState::Done(secs),
+                        Err((e, _)) => BatchState::Failed(e.clone()),
+                    };
+                    let line = format!("Пачка «{}»: {:?}", run.batch.title, run.state);
+                    pipe.note(line);
+                }
+            }
+        }
+        if parsed.is_ok() {
+            if let Err(err) = map.save(&repo) {
+                pipe.error = Some(format!("Карта не сохранилась: {err:#}"));
+            }
+        }
+        let had_map = self.map.is_some();
+        self.load(cx);
+        if !had_map {
+            self.placed = false;
+        }
+        if nav {
+            return self.start_proofs(cx);
+        }
+        self.advance(cx);
+    }
+
+    /// After details: describe the whole app's navigation (`app.yml`).
+    fn start_navigation(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.project.clone() else { return };
+        let Some(map) = self.map.clone() else { return };
+        let Some(pipe) = self.pipeline.as_mut() else { return };
+        pipe.stage = Stage::Navigation;
+        let checklist = parts_dir(&repo).join("checklist.json");
+        let prompt = nav_prompt(&repo, &map, &checklist, pipe.sync.then_some(pipe.changed.as_slice()));
+        self.start_job(NAV_KEY.into(), prompt, cx);
+        self.save_log();
+        cx.notify();
+    }
+
+    fn start_proofs(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.project.clone() else { return };
+        let Some(map) = self.map.clone() else { return };
+        let Some(pipe) = self.pipeline.as_mut() else { return };
+        if !pipe.running() {
+            self.save_log();
+            cx.notify();
+            return;
+        }
+        pipe.stage = Stage::Proofs;
+        let inv = pipe.inventory.clone().unwrap_or_default();
+        let media = media_files(&self.home, &repo);
+        let described: Vec<String> = pipe.batches.iter().flat_map(|b| b.batch.features.clone()).collect();
+        if pipe.sync && described.is_empty() {
+            // Nothing re-described: no proofs to re-check.
+            pipe.stage = Stage::Coverage;
+            return self.advance(cx);
+        }
+        let scope = if pipe.sync { FlowMap { features: map.features.iter().filter(|f| described.contains(&f.id)).cloned().collect(), ..map.clone() } } else { map };
+        let prompt = proofs_prompt(&repo, &scope, &inv, &media);
+        self.start_job("proofs".into(), prompt, cx);
+        self.save_log();
+        cx.notify();
     }
 
     /// Start whatever the current stage needs next.
@@ -913,21 +1195,15 @@ impl FlowsView {
                 }
                 if all_settled {
                     let Some(pipe) = self.pipeline.as_mut() else { return };
-                    pipe.stage = Stage::Proofs;
-                    let inv = pipe.inventory.clone().unwrap_or_default();
-                    let media = media_files(&self.home, &repo);
-                    let described: Vec<String> = pipe.batches.iter().flat_map(|b| b.batch.features.clone()).collect();
-                    if pipe.sync && described.is_empty() {
-                        // Nothing re-described: no proofs to re-check.
+                    let described = pipe.batches.iter().any(|b| !b.batch.features.is_empty());
+                    if pipe.sync && !described {
                         pipe.stage = Stage::Coverage;
                         return self.advance(cx);
                     }
-                    let scope = if pipe.sync { FlowMap { features: map.features.iter().filter(|f| described.contains(&f.id)).cloned().collect(), ..map.clone() } } else { map.clone() };
-                    let prompt = proofs_prompt(&repo, &scope, &inv, &media);
-                    self.start_job("proofs".into(), prompt, cx);
+                    return self.start_navigation(cx);
                 }
             }
-            Stage::Proofs => {}
+            Stage::Navigation | Stage::Proofs => {}
             Stage::Coverage => {
                 if !pipe.jobs.is_empty() {
                     return;
@@ -1051,9 +1327,22 @@ impl FlowsView {
     /// or as close to it as lets a whole block (all three columns) fit across.
     fn place(&mut self) {
         let (w, _) = self.viewport_size();
-        let zoom = ((w - canvas::FIT_MARGIN * 2.) / BLOCK_W).clamp(0.6, 1.);
-        self.view = canvas::View { x: canvas::FIT_MARGIN, y: canvas::FIT_TOP, zoom };
+        let zoom = match self.tab {
+            // The app map: start in the top-left at 100% (or as close as fits three columns).
+            Tab::App => ((w - canvas::FIT_MARGIN * 2.) / (3. * SCREEN_W + 2. * NAV_COL_GAP)).clamp(0.7, 1.),
+            _ => ((w - canvas::FIT_MARGIN * 2.) / BLOCK_W).clamp(0.6, 1.),
+        };
+        self.view = canvas::View { x: canvas::FIT_MARGIN, y: canvas::FIT_TOP + 24., zoom };
         self.placed = true;
+    }
+
+    fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        if self.tab != tab {
+            self.tab = tab;
+            self.placed = false;
+            self.selected = None;
+            cx.notify();
+        }
     }
 
     fn fit(&mut self, world: (f32, f32), cx: &mut Context<Self>) {
@@ -1172,6 +1461,58 @@ fn sync_note(changed: &[String]) -> String {
     )
 }
 
+/// The navigation pass's key: its result is `parts/nav/app.yml`.
+pub const NAV_KEY: &str = "nav";
+
+/// Grammar reminder for agents writing flow files (full spec: docs/FLOWS.md in Stepan).
+const FLOW_GRAMMAR: &str = r#"Язык карты флоу (не JSON и не обычный YAML — свой простой язык, читается построчно):
+- поле: `ключ: значение`; список: `[a, b]` или строки `- a` под ключом; комментарий — `#` в начале строки;
+- шаг фичи: `- Экран: действие -> результат  [Сущность, функция, путь/к/файлу.tsx]` — экран как он называется в навигации; ссылки на код в квадратных скобках В САМОМ КОНЦЕ, через два пробела (необязательны); скобки внутри текста вроде /catalog/[id] можно писать как есть;
+- переход в app.yml: `-> Экран: действие (Название фичи)` под экраном-источником; «(Фича)» в конце — если переход часть фичи;
+- доказательство: `- test: путь/или::имя_теста  covers: 1, 2` (covers — номера шагов фичи по порядку, с 1); виды: test | screenshot | video | cli | manual.
+Пример features/checkout.promo.yml:
+feature: Промокод при оформлении
+area: Оформление заказа
+status: done
+summary: Вводишь промокод — сумма пересчитывается со скидкой
+aliases: [купон, скидка]
+entries: [/checkout, app/checkout/page.tsx]
+starts_at: Оформление
+
+steps:
+  - Корзина: нажать «Оформить» -> открылось Оформление  [CartSheet, app/cart/CartSheet.tsx]
+  - Оформление: ввести промокод, выйти из поля -> сумма со скидкой  [applyPromo, lib/checkout.ts]
+
+proofs:
+  - test: lib/checkout.test.ts::applies_promo  covers: 2
+Несколько путей у фичи — вместо `steps:` блок `paths:` с названиями путей и шагами под каждым."#;
+
+/// Flow files of a pass have syntax errors: one round to fix them.
+fn flow_repair_prompt(dir: &Path, errors: &str) -> String {
+    format!(
+        "[iv3 flows] Файлы карты флоу в {} написаны с ошибками языка карты:\n{errors}\n\nИсправь только эти места (номера строк выше), смысл не меняй, другие файлы не трогай.\n\n{FLOW_GRAMMAR}\n\nВ конце одной строкой: исправлено.",
+        dir.display()
+    )
+}
+
+/// Copy a pass's scratch folder into the build log.
+fn copy_dir(from: &Path, to: &Path) {
+    let Ok(rd) = fs::read_dir(from) else { return };
+    let _ = fs::create_dir_all(to);
+    for e in rd.flatten() {
+        let p = e.path();
+        // Plugin state agents' hooks drop next to their output is not part of the result.
+        if e.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        if p.is_dir() {
+            copy_dir(&p, &to.join(e.file_name()));
+        } else {
+            let _ = fs::copy(&p, to.join(e.file_name()));
+        }
+    }
+}
+
 fn repair_prompt(part: &Path, error: &str) -> String {
     format!(
         "[iv3 flows] Файл результата {} не читается: {error}\n\nОткрой его и перепиши валидным JSON (тот же смысл и та же схема, ключи как были). Строки — в двойных кавычках, особенно пути и маршруты со скобками вроде /catalog/[id]. Не меняй ничего, кроме этого файла. В конце одной строкой: исправлено.",
@@ -1232,7 +1573,10 @@ pub fn merge_inventory(map: &mut FlowMap, part: &FlowProposal) {
 pub fn merge_details(map: &mut FlowMap, part: &FlowProposal, allow_remove: bool) {
     let mut part = part.clone();
     for f in &mut part.upsert {
-        f.status.clear();
+        // Described now: no longer a draft; a real status (done / in_progress / …) stays.
+        if f.status == "draft" {
+            f.status.clear();
+        }
         if let Some(old) = map.feature(&f.id) {
             let mut entries = old.entries.clone();
             union(&mut entries, &f.entries);
@@ -1317,11 +1661,12 @@ fn media_files(home: &Home, repo: &Path) -> Vec<PathBuf> {
 }
 
 const RULES: &str = "Правила: не меняй код проекта, ничего не коммить и не пушь, не запускай dev-серверы надолго. Пиши ТОЛЬКО один файл результата (путь ниже) — валидный JSON: все строки в двойных кавычках. Фичи называй как пользователь («Выбор карты Джокера»), а не именами компонентов.";
+const RULES_FLOW: &str = "Правила: не меняй код проекта, ничего не коммить и не пушь, не запускай dev-серверы надолго. Пиши ТОЛЬКО файлы результата в папку ниже, на языке карты флоу. Фичи и экраны называй как пользователь («Выбор карты Джокера», «Карточка задачи»), а не именами компонентов.";
 
 /// Pass 1: all features and areas, no paths. The checklist keeps it honest.
 pub fn inventory_prompt(repo: &Path, checklist: &Path, update: bool) -> String {
     let out = parts_dir(repo).join("inventory.json");
-    let map = flows::path(repo);
+    let map = flows::dir(repo);
     let mode = if update {
         format!(
             "Карта уже есть: {}. Перечисли ВСЕ фичи — и существующие (с теми же id), и новые. Существующие, которые не менялись, — без status. Новые и заметно изменившиеся — \"status\": \"draft\". Исчезнувшие — их id в remove.",
@@ -1371,56 +1716,138 @@ pub fn inventory_prompt(repo: &Path, checklist: &Path, update: bool) -> String {
     )
 }
 
-/// Pass 2: one area batch, described thoroughly.
+/// Pass 2: one area batch, described thoroughly — one flow file per feature.
 pub fn details_prompt(repo: &Path, map: &FlowMap, batch: &flows::Batch) -> String {
-    let out = parts_dir(repo).join(format!("{}.json", batch.id));
+    let out = parts_dir(repo).join(&batch.id);
     let list: Vec<String> = batch
         .features
         .iter()
         .filter_map(|id| map.feature(id))
-        .map(|f| format!("- {} · «{}» · {}\n  точки входа: {}", f.id, f.title, f.summary, if f.entries.is_empty() { "—".into() } else { f.entries.join(", ") }))
+        .map(|f| {
+            format!(
+                "- {id}.yml · «{}» · область «{}» · {}\n  точки входа: {}",
+                f.title,
+                map.areas.iter().find(|a| a.id == f.area).map_or(f.area.as_str(), |a| a.title.as_str()),
+                f.summary,
+                if f.entries.is_empty() { "—".into() } else { f.entries.join(", ") },
+                id = f.id
+            )
+        })
         .collect();
+    let screens: Vec<&str> = map.nav.screens.iter().map(|s| s.name.as_str()).collect();
+    let mut known: Vec<String> = map.features.iter().flat_map(|f| f.steps().map(|s| s.screen.clone())).collect();
+    known.sort();
+    known.dedup();
+    let screen_names = if !screens.is_empty() { screens.join(", ") } else if !known.is_empty() { known.join(", ") } else { "— (пока нет: назови сам, коротко и как пользователь)".into() };
     format!(
         r#"[iv3 flows] Детали фич проекта {repo}: «{title}» ({n} фич) — проход 2, одна пачка.
 
-Опиши подробно ТОЛЬКО эти фичи (остальные описывают другие агенты):
+Опиши подробно ТОЛЬКО эти фичи (остальные описывают другие агенты). По файлу на фичу: {out}/<id>.yml, где <id> — из списка (имя файла не меняй):
 {list}
 
-Для каждой фичи: 1–3 пути (paths) — цепочка шагов, каждый шаг: screen (где пользователь), action (что делает), result (что видит после), entities (имена компонентов/функций/сторов, через которые идёт шаг), files (пути от корня репозитория). Пройди по коду от точек входа, не угадывай. proofs — только реально существующие тесты/скриншоты/видео в репозитории (reference = путь или команда, covers = id шагов; at не заполняй); нет доказательств — пустой список. Если фича на деле две — можно добавить ещё одну фичу в той же области с новым id. id из списка не меняй.
+Для каждой фичи:
+- `feature`, `area` (название области из списка), `summary` — одной фразой, что получает пользователь; `aliases` — как ещё её называют;
+- `status`: done — работает целиком по коду; in_progress — сделано частично (заглушки, TODO, не подключено); planned — упомянута, но кода нет; broken — ТОЛЬКО если есть доказательство поломки (упавший тест, явная ошибка) — не выдумывай;
+- `starts_at` — экран, с которого фича начинается;
+- `steps` — путь пользователя по коду от точки входа (1–3 пути; несколько — блоком `paths:`). Пройди по коду, не угадывай. Каждый шаг — экран, действие, результат и ссылки на код (компоненты/функции/сторы и файлы от корня репо);
+- `proofs` — только реально существующие тесты/скриншоты/видео в репозитории, covers — номера шагов; нет — не пиши блок.
+Имена экранов одинаковые во всех фичах. Уже известные экраны: {screen_names}.
+Если фича на деле две — добавь ещё один файл с новым id вида область.коротко (латиница, точки, дефисы).
+Если это синхронизация и фичи больше нет в коде — не пиши её файл, а добавь её id строкой в файл {out}/REMOVE.
+
+{grammar}
 
 {rules}
 
-Запиши результат в {out}:
-
-{{
-  "upsert": [
-    {{
-      "id": "<id из списка>",
-      "title": "…",
-      "area": "…",
-      "summary": "…",
-      "aliases": [],
-      "entries": [],
-      "paths": [
-        {{
-          "id": "from-daily",
-          "title": "Из ежедневной карты",
-          "steps": [
-            {{"id": "open", "screen": "Rewards Hub", "action": "Нажать «Выбрать Джокера»", "result": "Открывается диалог", "entities": ["GlobalDailyCard"], "files": ["apps/web/src/…/GlobalDailyCard.tsx"]}}
-          ]
-        }}
-      ],
-      "proofs": [{{"kind": "test", "title": "Диалог выбора", "reference": "apps/web/src/…/JokerPickDialog.test.tsx", "covers": ["open"]}}]
-    }}
-  ]
-}}
-
-kind в proofs: test | screenshot | video | cli | manual. В конце одной строкой: сколько путей и доказательств описал."#,
+В конце одной строкой: сколько фич, путей и доказательств описал."#,
         repo = repo.display(),
         title = batch.title,
         n = batch.features.len(),
         list = list.join("\n"),
-        rules = RULES,
+        grammar = FLOW_GRAMMAR,
+        rules = RULES_FLOW,
+        out = out.display(),
+    )
+}
+
+/// The navigation pass: the whole app as one flow — start, screens, transitions.
+pub fn nav_prompt(repo: &Path, map: &FlowMap, checklist: &Path, changed: Option<&[String]>) -> String {
+    let out = parts_dir(repo).join(NAV_KEY);
+    let mut screens: Vec<String> = Vec::new();
+    for f in &map.features {
+        for name in std::iter::once(f.starts_at.clone()).chain(f.steps().map(|s| s.screen.clone())) {
+            if !name.is_empty() && !screens.contains(&name) {
+                screens.push(name);
+            }
+        }
+    }
+    let features: Vec<String> = map
+        .features
+        .iter()
+        .map(|f| {
+            let path: Vec<String> = f.steps().map(|s| s.screen.clone()).collect();
+            format!("- «{}»{}: {}", f.title, if f.starts_at.is_empty() { String::new() } else { format!(" (начинается на «{}»)", f.starts_at) }, path.join(" → "))
+        })
+        .collect();
+    let current = flows::dir(repo).join(flowdsl::APP);
+    let mode = match (current.exists(), changed) {
+        (true, Some(files)) => format!(
+            "Это СИНХРОНИЗАЦИЯ: текущая навигация — {} (перепиши её целиком в новый файл, сохранив имена экранов). Изменились файлы:\n{}",
+            current.display(),
+            files.iter().take(80).map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n")
+        ),
+        (true, None) => format!("Текущая навигация — {}: проверь по коду и перепиши целиком в новый файл, сохранив имена экранов.", current.display()),
+        _ => "Навигации ещё нет — опиши с нуля.".into(),
+    };
+    format!(
+        r#"[iv3 flows] Навигация приложения {repo} — проход «Навигация».
+
+Нужен полный флоу ВСЕГО приложения: явный вход (что происходит при запуске), все экраны и переходы между ними — «запустили → вот дашборд → отсюда можно сюда, сюда и сюда».
+{mode}
+
+Экраны, которые уже встречаются в шагах фич (используй РОВНО эти имена, добавь недостающие):
+{screens}
+
+Фичи и их путь по экранам (для пометки переходов «(Фича)»):
+{features}
+
+Точки входа из кода (маршруты, экраны, меню) — JSON-чек-лист: {checklist}
+
+Запиши файл {out}/app.yml:
+app: <название приложения>
+start: Запуск
+areas: [<области в порядке важности>]
+
+screens:
+  Запуск:
+    -> Дашборд: если вошёл
+    -> Вход: если не вошёл
+  Вход:
+    route: /login
+    -> Дашборд: войти (Вход по почте)
+  Дашборд:
+    route: /
+    -> Карточка задачи: клик по задаче
+  Карточка задачи:
+    kind: panel
+    -> Сессия: «Открыть сессию» (Запуск задачи агентом)
+
+- `start` — первый экран; обычно «Запуск» с переходами по условиям (вошёл / не вошёл / первый запуск / восстановление вкладки);
+- `kind`: page (по умолчанию) | dialog | sheet | tab | panel | external; `route` — маршрут, если есть;
+- переходы ищи в коде: ссылки, router.push / navigate, меню, кнопки, горячие клавиши, редиректы, диплинки; не выдумывай;
+- каждый экран из списка выше должен быть в screens; недостижимые (только по прямой ссылке) — тоже, со своим route.
+
+{grammar}
+
+{rules}
+
+В конце одной строкой: сколько экранов и переходов."#,
+        repo = repo.display(),
+        screens = if screens.is_empty() { "—".into() } else { screens.join(", ") },
+        features = if features.is_empty() { "—".into() } else { features.join("\n") },
+        checklist = checklist.display(),
+        grammar = FLOW_GRAMMAR,
+        rules = RULES_FLOW,
         out = out.display(),
     )
 }
@@ -1468,7 +1895,7 @@ Storybook ({stories_n}):
 
 В конце одной строкой: у скольких фич нашлись доказательства."#,
         repo = repo.display(),
-        map = flows::path(repo).display(),
+        map = flows::dir(repo).display(),
         features = features.join("\n"),
         tests_n = inv.tests.len(),
         tests = if inv.tests.is_empty() { "—".into() } else { take(&inv.tests, 300) },
@@ -1502,7 +1929,7 @@ pub fn cover_prompt(repo: &Path, uncovered: &[&EntryPoint], key: &str) -> String
 
 Запиши результат в {out}: {{"upsert": [], "attach": [], "ignored": []}}. В конце одной строкой: сколько привязал, добавил, исключил."#,
         repo = repo.display(),
-        map = flows::path(repo).display(),
+        map = flows::dir(repo).display(),
         n = uncovered.len(),
         list = list.join("\n"),
         rules = RULES,
@@ -1651,7 +2078,37 @@ impl FlowsView {
                         ),
                 )
             })
+            .when(has_map, |d| d.child(self.render_tabs(p, cx)))
             .child(self.render_projects(p, theme, cx))
+    }
+
+    fn render_tabs(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let (screens, features) = self.map.as_ref().map_or((0, 0), |m| (m.nav.screens.len(), m.features.len()));
+        let tab = |id: &'static str, t: Tab, label: String, this: &Self| {
+            let active = this.tab == t;
+            h_flex()
+                .id(id)
+                .h(px(30.))
+                .px(px(12.))
+                .rounded(px(7.))
+                .cursor_pointer()
+                .text_size(px(13.))
+                .font_weight(if active { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+                .map(|d| if active { d.bg(p.surface).border_1().border_color(p.border).text_color(p.ink) } else { d.text_color(p.muted).hover(|s| s.text_color(p.fg)) })
+                .on_click(cx.listener(move |this, _, _, cx| this.set_tab(t, cx)))
+                .child(label)
+        };
+        h_flex()
+            .gap(px(4.))
+            .p(px(3.))
+            .rounded(px(9.))
+            .bg(p.sunken)
+            .border_1()
+            .border_color(p.border)
+            .w_auto()
+            .child(tab("flows-tab-app", Tab::App, if screens > 0 { format!("Приложение · {screens} экр.") } else { "Приложение".into() }, self))
+            .child(tab("flows-tab-features", Tab::Features, format!("Фичи · {features}"), self))
+            .child(tab("flows-tab-proofs", Tab::Proofs, "Доказательства".into(), self))
     }
 
     fn render_projects(&self, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1665,7 +2122,7 @@ impl FlowsView {
         list.truncate(9);
         h_flex().gap(px(6.)).flex_wrap().children(list.into_iter().enumerate().map(|(i, dir)| {
             let active = self.project.as_ref() == Some(&dir);
-            let has = flows::path(&dir).exists();
+            let has = flows::exists(&dir);
             let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| dir.display().to_string());
             let pick = dir.clone();
             h_flex()
@@ -1716,7 +2173,7 @@ impl FlowsView {
                 .gap(px(14.))
                 .child(empty(
                     "У проекта ещё нет карты флоу",
-                    "Агент изучит маршруты, экраны, меню и тесты и опишет фичи словами пользователя: как до каждой дойти и что доказывает, что она работает. Карта ляжет в .stepan_verify/flows.yaml — её будут читать и агенты.",
+                    "Агент изучит маршруты, экраны, меню и тесты и опишет фичи словами пользователя: как до каждой дойти и что доказывает, что она работает. Карта ляжет в .stepan_verify/flows/ (app.yml — навигация, features/*.yml — фичи) на простом языке, который удобно править руками, — её будут читать и агенты.",
                     p,
                 ))
                 .when_some(self.error.clone().or(self.build_error.clone()), |d, e| d.child(ui::badge(e, p.red)))
@@ -1737,6 +2194,18 @@ impl FlowsView {
             self.place();
         }
         let strip = self.pipeline.is_some().then(|| self.render_pipeline(p, theme, cx));
+        let main: AnyElement = match self.tab {
+            Tab::Proofs => self.render_canvas(&map, &lay, p, theme, cx).into_any_element(),
+            Tab::App => self.render_nav(&map, p, theme, cx).into_any_element(),
+            Tab::Features => self.render_catalog(&map, p, theme, cx).into_any_element(),
+        };
+        if self.tab == Tab::Features {
+            return v_flex()
+                .size_full()
+                .when_some(strip, |d, strip| d.child(div().px(px(20.)).pt(px(12.)).pb(px(8.)).child(strip)))
+                .child(div().flex_1().min_h_0().w_full().child(main))
+                .into_any_element();
+        }
         v_flex()
             .size_full()
             .when_some(strip, |d, strip| d.child(div().px(px(20.)).pt(px(12.)).pb(px(8.)).child(strip)))
@@ -1745,7 +2214,7 @@ impl FlowsView {
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .child(div().flex_1().min_w_0().h_full().relative().child(self.render_canvas(&map, &lay, p, theme, cx)))
+                    .child(div().flex_1().min_w_0().h_full().relative().child(main))
                     .when_some(self.selected.clone(), |d, sel| d.child(self.render_panel(&map, sel, p, theme, cx))),
             )
             .into_any_element()
@@ -1766,7 +2235,7 @@ impl FlowsView {
             _ => "Карта построена",
         };
         let stage_chip = |stage: Stage| {
-            let order = |s: Stage| Stage::PIPELINE.iter().position(|x| *x == s).unwrap_or(4);
+            let order = |s: Stage| Stage::PIPELINE.iter().position(|x| *x == s).unwrap_or(Stage::PIPELINE.len());
             let (cur, me) = (order(pipe.stage), order(stage));
             let state = if pipe.stage == Stage::Done || me < cur {
                 if stage == Stage::Details && failed > 0 { 3 } else { 2 }
@@ -1877,6 +2346,8 @@ impl FlowsView {
                             .child(stage_chip(Stage::Inventory))
                             .child(arrow())
                             .child(stage_chip(Stage::Details))
+                            .child(arrow())
+                            .child(stage_chip(Stage::Navigation))
                             .child(arrow())
                             .child(stage_chip(Stage::Proofs))
                             .child(arrow())
@@ -2373,9 +2844,10 @@ impl FlowsView {
         let body: AnyElement = match sel {
             Selection::Proposals => self.render_proposals(p, theme, cx).into_any_element(),
             Selection::Feature(fi) => match map.features.get(fi) {
-                Some(f) => self.render_feature(fi, f, p, theme, cx).into_any_element(),
+                Some(f) => self.render_feature(fi, f, false, p, theme, cx).into_any_element(),
                 None => div().into_any_element(),
             },
+            Selection::Screen(si) => self.render_screen(map, si, p, theme, cx).into_any_element(),
         };
         v_flex()
             .id("flows-panel")
@@ -2400,7 +2872,8 @@ impl FlowsView {
             .child(div().id("flows-panel-scroll").flex_1().min_h_0().overflow_y_scroll().child(body))
     }
 
-    fn render_feature(&self, fi: usize, f: &Feature, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    /// `compact`: only proofs and sessions (the flow itself is shown elsewhere).
+    fn render_feature(&self, fi: usize, f: &Feature, compact: bool, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let repo = self.project.clone().unwrap_or_default();
         let fresh = self.fresh.get(fi).copied().unwrap_or(Freshness::Missing);
         let (tone, label) = freshness_tone(fresh, p);
@@ -2420,9 +2893,9 @@ impl FlowsView {
                 .child(rel)
         };
         v_flex()
-            .p(px(16.))
+            .p(px(if compact { 0. } else { 16. }))
             .gap(px(14.))
-            .child(
+            .when(!compact, |d| d.child(
                 v_flex()
                     .gap(px(6.))
                     .child(ui::eyebrow(map_area(self.map.as_ref(), &f.area), p, theme))
@@ -2430,8 +2903,8 @@ impl FlowsView {
                     .child(h_flex().gap(px(6.)).child(ui::badge(label, tone)).child(ui::mono(f.id.clone(), theme).text_color(p.faint)))
                     .when(!f.summary.is_empty(), |d| d.child(div().text_size(px(13.)).text_color(p.fg).child(f.summary.clone())))
                     .when(!f.aliases.is_empty(), |d| d.child(div().text_size(px(12.)).text_color(p.muted).child(format!("ещё называют: {}", f.aliases.join(", "))))),
-            )
-            .children(f.paths.iter().enumerate().map(|(pi, path)| {
+            ))
+            .children(f.paths.iter().enumerate().filter(|_| !compact).map(|(pi, path)| {
                 v_flex()
                     .gap(px(8.))
                     .child(ui::section_title(if path.title.is_empty() { "Путь".to_owned() } else { path.title.clone() }, Some(path.steps.len().to_string()), p, theme))
@@ -2529,6 +3002,697 @@ impl FlowsView {
     }
 }
 
+// ------------------------------------------------------------------ «Приложение», «Фичи»
+
+impl FlowsView {
+    /// Pan/zoom container shared by the canvases (drag, wheel, pinch, double click = fit).
+    fn pannable(&self, id: &'static str, world: (f32, f32), p: &Palette, cx: &mut Context<Self>) -> Stateful<Div> {
+        let grabbing = self.drag.is_some_and(|d| d.moved);
+        let viewport = self.viewport.clone();
+        let dot = p.border_strong.opacity(0.35);
+        let v = self.view;
+        let grid = canvas(
+            move |bounds, _, _| viewport.set(Some(bounds)),
+            move |bounds, _, window, _| {
+                let o = bounds.origin;
+                let mut step = 24. * v.zoom;
+                while step < 14. {
+                    step *= 2.;
+                }
+                let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                let (mut x, start_y) = (v.x.rem_euclid(step), v.y.rem_euclid(step));
+                if (w / step) * (h / step) < 6000. {
+                    while x < w {
+                        let mut y = start_y;
+                        while y < h {
+                            window.paint_quad(fill(Bounds::new(point(px(x - 0.75), px(y - 0.75)) + o, size(px(1.5), px(1.5))), dot));
+                            y += step;
+                        }
+                        x += step;
+                    }
+                }
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+        div()
+            .id(id)
+            .relative()
+            .size_full()
+            .bg(p.sunken)
+            .overflow_hidden()
+            .cursor(if grabbing { CursorStyle::ClosedHand } else { CursorStyle::OpenHand })
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                this.drag = Some(canvas::Drag::new((f32::from(e.position.x), f32::from(e.position.y)), this.view));
+                this.dragged = false;
+                cx.notify();
+            }))
+            .on_mouse_down(MouseButton::Middle, cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                this.drag = Some(canvas::Drag::new((f32::from(e.position.x), f32::from(e.position.y)), this.view));
+                this.dragged = false;
+                cx.notify();
+            }))
+            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
+                let Some(mut drag) = this.drag else { return };
+                if e.pressed_button.is_none() {
+                    this.drag = None;
+                    cx.notify();
+                    return;
+                }
+                this.view = drag.update((f32::from(e.position.x), f32::from(e.position.y)));
+                this.dragged = drag.moved;
+                this.drag = Some(drag);
+                cx.notify();
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                this.drag = None;
+                cx.notify();
+            }))
+            .on_mouse_up(MouseButton::Middle, cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                this.drag = None;
+                cx.notify();
+            }))
+            .on_scroll(cx.listener(|this, e: &ScrollEvent, _, cx| {
+                cx.stop_propagation();
+                let delta = match e.delta {
+                    ScrollDelta::Pixels(d) => (f32::from(d.x), f32::from(d.y)),
+                    ScrollDelta::Lines(l) => (l.x * 24., l.y * 24.),
+                };
+                let at = this.local(e.position);
+                this.view = if e.modifiers.platform || e.modifiers.control {
+                    this.view.zoom_at(canvas::wheel_zoom(-delta.1), at)
+                } else {
+                    this.view.pan(delta.0, delta.1)
+                };
+                cx.notify();
+            }))
+            .on_pinch(cx.listener(|this, e: &PinchEvent, _, cx| {
+                cx.stop_propagation();
+                let at = this.local(e.position);
+                this.view = this.view.zoom_at(1. + e.delta, at);
+                cx.notify();
+            }))
+            .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
+                if this.dragged {
+                    return;
+                }
+                if e.click_count() >= 2 {
+                    this.fit(world, cx);
+                }
+            }))
+            .child(grid)
+    }
+
+    fn zoom_controls(&self, prefix: &'static str, world: (f32, f32), p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let z = self.view.zoom;
+        h_flex()
+            .absolute()
+            .top(px(12.))
+            .right(px(12.))
+            .gap(px(2.))
+            .px(px(4.))
+            .py(px(3.))
+            .rounded(px(9.))
+            .border_1()
+            .border_color(p.border)
+            .bg(p.surface)
+            .shadow(ui::card_shadow())
+            .child(PressButton::new(SharedString::from(format!("{prefix}-zoom-out"))).ghost().xsmall().icon(IconName::Minus).on_click(cx.listener(|this, _, _, cx| this.zoom_center(0.8, cx))))
+            .child(
+                div()
+                    .id(SharedString::from(format!("{prefix}-zoom-100")))
+                    .px(px(6.))
+                    .cursor_pointer()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_size(px(11.5))
+                    .text_color(p.muted)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.place();
+                        cx.notify();
+                    }))
+                    .child(format!("{:.0}%", z * 100.)),
+            )
+            .child(PressButton::new(SharedString::from(format!("{prefix}-zoom-in"))).ghost().xsmall().icon(IconName::Plus).on_click(cx.listener(|this, _, _, cx| this.zoom_center(1.25, cx))))
+            .child(
+                PressButton::new(SharedString::from(format!("{prefix}-fit")))
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::empty().path("icons/scan.svg"))
+                    .label("Вписать")
+                    .on_click(cx.listener(move |this, _, _, cx| this.fit(world, cx))),
+            )
+    }
+
+    /// «Приложение»: the whole app from its start — screens and transitions.
+    fn render_nav(&self, map: &FlowMap, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let nav = &map.nav;
+        if nav.screens.is_empty() {
+            let building = self.is_building();
+            return v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap(px(14.))
+                .child(empty(
+                    "Навигация приложения ещё не описана",
+                    "Здесь будет весь флоу приложения: откуда оно стартует, какие экраны есть и куда из каждого можно перейти. Его описывает проход «Навигация» при сборке карты — файл .stepan_verify/flows/app.yml.",
+                    p,
+                ))
+                .when(!building, |d| {
+                    d.child(
+                        PressButton::new("flows-build-nav")
+                            .primary()
+                            .icon(IconName::RefreshCw)
+                            .label("Обновить карту")
+                            .on_click(cx.listener(|this, _, _, cx| this.build(cx))),
+                    )
+                })
+                .into_any_element();
+        }
+        let lay = nav_layout(nav);
+        let v = self.view;
+        let z = v.zoom;
+        let sx = move |x: f32| v.x + x * z;
+        let sy = move |y: f32| v.y + y * z;
+        let zl = move |l: f32| l * z;
+        let text = z >= 0.35;
+        let labels = z >= 0.55;
+        let world = (lay.size.0 + 120., lay.size.1 + 120.);
+        let focus = self.hover_feature.clone().or_else(|| self.pinned_feature.clone());
+        let focus_screens: Vec<String> = focus
+            .as_ref()
+            .and_then(|t| map.features.iter().find(|f| &f.title == t))
+            .map(|f| nav.feature_screens(f))
+            .unwrap_or_default();
+        let selected = match &self.selected {
+            Some(Selection::Screen(i)) => Some(*i),
+            _ => None,
+        };
+        let lines: Vec<([(f32, f32); 4], Hsla, f32)> = lay
+            .edges
+            .iter()
+            .map(|e| {
+                let edge = &nav.screens[e.from].edges[e.edge];
+                let lit = focus.as_ref().is_some_and(|f| &edge.feature == f);
+                let near = selected.is_some_and(|s| s == e.from || s == e.to);
+                let color = if lit {
+                    p.accent.solid
+                } else if near {
+                    p.ink.opacity(0.7)
+                } else if focus.is_some() {
+                    p.border_strong.opacity(0.35)
+                } else {
+                    p.border_strong
+                };
+                let curve = e.curve.map(|(x, y)| (sx(x), sy(y)));
+                (curve, color, if lit { 2.5 } else { 1.5 })
+            })
+            .collect();
+        let edges_layer = canvas(
+            move |_, _, _| lines,
+            move |bounds, lines, window, _| {
+                let o = bounds.origin;
+                let pt = |(x, y): (f32, f32)| point(px(x), px(y)) + o;
+                for (c, color, width) in lines {
+                    let mut path = PathBuilder::stroke(px(width));
+                    path.move_to(pt(c[0]));
+                    path.cubic_bezier_to(pt(c[3]), pt(c[1]), pt(c[2]));
+                    if let Ok(path) = path.build() {
+                        window.paint_path(path, color);
+                    }
+                    // Arrowhead along the last segment.
+                    let (ex, ey) = c[3];
+                    let (dx, dy) = (ex - c[2].0, ey - c[2].1);
+                    let len = (dx * dx + dy * dy).sqrt().max(0.001);
+                    let (ux, uy) = (dx / len, dy / len);
+                    let size = 7.;
+                    let back = (ex - ux * size, ey - uy * size);
+                    let left = (back.0 - uy * size * 0.55, back.1 + ux * size * 0.55);
+                    let right = (back.0 + uy * size * 0.55, back.1 - ux * size * 0.55);
+                    let mut head = PathBuilder::fill();
+                    head.move_to(pt((ex, ey)));
+                    head.line_to(pt(left));
+                    head.line_to(pt(right));
+                    head.close();
+                    if let Ok(head) = head.build() {
+                        window.paint_path(head, color);
+                    }
+                }
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+
+        let mono = theme.mono_font_family.clone();
+        let screens = lay.screens.iter().map(|&(si, r)| {
+            let s = &nav.screens[si];
+            let is_start = s.name == nav.start;
+            let dim = focus.is_some() && !focus_screens.contains(&s.name);
+            let lit = focus.is_some() && focus_screens.contains(&s.name);
+            let is_sel = selected == Some(si);
+            let features_here = map.features.iter().filter(|f| f.starts_at == s.name).count();
+            div()
+                .id(SharedString::from(format!("nav-screen-{si}")))
+                .absolute()
+                .left(px(sx(r.x)))
+                .top(px(sy(r.y)))
+                .w(px(zl(r.w)))
+                .h(px(zl(r.h)))
+                .rounded(px(zl(12.).max(3.)))
+                .border(px(if is_start || lit || is_sel { 1.5 } else { 1. }))
+                .border_color(if is_sel {
+                    p.ink
+                } else if lit || is_start {
+                    p.accent.solid
+                } else {
+                    p.border
+                })
+                .bg(if is_start { ui::mix(p.accent.soft, p.surface, 0.55) } else { p.surface })
+                .shadow(ui::card_shadow())
+                .when(dim, |d| d.opacity(0.45))
+                .overflow_hidden()
+                .px(px(zl(12.)))
+                .py(px(zl(9.)))
+                .flex()
+                .flex_col()
+                .gap(px(zl(4.)))
+                .cursor_pointer()
+                .hover(|st| st.border_color(p.border_strong))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.dragged {
+                        return;
+                    }
+                    this.selected = if this.selected == Some(Selection::Screen(si)) { None } else { Some(Selection::Screen(si)) };
+                    cx.notify();
+                }))
+                .when(text, |d| {
+                    d.when(is_start, |d| d.child(div().font_family(mono.clone()).text_size(px(zl(9.5))).text_color(p.accent.text).child("СТАРТ")))
+                        .child(
+                            h_flex()
+                                .gap(px(zl(7.)))
+                                .child(Icon::empty().path(kind_icon(&s.kind, is_start)).size(px(zl(15.))).text_color(if is_start { p.accent.text } else { p.muted }))
+                                .child(div().min_w_0().truncate().text_size(px(zl(14.))).font_weight(FontWeight::SEMIBOLD).text_color(p.ink).child(s.name.clone())),
+                        )
+                        .child(
+                            h_flex()
+                                .gap(px(zl(6.)))
+                                .font_family(mono.clone())
+                                .text_size(px(zl(10.5)))
+                                .text_color(p.faint)
+                                .child(kind_label(&s.kind))
+                                .when(!s.route.is_empty(), |d| d.child(div().min_w_0().truncate().child(s.route.clone())))
+                                .when(features_here > 0, |d| d.child(div().text_color(p.accent.text).child(format!("· фич: {features_here}")))),
+                        )
+                })
+        }).collect::<Vec<_>>();
+        let edge_labels = lay.edges.iter().enumerate().filter_map(|(k, e)| {
+            let edge = &nav.screens[e.from].edges[e.edge];
+            if edge.action.is_empty() && edge.feature.is_empty() {
+                return None;
+            }
+            if !labels && edge.feature.is_empty() {
+                return None;
+            }
+            let lit = focus.as_ref().is_some_and(|f| f == &edge.feature);
+            let w = 170.;
+            let feature = edge.feature.clone();
+            let hover_name = feature.clone();
+            Some(
+                v_flex()
+                    .id(SharedString::from(format!("nav-edge-{k}")))
+                    .absolute()
+                    .left(px(sx(e.label.0) - zl(w) / 2.))
+                    .top(px(sy(e.label.1) - zl(11.)))
+                    .w(px(zl(w)))
+                    .items_center()
+                    .gap(px(zl(2.)))
+                    .when(labels && !edge.action.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .max_w_full()
+                                .truncate()
+                                .px(px(zl(5.)))
+                                .rounded(px(zl(4.)))
+                                .bg(p.sunken.opacity(0.92))
+                                .text_size(px(zl(11.)))
+                                .text_color(if lit { p.ink } else { p.muted })
+                                .child(edge.action.clone()),
+                        )
+                    })
+                    .when(!feature.is_empty() && text, |d| {
+                        d.child(
+                            div()
+                                .id(SharedString::from(format!("nav-edge-feature-{k}")))
+                                .max_w_full()
+                                .truncate()
+                                .px(px(zl(6.)))
+                                .py(px(zl(1.)))
+                                .rounded(px(zl(5.)))
+                                .border_1()
+                                .border_color(if lit { p.accent.solid } else { ui::mix(p.accent.solid, p.border, 0.4) })
+                                .bg(if lit { p.accent.soft } else { p.surface })
+                                .text_size(px(zl(10.5)))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(p.accent.text)
+                                .cursor_pointer()
+                                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                    let next = hovered.then(|| hover_name.clone());
+                                    if this.hover_feature != next {
+                                        this.hover_feature = next;
+                                        cx.notify();
+                                    }
+                                }))
+                                .child(feature),
+                        )
+                    }),
+            )
+        }).collect::<Vec<_>>();
+        let legend = h_flex()
+            .absolute()
+            .left(px(12.))
+            .bottom(px(12.))
+            .gap(px(12.))
+            .px(px(10.))
+            .py(px(6.))
+            .rounded(px(9.))
+            .border_1()
+            .border_color(p.border)
+            .bg(p.surface.opacity(0.94))
+            .text_size(px(11.))
+            .text_color(p.muted)
+            .child(h_flex().gap(px(4.)).child(Icon::empty().path("icons/rocket.svg").xsmall().text_color(p.accent.text)).child("старт"))
+            .child(h_flex().gap(px(4.)).child(div().px(px(5.)).rounded(px(4.)).border_1().border_color(p.accent.solid).text_color(p.accent.text).child("фича")).child("наведи — её путь по экранам"))
+            .when_some(self.pinned_feature.clone(), |d, f| {
+                d.child(
+                    h_flex()
+                        .id("nav-unpin")
+                        .gap(px(4.))
+                        .cursor_pointer()
+                        .text_color(p.accent.text)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.pinned_feature = None;
+                            cx.notify();
+                        }))
+                        .child(format!("показан путь «{f}» ✕")),
+                )
+            })
+            .child(ui::mono("тащи — двигать · ⌘ + колесо — масштаб · двойной клик — вписать", theme).text_size(px(10.5)).text_color(p.faint));
+        self.pannable("flows-nav-canvas", world, p, cx)
+            .child(edges_layer)
+            .children(screens)
+            .children(edge_labels)
+            .when_some(self.build_error.clone(), |d, e| d.child(div().absolute().top(px(10.)).left(px(12.)).child(ui::badge(e, p.red))))
+            .child(legend)
+            .child(self.zoom_controls("nav", world, p, theme, cx))
+            .into_any_element()
+    }
+
+    /// Panel of a screen: where people come from, where they can go, features here.
+    fn render_screen(&self, map: &FlowMap, si: usize, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let nav = &map.nav;
+        let Some(s) = nav.screens.get(si) else { return v_flex() };
+        let pick = |name: &str| nav.screens.iter().position(|x| x.name == name);
+        let row = |id: String, arrow: &'static str, other: String, action: String, feature: String, target: Option<usize>| {
+            v_flex()
+                .id(SharedString::from(id))
+                .gap(px(2.))
+                .py(px(6.))
+                .px(px(8.))
+                .rounded(px(6.))
+                .cursor_pointer()
+                .hover(|d| d.bg(p.surface2))
+                .when_some(target, |d, t| {
+                    d.on_click(cx.listener(move |this, _, _, cx| {
+                        this.selected = Some(Selection::Screen(t));
+                        cx.notify();
+                    }))
+                })
+                .child(h_flex().gap(px(6.)).text_size(px(13.)).text_color(p.fg).child(div().text_color(p.faint).child(arrow)).child(div().font_weight(FontWeight::MEDIUM).child(other)))
+                .when(!action.is_empty(), |d| d.child(div().pl(px(18.)).text_size(px(12.)).text_color(p.muted).child(action)))
+                .when(!feature.is_empty(), |d| d.child(div().pl(px(18.)).child(ui::badge(feature, p.accent))))
+        };
+        let incoming: Vec<(String, String, String)> = nav.incoming(&s.name).map(|(from, e)| (from.name.clone(), e.action.clone(), e.feature.clone())).collect();
+        let here: Vec<(usize, &Feature)> = map.features.iter().enumerate().filter(|(_, f)| nav.feature_screens(f).contains(&s.name)).collect();
+        let is_start = s.name == nav.start;
+        v_flex()
+            .p(px(16.))
+            .gap(px(14.))
+            .child(
+                v_flex()
+                    .gap(px(6.))
+                    .child(ui::eyebrow(if is_start { "Старт приложения".to_owned() } else { kind_label(&s.kind).to_owned() }, p, theme))
+                    .child(div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).text_color(p.ink).child(s.name.clone()))
+                    .when(!s.route.is_empty(), |d| d.child(ui::mono(s.route.clone(), theme).text_color(p.muted)))
+                    .when(!s.about.is_empty(), |d| d.child(div().text_size(px(13.)).text_color(p.fg).child(s.about.clone()))),
+            )
+            .child(
+                v_flex()
+                    .gap(px(4.))
+                    .child(ui::section_title("Отсюда можно перейти", Some(s.edges.len().to_string()), p, theme))
+                    .when(s.edges.is_empty(), |d| d.child(div().text_size(px(12.5)).text_color(p.muted).child("Тупик: переходов дальше не описано.")))
+                    .children(s.edges.iter().enumerate().map(|(k, e)| row(format!("nav-out-{si}-{k}"), "→", e.to.clone(), e.action.clone(), e.feature.clone(), pick(&e.to)))),
+            )
+            .child(
+                v_flex()
+                    .gap(px(4.))
+                    .child(ui::section_title("Сюда приходят", Some(incoming.len().to_string()), p, theme))
+                    .when(incoming.is_empty() && !is_start, |d| d.child(div().text_size(px(12.5)).text_color(p.muted).child("Ниоткуда: только по прямой ссылке или переход не описан.")))
+                    .children(incoming.into_iter().enumerate().map(|(k, (from, action, feature))| {
+                        let t = pick(&from);
+                        row(format!("nav-in-{si}-{k}"), "←", from, action, feature, t)
+                    })),
+            )
+            .child(
+                v_flex()
+                    .gap(px(4.))
+                    .child(ui::section_title("Фичи на этом экране", Some(here.len().to_string()), p, theme))
+                    .children(here.into_iter().map(|(fi, f)| {
+                        let (tone, label) = status_tone(&f.status, p);
+                        h_flex()
+                            .id(SharedString::from(format!("nav-feature-{si}-{fi}")))
+                            .gap(px(8.))
+                            .py(px(6.))
+                            .px(px(8.))
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(|d| d.bg(p.surface2))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.feature_open = Some(fi);
+                                this.set_tab(Tab::Features, cx);
+                            }))
+                            .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).text_color(p.fg).child(f.title.clone()))
+                            .child(ui::badge(label, tone))
+                    })),
+            )
+    }
+
+    /// «Фичи»: the catalog on the left, the open feature's flow on the right.
+    fn render_catalog(&self, map: &FlowMap, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let query = self.query.clone();
+        let visible: Vec<(usize, &Feature)> = map.features.iter().enumerate().filter(|(_, f)| matches(f, &query)).collect();
+        let count = |st: &str| visible.iter().filter(|(_, f)| f.status == st).count();
+        let filter = self.status_filter;
+        let chip = |id: String, label: String, value: Option<&'static str>, this: &Self| {
+            let active = this.status_filter == value;
+            div()
+                .id(SharedString::from(id))
+                .h(px(24.))
+                .px(px(9.))
+                .flex()
+                .items_center()
+                .rounded(px(12.))
+                .border_1()
+                .cursor_pointer()
+                .text_size(px(12.))
+                .map(|d| if active { d.bg(p.ink).border_color(p.ink).text_color(theme.background) } else { d.bg(p.surface).border_color(p.border).text_color(p.fg).hover(|s| s.border_color(p.border_strong)) })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.status_filter = value;
+                    cx.notify();
+                }))
+                .child(label)
+        };
+        let mut chips = vec![chip("flows-filter-all".into(), format!("Все · {}", visible.len()), None, self).into_any_element()];
+        for (st, label) in STATUS_FILTERS {
+            let n = count(st);
+            if n > 0 {
+                chips.push(chip(format!("flows-filter-{st}"), format!("{label} · {n}"), Some(st), self).into_any_element());
+            }
+        }
+        let shown: Vec<(usize, &Feature)> = visible.iter().copied().filter(|(_, f)| filter.is_none_or(|st| f.status == st)).collect();
+        let mut groups: Vec<(String, Vec<(usize, &Feature)>)> = Vec::new();
+        for a in &map.areas {
+            let list: Vec<(usize, &Feature)> = shown.iter().copied().filter(|(_, f)| f.area == a.id).collect();
+            if !list.is_empty() {
+                groups.push((a.title.clone(), list));
+            }
+        }
+        let rest: Vec<(usize, &Feature)> = shown.iter().copied().filter(|(_, f)| !map.areas.iter().any(|a| a.id == f.area)).collect();
+        if !rest.is_empty() {
+            groups.push(("Без области".into(), rest));
+        }
+        let open = self.feature_open.filter(|i| *i < map.features.len());
+        let list = v_flex()
+            .id("flows-catalog")
+            .w(px(380.))
+            .h_full()
+            .flex_shrink_0()
+            .border_r_1()
+            .border_color(p.border)
+            .bg(p.sunken)
+            .overflow_y_scroll()
+            .p(px(14.))
+            .gap(px(14.))
+            .child(h_flex().flex_wrap().gap(px(6.)).children(chips))
+            .when(groups.is_empty(), |d| d.child(div().text_size(px(13.)).text_color(p.muted).child("Ничего не нашлось")))
+            .children(groups.into_iter().map(|(title, list)| {
+                v_flex()
+                    .gap(px(6.))
+                    .child(ui::eyebrow(format!("{title} · {}", list.len()), p, theme))
+                    .children(list.into_iter().map(|(fi, f)| {
+                        let (tone, label) = status_tone(&f.status, p);
+                        let fresh = self.fresh.get(fi).copied().unwrap_or(Freshness::Missing);
+                        let (ftone, flabel) = freshness_tone(fresh, p);
+                        let steps = f.steps().count();
+                        let is_open = open == Some(fi);
+                        v_flex()
+                            .id(SharedString::from(format!("flows-cat-{fi}")))
+                            .gap(px(5.))
+                            .p(px(10.))
+                            .rounded(px(9.))
+                            .border_1()
+                            .border_color(if is_open { p.ink } else { p.border })
+                            .bg(p.surface)
+                            .cursor_pointer()
+                            .hover(|d| d.border_color(p.border_strong))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.feature_open = Some(fi);
+                                cx.notify();
+                            }))
+                            .child(div().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).text_color(p.ink).child(f.title.clone()))
+                            .child(
+                                h_flex()
+                                    .gap(px(6.))
+                                    .flex_wrap()
+                                    .child(ui::badge(label, tone))
+                                    .child(ui::dot_badge(flabel, ftone))
+                                    .child(ui::mono(format!("{steps} шаг."), theme).text_color(p.faint))
+                                    .when(!f.starts_at.is_empty(), |d| d.child(ui::mono(format!("с «{}»", f.starts_at), theme).text_color(p.faint))),
+                            )
+                    }))
+            }));
+        let body: AnyElement = match open.and_then(|i| map.features.get(i).map(|f| (i, f))) {
+            Some((fi, f)) => self.render_feature_flow(map, fi, f, p, theme, cx).into_any_element(),
+            None => v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .child(empty("Выбери фичу", "Слева — все фичи проекта по областям: что готово, что в работе, что сломано. Открой фичу, чтобы увидеть её флоу по экранам.", p))
+                .into_any_element(),
+        };
+        h_flex().size_full().child(list).child(div().flex_1().min_w_0().h_full().child(body))
+    }
+
+    /// One feature's flow: each path as a chain «экран → действие → результат».
+    fn render_feature_flow(&self, map: &FlowMap, fi: usize, f: &Feature, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let (tone, label) = status_tone(&f.status, p);
+        let fresh = self.fresh.get(fi).copied().unwrap_or(Freshness::Missing);
+        let (ftone, flabel) = freshness_tone(fresh, p);
+        let file = self.project.as_ref().map(|r| flows::dir(r).join(flowdsl::FEATURES).join(format!("{}.yml", f.id)));
+        let title = f.title.clone();
+        let kind_of = |screen: &str| map.nav.screen(screen).map(|s| s.kind.clone()).unwrap_or_default();
+        v_flex()
+            .id("flows-feature-flow")
+            .size_full()
+            .overflow_y_scroll()
+            .p(px(24.))
+            .gap(px(18.))
+            .child(
+                v_flex()
+                    .gap(px(6.))
+                    .child(ui::eyebrow(map_area(Some(map), &f.area), p, theme))
+                    .child(div().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).text_color(p.ink).child(f.title.clone()))
+                    .child(h_flex().gap(px(6.)).child(ui::badge(label, tone)).child(ui::dot_badge(flabel, ftone)))
+                    .when(!f.summary.is_empty(), |d| d.child(div().text_size(px(14.)).text_color(p.fg).child(f.summary.clone())))
+                    .child(
+                        h_flex()
+                            .gap(px(8.))
+                            .pt(px(4.))
+                            .when_some(file.filter(|p| p.exists()), |d, file| {
+                                d.child(
+                                    PressButton::new("flows-open-yml")
+                                        .small()
+                                        .icon(Icon::empty().path("icons/file-code.svg"))
+                                        .label("Открыть .yml")
+                                        .on_click(move |_, window, cx| crate::preview::open_in_app(file.clone(), None, window, cx)),
+                                )
+                            })
+                            .when(!map.nav.screens.is_empty(), |d| {
+                                d.child(
+                                    PressButton::new("flows-show-on-app")
+                                        .small()
+                                        .icon(Icon::empty().path("icons/route.svg"))
+                                        .label("Путь на карте приложения")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.pinned_feature = Some(title.clone());
+                                            this.set_tab(Tab::App, cx);
+                                        })),
+                                )
+                            }),
+                    ),
+            )
+            .children(f.paths.iter().enumerate().map(|(pi, path)| {
+                let name = if path.title.is_empty() { "Путь".to_owned() } else { path.title.clone() };
+                let n = path.steps.len();
+                v_flex()
+                    .gap(px(10.))
+                    .child(ui::section_title(name, Some(n.to_string()), p, theme))
+                    .child(h_flex().flex_wrap().items_start().gap(px(8.)).children(path.steps.iter().enumerate().map(|(si, s)| {
+                        let kind = kind_of(&s.screen);
+                        h_flex()
+                            .items_start()
+                            .gap(px(8.))
+                            .child(
+                                v_flex()
+                                    .id(SharedString::from(format!("flow-step-{pi}-{si}")))
+                                    .w(px(230.))
+                                    .gap(px(6.))
+                                    .p(px(12.))
+                                    .rounded(px(10.))
+                                    .border_1()
+                                    .border_color(p.border)
+                                    .bg(p.surface)
+                                    .shadow(ui::card_shadow())
+                                    .child(
+                                        h_flex()
+                                            .gap(px(6.))
+                                            .child(div().size(px(18.)).flex_shrink_0().rounded_full().bg(p.ink).flex().items_center().justify_center().text_size(px(10.5)).text_color(theme.background).child((si + 1).to_string()))
+                                            .child(Icon::empty().path(kind_icon(&kind, false)).xsmall().text_color(p.muted))
+                                            .child(div().min_w_0().truncate().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(p.ink).child(s.screen.clone())),
+                                    )
+                                    .child(div().text_size(px(13.)).text_color(p.fg).child(s.action.clone()))
+                                    .when(!s.result.is_empty(), |d| d.child(div().text_size(px(12.5)).text_color(p.green.text).child(format!("→ {}", s.result))))
+                                    .when(!s.entities.is_empty() || !s.files.is_empty(), |d| {
+                                        d.child(
+                                            h_flex()
+                                                .flex_wrap()
+                                                .gap(px(4.))
+                                                .children(s.entities.iter().map(|e| ui::chip(e.clone(), p, theme)))
+                                                .children(s.files.iter().map(|x| ui::chip(x.rsplit('/').next().unwrap_or(x).to_owned(), p, theme))),
+                                        )
+                                    }),
+                            )
+                            .when(si + 1 < n, |d| d.child(div().pt(px(30.)).text_size(px(16.)).text_color(p.faint).child("→")))
+                    })))
+            }))
+            .when(f.paths.is_empty(), |d| d.child(ui::badge(if f.status == "draft" { "Описывается — шаги появятся после прохода «Детали»" } else { "Шагов нет" }, p.blue)))
+            .child(div().max_w(px(760.)).child(self.render_feature(fi, f, true, p, theme, cx)))
+    }
+}
+
 fn map_area(map: Option<&FlowMap>, id: &str) -> String {
     map.and_then(|m| m.areas.iter().find(|a| a.id == id)).map(|a| a.title.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| if id.is_empty() { "Другое".into() } else { id.to_owned() })
 }
@@ -2616,6 +3780,45 @@ mod tests {
     }
 
     #[core::prelude::v1::test]
+    fn details_keep_feature_status() {
+        let mut m = map();
+        let mut f = m.features[0].clone();
+        f.status = "in_progress".into();
+        merge_details(&mut m, &FlowProposal { upsert: vec![f.clone()], ..Default::default() }, false);
+        assert_eq!(m.features[0].status, "in_progress");
+        f.status = "draft".into();
+        merge_details(&mut m, &FlowProposal { upsert: vec![f], ..Default::default() }, false);
+        assert_eq!(m.features[0].status, "");
+    }
+
+    #[core::prelude::v1::test]
+    fn navigation_lays_out_left_to_right_from_start() {
+        use flows::{AppNav, Edge, Screen};
+        let edge = |to: &str| Edge { to: to.into(), ..Default::default() };
+        let nav = AppNav {
+            app: "X".into(),
+            start: "Запуск".into(),
+            screens: vec![
+                Screen { name: "Запуск".into(), edges: vec![edge("Вход"), edge("Дашборд")], ..Default::default() },
+                Screen { name: "Вход".into(), edges: vec![edge("Дашборд")], ..Default::default() },
+                Screen { name: "Дашборд".into(), edges: vec![edge("Сессия"), edge("Вход")], ..Default::default() },
+                Screen { name: "Сессия".into(), edges: vec![edge("Дашборд")], ..Default::default() },
+            ],
+        };
+        let lay = nav_layout(&nav);
+        let x = |i: usize| lay.screens.iter().find(|(j, _)| *j == i).unwrap().1.x;
+        // Start in the first column; one step away in the second; two steps in the third.
+        assert_eq!(x(0), 0.);
+        assert_eq!(x(1), x(2));
+        assert!(x(3) > x(2) && x(2) > x(0));
+        // The start card is taller; back edges (Сессия → Дашборд) dip below the cards.
+        assert!(lay.screens[0].1.h > lay.screens[1].1.h);
+        let back = lay.edges.iter().find(|e| e.from == 3 && e.to == 2).unwrap();
+        assert!(back.label.1 > SCREEN_H);
+        assert_eq!(lay.edges.len(), 6);
+    }
+
+    #[core::prelude::v1::test]
     fn pass_prompts_carry_marker_and_outputs() {
         let repo = Path::new("/tmp/demo");
         let inv = inventory_prompt(repo, Path::new("/tmp/demo/.stepan_verify/flows.parts/checklist.json"), false);
@@ -2624,7 +3827,10 @@ mod tests {
         let m = map();
         let batch = flows::Batch { id: "a-1".into(), title: "Награды".into(), features: vec!["a1".into()] };
         let d = details_prompt(repo, &m, &batch);
-        assert!(d.starts_with("[iv3 flows]") && d.contains("flows.parts/a-1.json") && d.contains("- a1 ") && !d.contains("- b1 "));
+        assert!(d.starts_with("[iv3 flows]") && d.contains("flows.parts/a-1") && d.contains("- a1.yml") && !d.contains("- b1.yml"));
+        assert!(d.contains("steps:") && d.contains("-> ") && !d.contains("\"upsert\""));
+        let n = nav_prompt(repo, &m, Path::new("/tmp/demo/.stepan_verify/flows.parts/checklist.json"), None);
+        assert!(n.starts_with("[iv3 flows]") && n.contains("flows.parts/nav/app.yml") && n.contains("start:") && n.contains("screens:"));
         let pr = proofs_prompt(repo, &m, &Inventory { tests: vec!["x.test.ts".into()], ..Default::default() }, &[]);
         assert!(pr.starts_with("[iv3 flows]") && pr.contains("x.test.ts") && pr.contains("proofs.json"));
         let e = EntryPoint { kind: flowscan::EntryKind::Route, id: "/z".into(), file: "app/z/page.tsx".into(), area: "z".into() };

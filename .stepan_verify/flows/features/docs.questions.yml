@@ -1,0 +1,12 @@
+feature: Вопросы агентов к тебе в документах
+area: Документы («Полка»)
+summary: Документ-вопрос от агента: «Ответить в сессии» или «Отвечено»; решения-предложения можно «Принять» / «Отклонить»
+aliases: [вопросы агента, открытые вопросы, решения]
+
+paths:
+  Ответить на вопрос:
+    - Просмотр документа типа «вопрос»: Нажать «Ответить в сессии» -> Открывается сессия, из которой пришёл вопрос  [DocsEvent::OpenSession, crates/stepan_verify_app/src/docs.rs, crates/stepan_verify_app/src/app.rs]
+    - Просмотр документа: Нажать «Отвечено» -> В документе ставится status answered  [front_field_edit, crates/stepan_verify_app/src/docs.rs, crates/stepan_verify_core/src/docs.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/docs.rs  covers: 2  at: 2026-11-25T08:41:08Z  title: Типы документов и вопросы

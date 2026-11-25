@@ -1,0 +1,12 @@
+feature: Доска задач
+area: Задачи (доска)
+summary: Колонки «Входящие», «К работе», «В работе», «Ждёт тебя», «Готово» с фильтром по проектам
+aliases: [доска, канбан, задачи, борд]
+
+paths:
+  Открыть доску:
+    - Левый сайдбар: Нажать «Задачи» -> Открывается доска с колонками и счётчиком задач  [Page::Tasks, board::render, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/board.rs]
+    - Доска задач: Выбрать чип проекта («Все проекты» или конкретный) -> Видны задачи только этого проекта  [filter_chip, crates/stepan_verify_app/src/board.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/tasks.rs  at: 2026-11-25T08:41:08Z  title: Чтение и запись задач (frontmatter)

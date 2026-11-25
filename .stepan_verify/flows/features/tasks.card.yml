@@ -1,0 +1,13 @@
+feature: Карточка задачи: ревью, ответ, журнал
+area: Задачи (доска)
+summary: Детали задачи — описание, папка, вложения, зависимости, журнал; «Принять», «Вернуть», «Ответить», «Открыть сессию»
+aliases: [детали задачи, ревью задачи, принять задачу]
+
+paths:
+  Принять или вернуть сданную задачу:
+    - Доска, колонка «Ждёт тебя»: Открыть карточку задачи -> Панель с описанием, зависимостями, вложениями и журналом  [board::task_panel, crates/stepan_verify_app/src/board.rs]
+    - Карточка задачи: Нажать «Принять» (или «Вернуть») -> Задача уходит в «Готово» (или обратно в работу), в журнале запись  [Board::set_status, events::append, crates/stepan_verify_app/src/board.rs, crates/stepan_verify_core/src/events.rs]
+    - Карточка задачи, блок вопроса агента: Написать и нажать «Ответить» -> Ответ уходит в сессию агента  [board::reply, crates/stepan_verify_app/src/board.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/tasks.rs  covers: 2  at: 2026-11-25T08:41:08Z  title: Claim, complete, зависимости

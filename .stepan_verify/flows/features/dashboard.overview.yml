@@ -1,0 +1,9 @@
+feature: Дашборд со сводкой и списком сессий
+area: Дашборд («Пульт»)
+summary: Главный экран — метрики (сессий за 24 ч, задач в работе, ждут тебя, проектов) и список недавних сессий по проектам
+aliases: [главный экран, пульт, дашборд, домашний экран]
+
+paths:
+  Открыть приложение или нажать «Дашборд» в сайдбаре:
+    - Левый сайдбар: Нажать «Дашборд» -> Открывается сводка метрик и список недавних сессий, сгруппированных по проектам  [AppView::nav_item, Page::Dashboard, dashboard::render, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/dashboard.rs]
+    - Дашборд: Нажать «Обновить» -> Кнопка показывает «Сканирую…», список сессий пересобирается с диска  [dashboard::render, SessionIndex scan, crates/stepan_verify_app/src/dashboard.rs, crates/stepan_verify_core/src/sessions.rs]

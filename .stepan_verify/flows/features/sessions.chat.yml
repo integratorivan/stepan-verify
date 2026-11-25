@@ -1,0 +1,14 @@
+feature: Лента сессии и отправка сообщений
+area: Сессии агентов
+summary: Лента сообщений, инструментов и диффов; сообщение агенту во время хода; Enter — отправить, Shift+Enter — перенос, «Стоп»
+aliases: [чат с агентом, лента, экран сессии]
+
+paths:
+  Написать агенту и остановить:
+    - Экран сессии, вкладка чата: Написать сообщение и нажать Enter или «Отправить» -> Сообщение попадает в ленту, агент стримит ответ («Думает…»)  [SessionView::send, AgentEvent, crates/stepan_verify_app/src/session.rs, crates/stepan_verify_agents/src/model.rs]
+    - Лента сессии: Смотреть на ход агента -> Подряд идущие инструменты сворачиваются в группу, правки показаны встроенным диффом +/−  [fold_runs, unified_diff, crates/stepan_verify_app/src/session.rs, crates/stepan_verify_agents/src/claude.rs]
+    - Экран сессии: Нажать «Стоп» -> Текущий ход прерывается  [SessionView::interrupt, crates/stepan_verify_app/src/session.rs]
+
+proofs:
+  - test: crates/stepan_verify_app/src/session.rs  covers: 2  at: 2026-11-25T08:41:08Z  title: Группировка инструментов и склейка правок в ленте
+  - test: crates/stepan_verify_agents/src/claude.rs  covers: 2  at: 2026-11-25T08:41:08Z  title: Правка превращается в unified diff (Claude)
