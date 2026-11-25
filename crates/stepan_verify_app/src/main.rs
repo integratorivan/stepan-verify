@@ -105,13 +105,32 @@ fn main() {
 /// (/usr/bin:/bin:…) and would not find `claude`, `codex` or `node` from
 /// Homebrew, npm or mise. Take the PATH your login shell builds.
 fn login_path() {
-    use std::{io::Read as _, process::{Command, Stdio}, time::{Duration, Instant}};
     let current = std::env::var("PATH").unwrap_or_default();
     let home = std::env::var("HOME").unwrap_or_default();
-    // Started from a terminal: the PATH is already the user's.
-    if current.split(':').any(|p| p.starts_with("/opt/homebrew") || p.starts_with("/usr/local/bin") || (!home.is_empty() && p.starts_with(&home))) {
+    // Started from a terminal: the PATH is already the user's. launchd's own
+    // PATH has /usr/local/bin too, so that one says nothing.
+    if current.split(':').any(|p| p.starts_with("/opt/homebrew") || (!home.is_empty() && p.starts_with(&home))) {
         return;
     }
+    let shell_path = shell_path().unwrap_or_default();
+    let mut parts: Vec<String> = shell_path.split(':').filter(|p| !p.is_empty()).map(str::to_owned).collect();
+    // A slow or broken shell config still leaves the usual install places.
+    let fallback = ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"]
+        .map(str::to_owned)
+        .into_iter()
+        .chain([".local/bin", ".bun/bin", ".cargo/bin", ".npm-global/bin"].map(|d| format!("{home}/{d}")));
+    for p in current.split(':').map(str::to_owned).chain(fallback) {
+        if !p.is_empty() && !parts.contains(&p) && std::path::Path::new(&p).is_dir() {
+            parts.push(p);
+        }
+    }
+    // SAFETY: before any other thread starts.
+    unsafe { std::env::set_var("PATH", parts.join(":")) };
+}
+
+/// The PATH the login shell builds, or None when it fails or takes too long.
+fn shell_path() -> Option<String> {
+    use std::{io::Read as _, process::{Command, Stdio}, time::{Duration, Instant}};
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
     let Ok(mut child) = Command::new(&shell)
         .args(["-l", "-i", "-c", "printf '\\n__STEPAN_VERIFY_PATH__%s' \"$PATH\""])
@@ -120,32 +139,22 @@ fn login_path() {
         .stderr(Stdio::null())
         .spawn()
     else {
-        return;
+        return None;
     };
     // A heavy or stuck shell config must not hold the window back.
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(4);
     while child.try_wait().ok().flatten().is_none() {
         if Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return;
+            return None;
         }
         std::thread::sleep(Duration::from_millis(30));
     }
     let mut text = String::new();
     let _ = child.stdout.take().map(|mut o| o.read_to_string(&mut text));
-    let Some((_, path)) = text.rsplit_once("__STEPAN_VERIFY_PATH__") else { return };
-    let mut parts: Vec<&str> = path.trim().split(':').filter(|p| !p.is_empty()).collect();
-    if parts.is_empty() {
-        return;
-    }
-    for p in current.split(':') {
-        if !p.is_empty() && !parts.contains(&p) {
-            parts.push(p);
-        }
-    }
-    // SAFETY: before any other thread starts.
-    unsafe { std::env::set_var("PATH", parts.join(":")) };
+    let (_, path) = text.rsplit_once("__STEPAN_VERIFY_PATH__")?;
+    Some(path.trim().to_owned())
 }
 
 /// The Dock / Cmd-Tab picture. A bundled stepan_verify.app already has AppIcon.icns;
