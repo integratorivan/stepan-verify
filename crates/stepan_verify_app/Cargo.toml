@@ -18,6 +18,7 @@ anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml = "0.9"
 # Image dimensions from the file header, to reserve layout space before decoding.
 imagesize = "0.14"
 # Word diff of node signatures on the change map (same crate stepan_verify_agents uses for hunks).

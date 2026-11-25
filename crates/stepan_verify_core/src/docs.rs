@@ -653,17 +653,16 @@ const RULES: &str = r#"# Документы Stepan
 - **Разбор** — `research/<slug>.md`. Ты что-то исследовал: замеры, причина бага, сравнение вариантов, устройство чужого кода. Пиши, если результат пригодится позже и его нельзя восстановить из кода или git.
 - **Решение** — `decisions/<ГГГГ-ММ-ДД>-<slug>.md`. В работе выбрали подход, библиотеку, схему данных или отказались от варианта. Что выбрали, какие варианты отвергли и почему, когда стоит пересмотреть. Решение — это выбор, а не перечень сделанного.
 - **Вопрос пользователю** — развилка, которую должен решить он. Запиши варианты и свою рекомендацию в разбор, вопрос — в поле `question`, и задай его в чате. Когда ответ получен, поставь `status: answered` и запиши решение.
-- **Фактура проекта** — `project.md`, один живой документ на проект: как запускать и тестировать, где что лежит, инварианты, грабли, внешние зависимости. Не заводи второй — дополняй и исправляй этот, коротко, по разделам. Устаревшее удаляй.
 - **Передача** — `handoff/<slug>.md`, только если работа остаётся незаконченной: что сделано, что осталось, где остановился.
 
-Не пиши: отчёт о проделанной работе, пересказ диффа, то, что уже есть в коде, README, CLAUDE.md или AGENTS.md. Один точный документ лучше пяти. Нечего записать — ничего не пиши. Если пользователь ведёт тебя по шагам, пиши документ по итогу, а не после каждого шага.
+Как запускать и тестировать проект, где что лежит, грабли, поправки и запреты пользователя — это не документы, а память (`stepan_verify memory add`, см. «Память Stepan» выше). Не пиши: отчёт о проделанной работе, пересказ диффа, то, что уже есть в коде, README, CLAUDE.md или AGENTS.md. Один точный документ лучше пяти. Нечего записать — ничего не пиши. Если пользователь ведёт тебя по шагам, пиши документ по итогу, а не после каждого шага.
 
 Формат — markdown с YAML-фронтматтером:
 
 ```markdown
 ---
 title: Разбор /events/search — +40 ms к p95
-kind: research          # research | decision | facts | handoff
+kind: research          # research | decision | handoff
 status: open            # решения: proposed | accepted | superseded; вопросы: open | answered
 question: Убрать fuzzy-поиск или оставить с индексом? Я бы оставил: …
 author: {author}
@@ -680,7 +679,8 @@ summary: Одна строка о сути
 /// `project` is the docs folder name (the cwd's last segment); None for a
 /// session outside any project.
 pub fn agent_brief(home: &Home, project: Option<&str>, author: &str, session: Option<&str>) -> String {
-    brief_from(&scan(home), &home.docs(), project, author, session)
+    let memory = crate::memory::Memory::load(home).brief(project);
+    format!("{memory}\n{}", brief_from(&scan(home), &home.docs(), project, author, session))
 }
 
 fn brief_from(docs: &[Doc], root: &Path, project: Option<&str>, author: &str, session: Option<&str>) -> String {
@@ -698,7 +698,7 @@ fn brief_from(docs: &[Doc], root: &Path, project: Option<&str>, author: &str, se
     let mine: Vec<&Doc> = docs.iter().filter(|d| d.project.as_deref() == Some(project)).collect();
     out.push_str(&format!("\n## Что полка уже знает о проекте {project}\n\n"));
     if mine.is_empty() {
-        out.push_str(&format!("Пока ничего. Если в этой работе выяснится, как устроен проект, начни `{}/project.md`.\n", dir.display()));
+        out.push_str("Пока ничего.\n");
         return out;
     }
     if let Some(facts) = mine.iter().find(|d| d.doc_type == DocType::Facts) {
@@ -1003,6 +1003,7 @@ mod tests {
 
         let brief = agent_brief(&home, Some("stepan_verify"), "claude", Some("abc"));
         assert!(brief.contains("session: abc") && brief.contains("author: claude"));
+        assert!(brief.starts_with("# Память Stepan") && brief.contains("stepan_verify memory add"), "memory comes first");
         assert!(brief.contains(&format!("лежат в `{}/`", dir.display())));
         assert!(brief.contains("STEPAN_VERIFY_HOME для тестов"), "facts body is included");
         assert!(brief.contains("WKWebView для HTML: нативно, без Electron"));

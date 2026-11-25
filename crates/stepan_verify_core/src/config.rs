@@ -228,6 +228,23 @@ pub struct Config {
     pub docs: DocsConfig,
     pub appearance: AppearanceConfig,
     pub updates: UpdatesConfig,
+    pub flows: FlowsConfig,
+}
+
+/// The project flow map («Флоу»).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FlowsConfig {
+    /// Link the `stepan-verify-flows` skill into Claude and Codex skill folders.
+    pub skill: bool,
+    /// Sync the map by itself when code it describes changed and things went quiet.
+    pub auto_sync: bool,
+}
+
+impl Default for FlowsConfig {
+    fn default() -> Self {
+        Self { skill: true, auto_sync: false }
+    }
 }
 
 impl Config {

@@ -2317,7 +2317,17 @@ impl ChangesView {
             }
             _ => None,
         };
-        let risk_count = |n: &map::MapNode| r.risks.iter().filter(|risk| risk.nodes.iter().any(|k| map::normalize(k) == n.key) || (!risk.id.is_empty() && n.risk_ids.contains(&risk.id))).count();
+        // Risks another agent refuted by running something do not count on the card.
+        let checked = self.selected.and_then(|i| self.runs.get(i)).and_then(|run| self.verify.get(&run.n));
+        let refuted = |i: usize, risk: &Risk| checked.and_then(|c| c.get(&risk_key(i, risk))).is_some_and(|v| v.verdict == "refuted");
+        let risk_count = |n: &map::MapNode| {
+            r.risks
+                .iter()
+                .enumerate()
+                .filter(|(i, risk)| !refuted(*i, risk))
+                .filter(|(_, risk)| risk.nodes.iter().any(|k| map::normalize(k) == n.key) || (!risk.id.is_empty() && n.risk_ids.contains(&risk.id)))
+                .count()
+        };
         let mono = theme.mono_font_family.clone();
         let has_tests = g.has_tests();
 

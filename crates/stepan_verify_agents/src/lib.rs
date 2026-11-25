@@ -149,6 +149,23 @@ pub(crate) fn docs_env(cmd: &mut std::process::Command, spec: &SessionSpec) {
     if flows.is_file() && !spec.env.iter().any(|(k, _)| k == "STEPAN_VERIFY_FLOWS") {
         cmd.env("STEPAN_VERIFY_FLOWS", flows);
     }
+    // `stepan_verify memory …` from any session: the app's own binary on PATH,
+    // and the project its memory entries belong to (the cwd's folder name, as docs name it).
+    let set = |key: &str| spec.env.iter().any(|(k, _)| k == key);
+    if !set("PATH") {
+        if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_owned())) {
+            let path = std::env::var("PATH").unwrap_or_default();
+            cmd.env("PATH", format!("{}:{path}", dir.display()));
+        }
+    }
+    if !set("STEPAN_VERIFY_PROJECT") {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        if home.as_deref() != Some(spec.cwd.as_path()) {
+            if let Some(name) = spec.cwd.file_name() {
+                cmd.env("STEPAN_VERIFY_PROJECT", name);
+            }
+        }
+    }
 }
 
 /// The project's flow map, relative to its root (same as `stepan_verify_core::flows::FILE`).

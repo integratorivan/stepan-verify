@@ -14,6 +14,8 @@ use anyhow::Result;
 ///   tasks/<id>.md      tasks: YAML frontmatter + markdown body
 ///   docs/              md/html documents by agents and you (agents get it as STEPAN_VERIFY_DOCS);
 ///                      metadata in YAML frontmatter, see `docs` module
+///   memory/            what agents must remember: the user's corrections, don'ts,
+///                      project facts (log.jsonl + snapshots, see `memory` module)
 ///   automations/       proactive triggers (schedules, watchers)
 ///   state/             app-owned state (session links, event logs)
 /// ```
@@ -37,13 +39,14 @@ impl Home {
     pub fn tasks(&self) -> PathBuf { self.root.join("tasks") }
     pub fn docs(&self) -> PathBuf { self.root.join("docs") }
     pub fn automations(&self) -> PathBuf { self.root.join("automations") }
+    pub fn memory(&self) -> PathBuf { self.root.join("memory") }
     pub fn state(&self) -> PathBuf { self.root.join("state") }
     /// Scratch output per session (before/after media and the like).
     pub fn tmp(&self) -> PathBuf { self.root.join("tmp") }
 
     /// Create the folder layout if missing. Never overwrites existing files.
     pub fn ensure(&self) -> Result<()> {
-        for dir in [self.skills(), self.tasks(), self.docs(), self.automations(), self.state()] {
+        for dir in [self.skills(), self.tasks(), self.docs(), self.memory(), self.automations(), self.state()] {
             fs::create_dir_all(dir)?;
         }
         let config = self.root.join("config.toml");
@@ -52,7 +55,7 @@ impl Home {
         }
         let readme = self.docs().join("README.md");
         // A README you edited stays; the stock one is upgraded.
-        if fs::read_to_string(&readme).map_or(true, |t| t == DOCS_README_V1) {
+        if fs::read_to_string(&readme).map_or(true, |t| t == DOCS_README_V1 || t == DOCS_README_V2) {
             fs::write(&readme, DOCS_README)?;
         }
         Ok(())
@@ -94,6 +97,42 @@ fn migrate_legacy(old: &Path, new: &Path) {
 /// Written into a fresh docs/ folder (and over the previous stock README);
 /// explains the layout to people and agents.
 const DOCS_README: &str = r#"# Документы Stepan
+
+Сюда агенты и ты кладёте документы по проектам — они появляются в разделе
+«Документы» сами. Агенты видят эту папку как `$STEPAN_VERIFY_DOCS`; каждая сессия,
+запущенная из Stepan, получает правила ниже и то, что полка знает о проекте.
+
+Документы — это то, что пригодится тебе: решения, разборы, передачи. Как устроен
+проект, твои поправки и запреты агенты держат не здесь, а в памяти
+(`~/.stepan_verify/memory`, раздел «Память», `stepan_verify memory …`).
+
+```
+<проект>/
+  decisions/ГГГГ-ММ-ДД-x.md  решения: что выбрали, что отвергли, почему
+  research/x.md              разборы: замеры, причины, варианты, вопрос тебе
+  handoff/x.md               передача незаконченной работы
+```
+
+```markdown
+---
+title: Разбор /events/search
+kind: research         # decision | research | handoff | briefing | note
+status: open           # решения: proposed | accepted | superseded; вопросы: open | answered
+question: Убрать fuzzy-поиск? Я бы оставил…
+project: outpoll-web   # если файл не в папке проекта
+author: codex          # claude | codex | ты | авто
+session: <id сессии>   # откуда документ
+task: <id задачи>      # к какой задаче
+summary: одна строка о сути
+---
+```
+
+`kind` можно не писать — он угадывается по папке. В HTML то же самое —
+тегами `<meta name="stepan_verify:kind" content="…">`.
+"#;
+
+/// The stock README before memory took project facts over.
+const DOCS_README_V2: &str = r#"# Документы Stepan
 
 Сюда агенты и ты кладёте документы по проектам — они появляются в разделе
 «Документы» сами. Агенты видят эту папку как `$STEPAN_VERIFY_DOCS`; каждая сессия,

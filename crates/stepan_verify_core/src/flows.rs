@@ -32,7 +32,22 @@ pub struct FlowMap {
     /// Product areas features group into: «Награды», «Авторизация».
     pub areas: Vec<Area>,
     pub features: Vec<Feature>,
+    /// Entry points deliberately left off the map (debug pages, redirects), with why.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ignored: Vec<Ignored>,
+    /// HEAD at the last full build / sync: what «the map lags behind» is measured from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub synced_commit: Option<String>,
     pub updated_at: Option<DateTime<Utc>>,
+}
+
+/// An entry point the map does not describe on purpose.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Ignored {
+    /// Route / screen id or file, as in the coverage checklist.
+    pub entry: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -52,6 +67,13 @@ pub struct Feature {
     pub summary: String,
     /// Other names people use for it («та штука в левом сайдбаре»).
     pub aliases: Vec<String>,
+    /// Entry points (routes, screens, files) this feature starts from —
+    /// how the coverage check knows the feature accounts for them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<String>,
+    /// `draft` while only inventoried (paths not described yet).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub status: String,
     pub paths: Vec<FlowPath>,
     pub proofs: Vec<Proof>,
 }
@@ -179,11 +201,77 @@ impl FlowMap {
             }
         }
         self.features.retain(|f| !proposal.remove.contains(&f.id));
+        for i in &proposal.ignored {
+            if !self.ignored.iter().any(|x| x.entry == i.entry) {
+                self.ignored.push(i.clone());
+            }
+        }
         if self.version == 0 {
             self.version = 1;
         }
         self.updated_at = Some(Utc::now());
     }
+
+    /// Replace the proofs of the listed features (a proofs pass); other fields stay.
+    pub fn apply_proofs(&mut self, part: &ProofsPart) {
+        for fp in &part.features {
+            if let Some(f) = self.features.iter_mut().find(|f| f.id == fp.feature) {
+                f.proofs = fp.proofs.clone();
+            }
+        }
+        self.updated_at = Some(Utc::now());
+    }
+
+    /// Features still waiting for their paths.
+    pub fn drafts(&self) -> impl Iterator<Item = &Feature> {
+        self.features.iter().filter(|f| f.status == "draft")
+    }
+
+    /// Split features into detail batches: by area, at most `size` per batch.
+    pub fn batches(&self, ids: &[String], size: usize) -> Vec<Batch> {
+        let size = size.max(1);
+        let mut by_area: Vec<(String, Vec<String>)> = Vec::new();
+        for f in self.features.iter().filter(|f| ids.contains(&f.id)) {
+            match by_area.iter_mut().find(|(a, _)| *a == f.area) {
+                Some((_, list)) => list.push(f.id.clone()),
+                None => by_area.push((f.area.clone(), vec![f.id.clone()])),
+            }
+        }
+        let mut out = Vec::new();
+        for (area, list) in by_area {
+            let title = self.areas.iter().find(|a| a.id == area).map(|a| a.title.clone()).unwrap_or_else(|| if area.is_empty() { "Без области".into() } else { area.clone() });
+            let chunks: Vec<&[String]> = list.chunks(size).collect();
+            let n = chunks.len();
+            for (i, chunk) in chunks.into_iter().enumerate() {
+                let suffix = if n > 1 { format!(" · {}/{}", i + 1, n) } else { String::new() };
+                out.push(Batch { id: format!("{}-{}", if area.is_empty() { "misc" } else { &area }, i + 1), title: format!("{title}{suffix}"), features: chunk.to_vec() });
+            }
+        }
+        out
+    }
+}
+
+/// A slice of features one detail agent describes.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Batch {
+    pub id: String,
+    pub title: String,
+    pub features: Vec<String>,
+}
+
+/// Result of a proofs pass: the full proof list per feature.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProofsPart {
+    pub features: Vec<FeatureProofs>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FeatureProofs {
+    pub feature: String,
+    pub proofs: Vec<Proof>,
 }
 
 impl Feature {
@@ -231,11 +319,14 @@ pub struct FlowProposal {
     pub remove: Vec<String>,
     /// One line per change, for the review UI: «+ Полёт карты в хаб».
     pub notes: Vec<String>,
+    /// Entry points to leave off the map, with a reason.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ignored: Vec<Ignored>,
 }
 
 impl FlowProposal {
     pub fn is_empty(&self) -> bool {
-        self.areas.is_empty() && self.upsert.is_empty() && self.remove.is_empty()
+        self.areas.is_empty() && self.upsert.is_empty() && self.remove.is_empty() && self.ignored.is_empty()
     }
 }
 
@@ -406,6 +497,36 @@ features:
         let t = map.touched(&[], &["GlobalDailyCard".into()]);
         assert_eq!(t[0].steps, vec!["open".to_owned()]);
         assert!(map.touched(&["other.ts".into()], &[]).is_empty());
+    }
+
+    #[test]
+    fn batches_split_by_area_and_size() {
+        let mut map = sample();
+        map.areas.push(Area { id: "auth".into(), title: "Вход".into() });
+        for i in 0..7 {
+            map.features.push(Feature { id: format!("auth.{i}"), area: "auth".into(), status: "draft".into(), ..Default::default() });
+        }
+        let ids: Vec<String> = map.drafts().map(|f| f.id.clone()).collect();
+        assert_eq!(ids.len(), 7);
+        let b = map.batches(&ids, 3);
+        assert_eq!(b.iter().map(|b| b.features.len()).collect::<Vec<_>>(), vec![3, 3, 1]);
+        assert_eq!(b[0].title, "Вход · 1/3");
+        let all: Vec<String> = map.features.iter().map(|f| f.id.clone()).collect();
+        assert_eq!(map.batches(&all, 6).len(), 3, "rewards 1 + auth 6 + auth 1");
+    }
+
+    #[test]
+    fn proofs_pass_and_ignored_merge() {
+        let mut map = sample();
+        let before = map.features[0].paths.clone();
+        map.apply_proofs(&ProofsPart {
+            features: vec![FeatureProofs { feature: "rewards.joker".into(), proofs: vec![Proof { kind: ProofKind::Test, reference: "a.test.ts".into(), ..Default::default() }] }],
+        });
+        assert_eq!(map.features[0].proofs.len(), 1);
+        assert_eq!(map.features[0].paths, before, "proofs pass keeps paths");
+        let ig = Ignored { entry: "/debug".into(), reason: "служебная".into() };
+        map.apply(&FlowProposal { ignored: vec![ig.clone(), ig], ..Default::default() });
+        assert_eq!(map.ignored.len(), 1);
     }
 
     #[test]

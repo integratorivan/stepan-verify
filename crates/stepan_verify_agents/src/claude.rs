@@ -130,8 +130,10 @@ fn spawn(spec: &SessionSpec, shared: &Arc<Mutex<Shared>>, store: &ImageStore, ev
     if let Some(text) = spec.instructions.as_deref().filter(|t| !t.trim().is_empty()) {
         cmd.args(["--append-system-prompt", text]);
     }
+    // Memory is for every session; the board only for task sessions.
+    cmd.args(["--allowedTools", "Bash(stepan_verify memory *)"]);
     if crate::board_home(spec).is_some() {
-        cmd.args(["--allowedTools", "Bash(stepan_verify task *)"]);
+        cmd.arg("Bash(stepan_verify task *)");
     }
     if spec.mode == Mode::FullAccess {
         cmd.arg("--allow-dangerously-skip-permissions");

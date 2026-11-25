@@ -23,8 +23,11 @@ use gpui_kit::*;
 use stepan_verify_agents::{AgentEvent, AgentHandle, ItemKind, Mode, Provider, SessionSpec};
 use stepan_verify_core::{
     Home,
-    flows::{self, Decisions, Feature, FlowMap, Freshness, ProofKind, SessionFlows},
+    flows::{self, Decisions, Feature, FlowMap, FlowProposal, Freshness, ProofKind, SessionFlows},
+    flowscan::{self, EntryPoint, Inventory},
+    flowsync::{self, Lag},
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     changes::canvas,
@@ -211,6 +214,8 @@ pub fn matches(f: &Feature, query: &str) -> bool {
 pub enum FlowsEvent {
     /// Open a session by its native id.
     OpenSession(String),
+    /// The map's lag behind the code changed (sidebar badge).
+    LagChanged,
 }
 
 impl EventEmitter<FlowsEvent> for FlowsView {}
@@ -221,13 +226,130 @@ enum Selection {
     Proposals,
 }
 
-struct Building {
-    started: Instant,
-    who: String,
-    update: bool,
+/// The map is built in passes so nothing gets lost on big projects:
+/// inventory (all features, no detail) → details per area batch →
+/// proofs → coverage check against the deterministic entry-point checklist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stage {
+    Inventory,
+    Details,
+    Proofs,
+    Coverage,
+    Done,
+}
+
+impl Stage {
+    const PIPELINE: [Stage; 4] = [Stage::Inventory, Stage::Details, Stage::Proofs, Stage::Coverage];
+
+    fn title(self) -> &'static str {
+        match self {
+            Stage::Inventory => "Опись",
+            Stage::Details => "Детали",
+            Stage::Proofs => "Доказательства",
+            Stage::Coverage => "Сверка",
+            Stage::Done => "Готово",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "detail", rename_all = "snake_case")]
+pub enum BatchState {
+    Waiting,
+    Running,
+    Done(u64),
+    Failed(String),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BatchRun {
+    pub batch: flows::Batch,
+    pub state: BatchState,
+    pub attempts: u32,
+}
+
+/// One agent working on one pass or batch.
+struct Job {
+    key: String,
     steps: Vec<String>,
+    started: Instant,
     _handle: AgentHandle,
     _events: Task<()>,
+}
+
+/// Features per detail agent: small enough to be described thoroughly.
+pub const BATCH_SIZE: usize = 6;
+/// Automatic «add what is missing» rounds before asking you.
+const AUTO_COVER_ROUNDS: u32 = 2;
+
+struct Pipeline {
+    n: usize,
+    started: Instant,
+    started_at: chrono::DateTime<chrono::Utc>,
+    who: String,
+    provider: Provider,
+    model: Option<String>,
+    update: bool,
+    stage: Stage,
+    inventory: Option<Inventory>,
+    batches: Vec<BatchRun>,
+    jobs: Vec<Job>,
+    limit: usize,
+    uncovered: Vec<EntryPoint>,
+    rounds: u32,
+    log: Vec<String>,
+    stopped: bool,
+    error: Option<String>,
+    finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Passes already asked to fix an unreadable result file.
+    repaired: std::collections::HashSet<String>,
+    /// Sync run: only features the changed files touch, plus new entry points.
+    sync: bool,
+    /// Files changed since the last sync (sync runs).
+    changed: Vec<String>,
+}
+
+impl Pipeline {
+    fn running(&self) -> bool {
+        self.stage != Stage::Done && !self.stopped && self.error.is_none()
+    }
+
+    fn note(&mut self, line: impl Into<String>) {
+        self.log.push(format!("{} {}", chrono::Local::now().format("%H:%M:%S"), line.into()));
+    }
+}
+
+/// What the build log on disk keeps: `state/flows/<repo>/builds/<n>/build.json`.
+#[derive(Serialize)]
+struct BuildLog<'a> {
+    n: usize,
+    started_at: chrono::DateTime<chrono::Utc>,
+    finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    who: &'a str,
+    update: bool,
+    stage: Stage,
+    stopped: bool,
+    error: &'a Option<String>,
+    batches: &'a [BatchRun],
+    uncovered: &'a [EntryPoint],
+    log: &'a [String],
+}
+
+/// A coverage pass result: new features, entries attached to existing ones, ignored entries.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct CoverPart {
+    upsert: Vec<Feature>,
+    attach: Vec<Attach>,
+    ignored: Vec<flows::Ignored>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Attach {
+    feature: String,
+    entries: Vec<String>,
 }
 
 pub struct FlowsView {
@@ -250,8 +372,12 @@ pub struct FlowsView {
     /// The view was placed for this map (first area at 100%).
     placed: bool,
     selected: Option<Selection>,
-    building: Option<Building>,
+    pipeline: Option<Pipeline>,
     build_error: Option<String>,
+    /// How far the map lags behind the code (git since `synced_commit`).
+    lag: Option<Lag>,
+    /// When the changed files were last touched: auto-sync waits for quiet.
+    lag_seen: Option<(usize, Instant)>,
     _poll: Task<()>,
     _ticker: Task<()>,
 }
@@ -267,6 +393,8 @@ impl FlowsView {
         })
         .detach();
         let project = project.or_else(|| last_project(&home));
+        // Every Claude / Codex session learns to keep the map current (idempotent).
+        sync_skill(&home, crate::settings::config(cx).flows.skill);
         let mut this = Self {
             home,
             projects: Vec::new(),
@@ -285,8 +413,10 @@ impl FlowsView {
             viewport: Rc::new(Cell::new(None)),
             placed: false,
             selected: None,
-            building: None,
+            pipeline: None,
             build_error: None,
+            lag: None,
+            lag_seen: None,
             _poll: Task::ready(()),
             _ticker: Task::ready(()),
         };
@@ -302,11 +432,14 @@ impl FlowsView {
                 let alive = this.update(cx, |this, cx| {
                     let Some(repo) = this.project.clone() else { return };
                     let mtime = fs::metadata(flows::path(&repo)).and_then(|m| m.modified()).ok();
-                    if mtime != this.mtime && this.building.is_none() {
+                    if mtime != this.mtime && !this.is_building() {
                         this.load(cx);
                     } else if n % 10 == 0 {
                         this.load_sessions();
                         cx.notify();
+                    }
+                    if n % 20 == 1 {
+                        this.check_lag(cx);
                     }
                 });
                 if alive.is_err() {
@@ -393,9 +526,46 @@ impl FlowsView {
 
     // -------------------------------------------------------------- building
 
+    /// Recompute the lag in the background (git calls); maybe auto-sync.
+    fn check_lag(&mut self, cx: &mut Context<Self>) {
+        let (Some(repo), Some(map)) = (self.project.clone(), self.map.clone()) else { return };
+        if map.synced_commit.is_none() || self.is_building() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let lag = cx.background_spawn(async move { flowsync::lag(&repo, &map) }).await;
+            let _ = this.update(cx, |this, cx| {
+                let n = lag.as_ref().map_or(0, |l| l.changed.len());
+                if this.lag_seen.map(|(k, _)| k) != Some(n) {
+                    this.lag_seen = Some((n, Instant::now()));
+                }
+                this.lag = lag.filter(Lag::matters);
+                // Auto-sync only after the edits went quiet for a while: a session is likely done.
+                let quiet = this.lag_seen.is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(120));
+                if this.lag.is_some() && quiet && crate::settings::config(cx).flows.auto_sync && !this.is_building() {
+                    this.sync(cx);
+                }
+                cx.emit(FlowsEvent::LagChanged);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Sidebar badge: commits (or files) the map is behind.
+    pub fn lag_badge(&self) -> Option<String> {
+        let lag = self.lag.as_ref()?;
+        Some(if lag.commits > 0 { format!("{}", lag.commits) } else { "!".into() })
+    }
+
+    fn is_building(&self) -> bool {
+        self.pipeline.as_ref().is_some_and(Pipeline::running)
+    }
+
+    /// Start (or restart) the multi-pass build of the map.
     pub(crate) fn build(&mut self, cx: &mut Context<Self>) {
         let Some(repo) = self.project.clone() else { return };
-        if self.building.is_some() {
+        if self.is_building() {
             return;
         }
         let config = crate::settings::config(cx);
@@ -407,28 +577,163 @@ impl FlowsView {
             Provider::Claude => Some(config.changes.model.clone()),
             Provider::Codex => Some(config.changes.codex_model.clone()).filter(|m| !m.is_empty()),
         };
-        let who = crate::changes::reviewer_name(provider, model.as_deref());
-        let update = flows::path(&repo).exists();
-        let out = flows::path(&repo);
-        let spec = SessionSpec {
+        let n = builds_dir(&self.home, &repo)
+            .read_dir()
+            .map(|rd| rd.flatten().filter_map(|e| e.file_name().to_str()?.parse::<usize>().ok()).max().unwrap_or(0))
+            .unwrap_or(0)
+            + 1;
+        let mut pipe = Pipeline {
+            n,
+            started: Instant::now(),
+            started_at: chrono::Utc::now(),
+            who: crate::changes::reviewer_name(provider, model.as_deref()),
             provider,
+            model,
+            update: flows::path(&repo).exists(),
+            stage: Stage::Inventory,
+            inventory: None,
+            batches: Vec::new(),
+            jobs: Vec::new(),
+            limit: config.agents.autopilot_limit.clamp(1, 4),
+            uncovered: Vec::new(),
+            rounds: 0,
+            log: Vec::new(),
+            stopped: false,
+            error: None,
+            finished_at: None,
+            repaired: Default::default(),
+            sync: false,
+            changed: Vec::new(),
+        };
+        pipe.note("Опись точек входа по коду (без агента)");
+        self.pipeline = Some(pipe);
+        self.build_error = None;
+        let scan_repo = repo.clone();
+        cx.spawn(async move |this, cx| {
+            let inv = cx.background_spawn(async move { flowscan::scan(&scan_repo) }).await;
+            let _ = this.update(cx, |this, cx| this.inventory_ready(inv, cx));
+        })
+        .detach();
+        self.restart_ticker(cx);
+        self.save_log();
+        cx.notify();
+    }
+
+    /// Bring the map up to date with the code changed since `synced_commit`:
+    /// re-describe only touched features, pick up new entry points, drop gone ones.
+    pub(crate) fn sync(&mut self, cx: &mut Context<Self>) {
+        if self.project.is_none() || self.is_building() {
+            return;
+        }
+        let synced = self.map.as_ref().and_then(|m| m.synced_commit.clone());
+        let Some(since) = synced else {
+            // Never synced (or no map): a full update build sets the baseline.
+            return self.build(cx);
+        };
+        self.build(cx);
+        let Some(pipe) = self.pipeline.as_mut() else { return };
+        pipe.sync = true;
+        pipe.update = true;
+        pipe.note(format!("Синхронизация с {}", &since[..since.len().min(8)]));
+        self.save_log();
+    }
+
+    /// Sync runs skip the inventory agent: git says what changed, the scan finds new entry points.
+    fn sync_ready(&mut self, inv: Inventory, cx: &mut Context<Self>) {
+        let Some(repo) = self.project.clone() else { return };
+        let Some(mut map) = self.map.clone() else { return };
+        let lag = flowsync::lag(&repo, &map).unwrap_or_default();
+        let Some(pipe) = self.pipeline.as_mut() else { return };
+        let mut touched: std::collections::BTreeSet<String> = map.touched(&lag.changed, &[]).into_iter().map(|t| t.feature).collect();
+        // A deleted page also breaks paths of other features that lead to it.
+        let routes = deleted_routes(&repo, &lag.changed);
+        touched.extend(map.features.iter().filter(|f| routes.iter().any(|r| mentions(f, r))).map(|f| f.id.clone()));
+        // Features whose every file is gone are probably gone too: the detail pass may remove them.
+        let gone: Vec<String> = map
+            .features
+            .iter()
+            .filter(|f| {
+                let files: Vec<&String> = f.steps().flat_map(|s| &s.files).collect();
+                !files.is_empty() && files.iter().all(|x| !repo.join(x).exists())
+            })
+            .map(|f| f.id.clone())
+            .collect();
+        for f in map.features.iter_mut().filter(|f| touched.contains(&f.id) || gone.contains(&f.id)) {
+            f.status = "draft".into();
+        }
+        let ids: Vec<String> = map.drafts().map(|f| f.id.clone()).collect();
+        pipe.batches = map.batches(&ids, BATCH_SIZE).into_iter().map(|batch| BatchRun { batch, state: BatchState::Waiting, attempts: 0 }).collect();
+        pipe.changed = lag.changed.clone();
+        pipe.note(format!(
+            "Синхронизация: {} коммитов, {} файлов изменено, затронуто фич {}, возможно удалено {}",
+            lag.commits,
+            lag.changed.len(),
+            touched.len(),
+            gone.len()
+        ));
+        pipe.inventory = Some(inv);
+        pipe.stage = Stage::Details;
+        if let Err(err) = map.save(&repo) {
+            pipe.error = Some(format!("Карта не сохранилась: {err:#}"));
+        }
+        self.load(cx);
+        self.advance(cx);
+    }
+
+    fn inventory_ready(&mut self, inv: Inventory, cx: &mut Context<Self>) {
+        let Some(repo) = self.project.clone() else { return };
+        let Some(pipe) = self.pipeline.as_mut() else { return };
+        if pipe.stopped {
+            return;
+        }
+        pipe.note(format!(
+            "Найдено точек входа: {} ({}), тестов: {}, stories: {}",
+            inv.entries.len(),
+            if inv.stacks.is_empty() { "стек не распознан".to_owned() } else { inv.stacks.join(", ") },
+            inv.tests.len(),
+            inv.stories.len()
+        ));
+        let parts = parts_dir(&repo);
+        let _ = fs::create_dir_all(&parts);
+        let checklist = parts.join("checklist.json");
+        if let Err(err) = serde_json::to_string_pretty(&inv).map_err(anyhow::Error::from).and_then(|t| Ok(fs::write(&checklist, t)?)) {
+            pipe.error = Some(format!("Не записал чек-лист: {err:#}"));
+            self.save_log();
+            cx.notify();
+            return;
+        }
+        if pipe.sync {
+            return self.sync_ready(inv, cx);
+        }
+        let update = pipe.update;
+        pipe.inventory = Some(inv);
+        let prompt = inventory_prompt(&repo, &checklist, update);
+        self.start_job("inventory".into(), prompt, cx);
+    }
+
+    fn start_job(&mut self, key: String, prompt: String, cx: &mut Context<Self>) {
+        let Some(repo) = self.project.clone() else { return };
+        let Some(pipe) = self.pipeline.as_mut() else { return };
+        let spec = SessionSpec {
+            provider: pipe.provider,
             native_id: None,
             transcript: None,
             cwd: repo.clone(),
-            // It reads the whole project and writes one file; it must not stop to ask.
+            // It reads the whole project and writes one file under .stepan_verify; it must not stop to ask.
             mode: Mode::FullAccess,
             image_cache: Some(self.home.state().join("images")),
-            env: vec![("STEPAN_VERIFY_FLOWS_OUT".into(), out.display().to_string())],
-            model,
+            env: vec![("STEPAN_VERIFY_FLOWS_OUT".into(), parts_dir(&repo).display().to_string())],
+            model: pipe.model.clone(),
             instructions: None,
         };
         let (handle, events) = stepan_verify_agents::open(spec);
-        handle.send(prompt(&repo, update));
+        handle.send(prompt);
+        let k = key.clone();
         let events = cx.spawn(async move |this, cx| {
             while let Ok(event) = events.recv().await {
                 let done = matches!(event, AgentEvent::TurnCompleted { .. } | AgentEvent::Exited | AgentEvent::Error(_));
                 let alive = this.update(cx, |this, cx| {
-                    this.on_event(event, cx);
+                    this.on_job_event(&k, event, cx);
                     cx.notify();
                 });
                 if alive.is_err() || done {
@@ -436,65 +741,299 @@ impl FlowsView {
                 }
             }
         });
-        self.building = Some(Building { started: Instant::now(), who, update, steps: Vec::new(), _handle: handle, _events: events });
-        self.build_error = None;
+        pipe.note(format!("Запущен агент: {key}"));
+        pipe.jobs.push(Job { key, steps: Vec::new(), started: Instant::now(), _handle: handle, _events: events });
+    }
+
+    fn on_job_event(&mut self, key: &str, event: AgentEvent, cx: &mut Context<Self>) {
+        let Some(pipe) = self.pipeline.as_mut() else { return };
+        let Some(job) = pipe.jobs.iter_mut().find(|j| j.key == key) else { return };
+        match event {
+            AgentEvent::Upsert(item) if item.kind == ItemKind::Tool && !item.title.is_empty() => {
+                let step = humanize(&item.title);
+                if job.steps.last() != Some(&step) {
+                    job.steps.push(step);
+                }
+            }
+            AgentEvent::TurnCompleted { error } => self.job_done(key, error, cx),
+            AgentEvent::Exited => self.job_done(key, Some("агент завершился раньше времени".into()), cx),
+            AgentEvent::Error(err) => self.job_done(key, Some(err), cx),
+            _ => {}
+        }
+    }
+
+    /// A pass finished: merge what it wrote, then move the pipeline on.
+    fn job_done(&mut self, key: &str, error: Option<String>, cx: &mut Context<Self>) {
+        let Some(repo) = self.project.clone() else { return };
+        let Some(pipe) = self.pipeline.as_mut() else { return };
+        let Some(pos) = pipe.jobs.iter().position(|j| j.key == key) else { return };
+        let job = pipe.jobs.remove(pos);
+        let secs = job.started.elapsed().as_secs();
+        if pipe.stopped {
+            return;
+        }
+        let part = parts_dir(&repo).join(format!("{key}.json"));
+        let archive = builds_dir(&self.home, &repo).join(pipe.n.to_string()).join("parts");
+        let text = fs::read_to_string(&part).ok();
+        // An unreadable result gets one repair round by an agent before it counts as a failure.
+        if let Some(t) = &text {
+            if let Err(e) = check_part(key, t) {
+                if pipe.repaired.insert(key.to_owned()) {
+                    pipe.note(format!("{key}: файл не читается ({e}) — прошу агента починить"));
+                    let prompt = repair_prompt(&part, &e);
+                    self.start_job(key.to_owned(), prompt, cx);
+                    self.save_log();
+                    cx.notify();
+                    return;
+                }
+            }
+            let _ = fs::create_dir_all(&archive);
+            let _ = fs::write(archive.join(format!("{key}.json")), t);
+            let _ = fs::remove_file(&part);
+        }
+        let mut map = self.map.clone().unwrap_or_else(|| FlowMap {
+            version: 1,
+            project: repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            ..Default::default()
+        });
+        let missing = |error: Option<String>| -> String {
+            error.unwrap_or_else(|| format!("агент не записал {}", part.strip_prefix(&repo).unwrap_or(&part).display()))
+        };
+        let parsed: Result<(), String> = match key {
+            "inventory" => match text.as_deref().map(read_part::<FlowProposal>) {
+                Some(Ok(prop)) => {
+                    merge_inventory(&mut map, &prop);
+                    if pipe.update {
+                        mark_changed_drafts(&mut map, &repo);
+                    }
+                    let ids: Vec<String> = map.drafts().map(|f| f.id.clone()).collect();
+                    pipe.batches = map
+                        .batches(&ids, BATCH_SIZE)
+                        .into_iter()
+                        .map(|batch| BatchRun { batch, state: BatchState::Waiting, attempts: 0 })
+                        .collect();
+                    pipe.note(format!("Опись: {} обл., {} фич, на детали {} пачек", map.areas.len(), map.features.len(), pipe.batches.len()));
+                    pipe.stage = Stage::Details;
+                    Ok(())
+                }
+                Some(Err(e)) => Err(format!("опись не читается: {e}")),
+                None => Err(missing(error)),
+            },
+            "proofs" => {
+                match text.as_deref().map(read_part::<flows::ProofsPart>) {
+                    Some(Ok(part)) => {
+                        map.apply_proofs(&part);
+                        pipe.note(format!("Доказательства: {} фич", part.features.len()));
+                    }
+                    // Proofs are a bonus pass: a miss does not stop the build.
+                    Some(Err(e)) => pipe.note(format!("Доказательства не прочитались: {e}")),
+                    None => pipe.note(format!("Доказательства: {}", missing(error))),
+                }
+                stamp_proofs(&mut map);
+                pipe.stage = Stage::Coverage;
+                Ok(())
+            }
+            k if k.starts_with("cover-") => {
+                match text.as_deref().map(read_part::<CoverPart>) {
+                    Some(Ok(part)) => {
+                        let added = merge_cover(&mut map, part);
+                        pipe.note(format!("Сверка: добавлено/привязано {added}"));
+                    }
+                    Some(Err(e)) => pipe.note(format!("Сверка не прочиталась: {e}")),
+                    None => pipe.note(format!("Сверка: {}", missing(error))),
+                }
+                stamp_proofs(&mut map);
+                pipe.stage = Stage::Coverage;
+                Ok(())
+            }
+            batch => {
+                let Some(run) = pipe.batches.iter_mut().find(|b| b.batch.id == batch) else { return };
+                match text.as_deref().map(read_part::<FlowProposal>) {
+                    Some(Ok(prop)) => {
+                        merge_details(&mut map, &prop, pipe.sync);
+                        run.state = BatchState::Done(secs);
+                    }
+                    Some(Err(e)) => run.state = BatchState::Failed(format!("ответ не читается: {e}")),
+                    None => run.state = BatchState::Failed(missing(error)),
+                }
+                let line = format!("Пачка «{}»: {:?}", run.batch.title, run.state);
+                pipe.note(line);
+                Ok(())
+            }
+        };
+        if let Err(e) = parsed {
+            pipe.error = Some(format!("{}: {e}", key));
+            pipe.note(format!("Ошибка: {e}"));
+        }
+        // Every merged pass lands on disk right away: progress survives failures.
+        if pipe.error.is_none() {
+            if let Err(err) = map.save(&repo) {
+                pipe.error = Some(format!("Карта не сохранилась: {err:#}"));
+            }
+        }
+        let had_map = self.map.is_some();
+        self.load(cx);
+        if !had_map {
+            self.placed = false;
+        }
+        self.advance(cx);
+    }
+
+    /// Start whatever the current stage needs next.
+    fn advance(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.project.clone() else { return };
+        let Some(map) = self.map.clone() else {
+            self.save_log();
+            return;
+        };
+        let Some(pipe) = self.pipeline.as_mut() else { return };
+        if !pipe.running() {
+            self.save_log();
+            cx.notify();
+            return;
+        }
+        match pipe.stage {
+            Stage::Inventory | Stage::Done => {}
+            Stage::Details => {
+                let mut start = Vec::new();
+                let busy = pipe.jobs.len();
+                for run in pipe.batches.iter_mut().filter(|b| b.state == BatchState::Waiting).take(pipe.limit.saturating_sub(busy)) {
+                    run.state = BatchState::Running;
+                    run.attempts += 1;
+                    start.push(run.batch.clone());
+                }
+                let all_settled = pipe.jobs.is_empty() && start.is_empty() && !pipe.batches.iter().any(|b| matches!(b.state, BatchState::Waiting | BatchState::Running));
+                let changed = pipe.changed.clone();
+                for batch in start {
+                    let mut prompt = details_prompt(&repo, &map, &batch);
+                    if !changed.is_empty() {
+                        prompt.push_str(&sync_note(&changed));
+                    }
+                    self.start_job(batch.id.clone(), prompt, cx);
+                }
+                if all_settled {
+                    let Some(pipe) = self.pipeline.as_mut() else { return };
+                    pipe.stage = Stage::Proofs;
+                    let inv = pipe.inventory.clone().unwrap_or_default();
+                    let media = media_files(&self.home, &repo);
+                    let described: Vec<String> = pipe.batches.iter().flat_map(|b| b.batch.features.clone()).collect();
+                    if pipe.sync && described.is_empty() {
+                        // Nothing re-described: no proofs to re-check.
+                        pipe.stage = Stage::Coverage;
+                        return self.advance(cx);
+                    }
+                    let scope = if pipe.sync { FlowMap { features: map.features.iter().filter(|f| described.contains(&f.id)).cloned().collect(), ..map.clone() } } else { map.clone() };
+                    let prompt = proofs_prompt(&repo, &scope, &inv, &media);
+                    self.start_job("proofs".into(), prompt, cx);
+                }
+            }
+            Stage::Proofs => {}
+            Stage::Coverage => {
+                if !pipe.jobs.is_empty() {
+                    return;
+                }
+                let inv = pipe.inventory.clone().unwrap_or_default();
+                pipe.uncovered = flowscan::uncovered(&map, &inv).into_iter().cloned().collect();
+                if pipe.uncovered.is_empty() || pipe.rounds >= AUTO_COVER_ROUNDS {
+                    pipe.note(format!("Сверка: не покрыто {}", pipe.uncovered.len()));
+                    pipe.stage = Stage::Done;
+                    pipe.finished_at = Some(chrono::Utc::now());
+                    let _ = fs::remove_dir_all(parts_dir(&repo));
+                    // The map now describes HEAD: lag is measured from here.
+                    let mut synced = map.clone();
+                    synced.synced_commit = flowsync::head(&repo);
+                    if synced.synced_commit.is_some() && synced.save(&repo).is_ok() {
+                        self.lag = None;
+                        self.load(cx);
+                    }
+                } else {
+                    pipe.rounds += 1;
+                    let key = format!("cover-{}", pipe.rounds);
+                    let prompt = cover_prompt(&repo, &pipe.uncovered.iter().collect::<Vec<_>>(), &key);
+                    pipe.note(format!("Сверка: не покрыто {} — дополняю (раунд {})", pipe.uncovered.len(), pipe.rounds));
+                    self.start_job(key, prompt, cx);
+                }
+            }
+        }
+        self.save_log();
+        cx.notify();
+    }
+
+    /// Stop every agent of the build; what was merged stays in the map.
+    fn stop_build(&mut self, cx: &mut Context<Self>) {
+        let Some(pipe) = self.pipeline.as_mut() else { return };
+        pipe.stopped = true;
+        pipe.jobs.clear();
+        for run in pipe.batches.iter_mut().filter(|b| b.state == BatchState::Running) {
+            run.state = BatchState::Failed("остановлено".into());
+        }
+        pipe.finished_at = Some(chrono::Utc::now());
+        pipe.note("Остановлено");
+        self.save_log();
+        cx.notify();
+    }
+
+    /// Re-run one failed batch (and the passes after it).
+    fn retry_batch(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(pipe) = self.pipeline.as_mut() else { return };
+        let Some(run) = pipe.batches.iter_mut().find(|b| b.batch.id == id) else { return };
+        run.state = BatchState::Waiting;
+        pipe.stopped = false;
+        pipe.error = None;
+        pipe.finished_at = None;
+        pipe.stage = Stage::Details;
+        pipe.note(format!("Повтор пачки {id}"));
+        self.restart_ticker(cx);
+        self.advance(cx);
+    }
+
+    /// One more coverage round on demand.
+    fn cover_more(&mut self, cx: &mut Context<Self>) {
+        let Some(pipe) = self.pipeline.as_mut() else { return };
+        pipe.stopped = false;
+        pipe.error = None;
+        pipe.finished_at = None;
+        pipe.stage = Stage::Coverage;
+        pipe.rounds = pipe.rounds.min(AUTO_COVER_ROUNDS.saturating_sub(1));
+        self.restart_ticker(cx);
+        self.advance(cx);
+    }
+
+    fn restart_ticker(&mut self, cx: &mut Context<Self>) {
         self._ticker = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let going = this.update(cx, |this, cx| {
                     cx.notify();
-                    this.building.is_some()
+                    this.is_building()
                 });
                 if !matches!(going, Ok(true)) {
                     break;
                 }
             }
         });
-        cx.notify();
     }
 
-    fn on_event(&mut self, event: AgentEvent, cx: &mut Context<Self>) {
-        let Some(b) = &mut self.building else { return };
-        match event {
-            AgentEvent::Upsert(item) if item.kind == ItemKind::Tool && !item.title.is_empty() => {
-                let step = humanize(&item.title);
-                if b.steps.last() != Some(&step) {
-                    b.steps.push(step);
-                }
-            }
-            AgentEvent::TurnCompleted { error } => self.finish(error, cx),
-            AgentEvent::Exited => self.finish(Some("Агент карты завершился раньше времени".into()), cx),
-            AgentEvent::Error(err) => self.finish(Some(err), cx),
-            _ => {}
-        }
-    }
-
-    fn finish(&mut self, error: Option<String>, cx: &mut Context<Self>) {
-        let Some(b) = self.building.take() else { return };
-        let before = self.mtime;
-        self.placed = false;
-        self.load(cx);
-        // Proofs the agent found describe the code as it is now: stamp them so
-        // later edits to the covered files show up as «устарело».
-        if let (Some(repo), Some(map)) = (self.project.clone(), self.map.as_mut()) {
-            let now = chrono::Utc::now();
-            let mut stamped = false;
-            for proof in map.features.iter_mut().flat_map(|f| f.proofs.iter_mut()).filter(|p| p.at.is_none()) {
-                proof.at = Some(now + chrono::Duration::seconds(2));
-                stamped = true;
-            }
-            if stamped && map.save(&repo).is_ok() {
-                self.load(cx);
-            }
-        }
-        let wrote = self.mtime.is_some() && self.mtime != before || (b.update && self.mtime.is_some() && error.is_none());
-        self.build_error = match (&self.error, wrote, error) {
-            (Some(e), _, _) => Some(format!("Карта не читается: {e}")),
-            (None, false, Some(e)) => Some(e),
-            (None, false, None) => Some("Агент закончил, но не записал .stepan_verify/flows.yaml".into()),
-            _ => None,
+    fn save_log(&self) {
+        let (Some(repo), Some(pipe)) = (&self.project, &self.pipeline) else { return };
+        let dir = builds_dir(&self.home, repo).join(pipe.n.to_string());
+        let _ = fs::create_dir_all(&dir);
+        let log = BuildLog {
+            n: pipe.n,
+            started_at: pipe.started_at,
+            finished_at: pipe.finished_at,
+            who: &pipe.who,
+            update: pipe.update,
+            stage: pipe.stage,
+            stopped: pipe.stopped,
+            error: &pipe.error,
+            batches: &pipe.batches,
+            uncovered: &pipe.uncovered,
+            log: &pipe.log,
         };
-        cx.notify();
+        if let Ok(text) = serde_json::to_string_pretty(&log) {
+            let _ = fs::write(dir.join("build.json"), text);
+        }
     }
 
     // -------------------------------------------------------------- canvas input
@@ -549,67 +1088,425 @@ fn humanize(title: &str) -> String {
         ("grep", "Ищу по коду"),
     ];
     let t = title.to_lowercase();
-    known.iter().find(|(needle, _)| t.contains(needle)).map(|(_, l)| (*l).to_owned()).unwrap_or_else(|| title.chars().take(90).collect())
+    known.iter().find(|(needle, _)| t.contains(needle)).map(|(_, l)| (*l).to_owned()).unwrap_or_else(|| {
+        // Shell lines lose their `cd … &&` / env noise: «Команда npm test».
+        let (label, detail) = crate::live_card::split_title(title);
+        let line = if detail.is_empty() { label } else { format!("{label} {detail}") };
+        line.chars().take(90).collect()
+    })
 }
 
-/// The map builder's brief. First line carries the `[iv3` marker that keeps
-/// helper sessions off the dashboard.
-pub fn prompt(repo: &Path, update: bool) -> String {
-    let out = flows::path(repo);
-    let task = if update {
-        format!("Карта уже есть: {}. Прочитай её и ОБНОВИ под текущий код: добавь новые фичи и пути, убери исчезнувшие, поправь шаги, entities/files и доказательства. id существующих фич и шагов не меняй, если фича та же.", out.display())
+// ------------------------------------------------------------------ passes
+
+/// Where pass results land in the repo before they are merged (removed after the build).
+pub fn parts_dir(repo: &Path) -> PathBuf {
+    repo.join(".stepan_verify/flows.parts")
+}
+
+fn commits_word(n: usize) -> &'static str {
+    match (n % 10, n % 100) {
+        (1, r) if r != 11 => "коммит",
+        (2..=4, r) if !(12..=14).contains(&r) => "коммита",
+        _ => "коммитов",
+    }
+}
+
+/// Install or remove the `stepan-verify-flows` skill links for Claude and Codex.
+pub fn sync_skill(home: &Home, on: bool) {
+    let targets = flowsync::skill_targets();
+    let report = if on { flowsync::install_skill(home, &targets) } else { flowsync::uninstall_skill(home, &targets) };
+    for w in report.warnings {
+        eprintln!("stepan_verify: skill {}: {w}", flowsync::SKILL_NAME);
+    }
+}
+
+/// A pass result: JSON (asked for), YAML accepted too; markdown fences are stripped.
+fn read_part<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
+    let t = text.trim();
+    let t = t.strip_prefix("```json").or_else(|| t.strip_prefix("```yaml")).or_else(|| t.strip_prefix("```")).unwrap_or(t);
+    let t = t.strip_suffix("```").unwrap_or(t).trim();
+    serde_json::from_str(t).or_else(|je| serde_yaml::from_str(t).map_err(|ye| format!("JSON: {je}; YAML: {ye}")))
+}
+
+/// Does this pass result parse as what the pass is supposed to return?
+fn check_part(key: &str, text: &str) -> Result<(), String> {
+    match key {
+        "proofs" => read_part::<flows::ProofsPart>(text).map(|_| ()),
+        k if k.starts_with("cover-") => read_part::<CoverPart>(text).map(|_| ()),
+        _ => read_part::<FlowProposal>(text).map(|_| ()),
+    }
+}
+
+/// Routes of entry-point files that were deleted: `app/(g)/auth/reset/page.tsx` → `/auth/reset`.
+pub fn deleted_routes(repo: &Path, changed: &[String]) -> Vec<String> {
+    changed
+        .iter()
+        .filter(|f| !repo.join(f).exists() && flowsync::looks_like_entry(f))
+        .filter_map(|f| {
+            let parts: Vec<&str> = f.split('/').collect();
+            let start = parts.iter().position(|p| matches!(*p, "app" | "pages" | "routes" | "screens"))? + 1;
+            let mut segs: Vec<&str> = parts[start..].iter().copied().filter(|s| !(s.starts_with('(') && s.ends_with(')'))).collect();
+            let last = segs.pop()?;
+            let stem = last.split('.').next().unwrap_or(last);
+            if !matches!(stem, "page" | "+page" | "index" | "route" | "layout") {
+                segs.push(stem);
+            }
+            let route = format!("/{}", segs.join("/"));
+            (route.len() > 1).then_some(route)
+        })
+        .collect()
+}
+
+/// Does a feature talk about this route anywhere (entries or step text)?
+fn mentions(f: &Feature, route: &str) -> bool {
+    let hit = |t: &str| t.split(|c: char| c.is_whitespace() || "()«»,.;:\"'".contains(c)).any(|w| w == route || w.starts_with(&format!("{route}?")));
+    f.entries.iter().any(|e| e == route) || f.steps().any(|s| hit(&s.screen) || hit(&s.action) || hit(&s.result))
+}
+
+/// Sync runs: tell the detail agent what changed and that it may drop vanished features.
+fn sync_note(changed: &[String]) -> String {
+    let list: Vec<&str> = changed.iter().take(80).map(String::as_str).collect();
+    format!(
+        "\n\nЭто СИНХРОНИЗАЦИЯ после изменений кода. Изменились файлы:\n{}\nОпиши фичи заново по текущему коду (id не меняй). Если фичи больше нет в коде — не пиши её в upsert, а добавь её id в \"remove\".",
+        list.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n")
+    )
+}
+
+fn repair_prompt(part: &Path, error: &str) -> String {
+    format!(
+        "[iv3 flows] Файл результата {} не читается: {error}\n\nОткрой его и перепиши валидным JSON (тот же смысл и та же схема, ключи как были). Строки — в двойных кавычках, особенно пути и маршруты со скобками вроде /catalog/[id]. Не меняй ничего, кроме этого файла. В конце одной строкой: исправлено.",
+        part.display()
+    )
+}
+
+fn builds_dir(home: &Home, repo: &Path) -> PathBuf {
+    home.state().join("flows").join(flows::repo_key(repo)).join("builds")
+}
+
+/// Inventory result: new features come in as drafts; for features already on the
+/// map only names and entry points are refreshed unless the agent marked them draft.
+pub fn merge_inventory(map: &mut FlowMap, part: &FlowProposal) {
+    for a in &part.areas {
+        match map.areas.iter_mut().find(|x| x.id == a.id) {
+            Some(x) => *x = a.clone(),
+            None => map.areas.push(a.clone()),
+        }
+    }
+    for f in &part.upsert {
+        match map.features.iter_mut().find(|x| x.id == f.id) {
+            Some(x) => {
+                if !f.title.is_empty() {
+                    x.title = f.title.clone();
+                }
+                if !f.area.is_empty() {
+                    x.area = f.area.clone();
+                }
+                if !f.summary.is_empty() {
+                    x.summary = f.summary.clone();
+                }
+                union(&mut x.aliases, &f.aliases);
+                union(&mut x.entries, &f.entries);
+                if f.status == "draft" {
+                    x.status = "draft".into();
+                }
+            }
+            None => {
+                let mut f = f.clone();
+                f.status = "draft".into();
+                map.features.push(f);
+            }
+        }
+    }
+    map.features.retain(|f| !part.remove.contains(&f.id));
+    for i in &part.ignored {
+        if !map.ignored.iter().any(|x| x.entry == i.entry) {
+            map.ignored.push(i.clone());
+        }
+    }
+    if map.version == 0 {
+        map.version = 1;
+    }
+}
+
+/// Detail result: whole features replace their drafts; entry points are never lost.
+pub fn merge_details(map: &mut FlowMap, part: &FlowProposal, allow_remove: bool) {
+    let mut part = part.clone();
+    for f in &mut part.upsert {
+        f.status.clear();
+        if let Some(old) = map.feature(&f.id) {
+            let mut entries = old.entries.clone();
+            union(&mut entries, &f.entries);
+            f.entries = entries;
+            if f.area.is_empty() {
+                f.area = old.area.clone();
+            }
+        }
+    }
+    if !allow_remove {
+        part.remove.clear();
+    }
+    map.apply(&part);
+}
+
+/// Coverage result: new features, entry points attached to existing ones, ignored entries.
+fn merge_cover(map: &mut FlowMap, part: CoverPart) -> usize {
+    let mut n = part.ignored.len();
+    for a in part.attach {
+        if let Some(f) = map.features.iter_mut().find(|f| f.id == a.feature) {
+            union(&mut f.entries, &a.entries);
+            n += a.entries.len();
+        }
+    }
+    let prop = FlowProposal { upsert: part.upsert, ignored: part.ignored, ..Default::default() };
+    n += prop.upsert.len();
+    merge_details(map, &prop, false);
+    n
+}
+
+fn union(into: &mut Vec<String>, from: &[String]) {
+    for x in from {
+        if !into.contains(x) {
+            into.push(x.clone());
+        }
+    }
+}
+
+/// Update mode: features whose step files changed after the last map update get re-described.
+fn mark_changed_drafts(map: &mut FlowMap, repo: &Path) {
+    let Some(since) = map.updated_at else { return };
+    for f in &mut map.features {
+        let changed = f.steps().flat_map(|s| &s.files).any(|file| {
+            fs::metadata(repo.join(file)).and_then(|m| m.modified()).is_ok_and(|m| chrono::DateTime::<chrono::Utc>::from(m) > since)
+        });
+        if changed {
+            f.status = "draft".into();
+        }
+    }
+}
+
+/// Proofs found now describe the code as it is now: stamp them so later edits show «устарело».
+fn stamp_proofs(map: &mut FlowMap) {
+    let now = chrono::Utc::now() + chrono::Duration::seconds(2);
+    for proof in map.features.iter_mut().flat_map(|f| f.proofs.iter_mut()).filter(|p| p.at.is_none()) {
+        proof.at = Some(now);
+    }
+}
+
+/// Before/after media of sessions in this project (`tmp/sessions/*/media/*`).
+fn media_files(home: &Home, repo: &Path) -> Vec<PathBuf> {
+    let root = home.root.join("tmp/sessions");
+    let Ok(sessions) = fs::read_dir(&root) else { return Vec::new() };
+    let repo_s = repo.display().to_string();
+    let mut out = Vec::new();
+    for s in sessions.flatten() {
+        let Ok(runs) = fs::read_dir(s.path().join("media")) else { continue };
+        for run in runs.flatten() {
+            let manifest = fs::read_to_string(run.path().join("manifest.json")).unwrap_or_default();
+            let ctx = fs::read_to_string(run.path().join("context.md")).unwrap_or_default();
+            if !manifest.contains(&repo_s) && !ctx.contains(&repo_s) {
+                continue;
+            }
+            let Ok(files) = fs::read_dir(run.path()) else { continue };
+            out.extend(files.flatten().map(|f| f.path()).filter(|p| {
+                matches!(p.extension().and_then(|e| e.to_str()), Some("png" | "jpg" | "gif" | "mp4" | "webm" | "mov"))
+            }));
+        }
+    }
+    out.truncate(200);
+    out
+}
+
+const RULES: &str = "Правила: не меняй код проекта, ничего не коммить и не пушь, не запускай dev-серверы надолго. Пиши ТОЛЬКО один файл результата (путь ниже) — валидный JSON: все строки в двойных кавычках. Фичи называй как пользователь («Выбор карты Джокера»), а не именами компонентов.";
+
+/// Pass 1: all features and areas, no paths. The checklist keeps it honest.
+pub fn inventory_prompt(repo: &Path, checklist: &Path, update: bool) -> String {
+    let out = parts_dir(repo).join("inventory.json");
+    let map = flows::path(repo);
+    let mode = if update {
+        format!(
+            "Карта уже есть: {}. Перечисли ВСЕ фичи — и существующие (с теми же id), и новые. Существующие, которые не менялись, — без status. Новые и заметно изменившиеся — \"status\": \"draft\". Исчезнувшие — их id в remove.",
+            map.display()
+        )
     } else {
-        format!("Карты ещё нет. Создай файл {} (папку .stepan_verify создай).", out.display())
+        "Карты ещё нет: у всех фич \"status\": \"draft\".".to_owned()
     };
     format!(
-        r#"[iv3 flows] Построй карту пользовательских флоу проекта {repo}.
+        r#"[iv3 flows] Опись фич проекта {repo} — проход 1 из нескольких.
 
-Это «feature map» с точки зрения пользователя: какие фичи есть → как пользователь до них добирается → что доказывает, что фича работает. Карта — общий словарь продукта для людей и агентов: когда человек говорит «та штука в левом сайдбаре», агент по карте понимает, о чём речь.
+Карту флоу строим по шагам, чтобы на большом проекте ничего не потерялось. Сейчас нужна только ОПИСЬ: какие фичи есть у пользователя и в какие области продукта они группируются. Пути и шаги НЕ описывай — их подробно опишут отдельные агенты по областям.
 
-{task}
+Чек-лист точек входа, найденный автоматически по коду (маршруты, экраны, меню, API), — JSON: {checklist}
+Каждая точка входа из чек-листа должна попасть в entries какой-то фичи или в ignored с причиной (служебная, редирект, отладка). Дополнительно найди фичи без собственного маршрута: диалоги, меню, горячие клавиши, уведомления, фоновые действия, команды CLI.
 
-Как работать:
-1. Изучи проект: маршруты/страницы/экраны, меню и навигацию, диалоги, команды CLI, горячие клавиши, обработчики действий, сторы. Посмотри существующие тесты (unit/e2e/snapshot), скриншоты, видео и сценарии проверки в репозитории.
-2. Фичи называй так, как их назвал бы пользователь («Выбор карты Джокера», «Вход по почте»), не именами компонентов. Группируй в области продукта (areas). Добавь aliases — как ещё люди называют фичу.
-3. Для каждой фичи — 1–3 пути (paths): цепочка шагов, каждый шаг — screen (где пользователь), action (что делает), result (что видит после), entities (имена компонентов/функций/сторов, через которые идёт шаг), files (пути от корня репозитория).
-4. proofs — только то, что реально есть в репозитории: тесты (reference = путь к файлу или команда запуска), скриншоты/видео (путь). covers — id шагов, которые доказательство покрывает (пусто = вся фича). at не заполняй. Если доказательств нет — оставь proofs пустым: это честно и видно на карте.
-5. Не меняй код проекта, ничего не коммить и не пуш. Пиши только этот один файл.
-6. Охват: все заметные пользователю фичи (обычно 8–40). Мелкие детали реализации не нужны.
+{mode}
 
-Формат файла — YAML ровно по этой схеме:
+Охват: все заметные пользователю фичи (на большом проекте это 30–150). Фича — то, что человек делает или видит ради результата; одна страница может давать несколько фич, одна фича — идти через несколько страниц.
 
-version: 1
-project: <имя проекта>
-areas:
-  - {{id: rewards, title: Награды}}
-features:
-  - id: rewards.joker-pick
-    title: Выбор карты Джокера
-    area: rewards
-    summary: Пользователь выбирает карту, и она летит в коллекцию
-    aliases: [джокер, диалог джокера]
-    paths:
-      - id: from-daily
-        title: Из ежедневной карты
-        steps:
-          - id: open
-            screen: Rewards Hub
-            action: Нажать «Выбрать Джокера» на ежедневной карте
-            result: Открывается диалог выбора
-            entities: [GlobalDailyCard, JokerPickDialog]
-            files: [apps/web/src/lib/components/RewardsHub/GlobalDailyCard.tsx]
-          - id: pick
-            screen: Диалог выбора Джокера
-            action: Выбрать карту и закрыть диалог
-            result: Карта летит в хаб и появляется в коллекции
-            entities: [JokerPickDialog, takeFlight]
-            files: [apps/web/src/lib/components/RewardsHub/JokerPickDialog.tsx]
-    proofs:
-      - {{kind: test, title: Диалог выбора, reference: apps/web/src/lib/components/RewardsHub/JokerPickDialog.test.tsx, covers: [pick]}}
+{rules}
 
-kind в proofs: test | screenshot | video | cli | manual.
-В конце коротко ответь: сколько областей, фич, путей и доказательств, и какие фичи остались без доказательств."#,
+Запиши результат в {out}:
+
+{{
+  "areas": [{{"id": "rewards", "title": "Награды"}}],
+  "upsert": [
+    {{
+      "id": "rewards.joker-pick",
+      "title": "Выбор карты Джокера",
+      "area": "rewards",
+      "summary": "Пользователь выбирает карту, и она летит в коллекцию",
+      "aliases": ["джокер"],
+      "entries": ["/rewards/[id]", "apps/web/src/lib/components/RewardsHub/JokerPickDialog.tsx"],
+      "status": "draft"
+    }}
+  ],
+  "remove": [],
+  "ignored": [{{"entry": "/debug/flags", "reason": "отладочная страница"}}]
+}}
+
+В конце коротко ответь: сколько областей и фич, сколько точек входа ушло в ignored."#,
         repo = repo.display(),
+        checklist = checklist.display(),
+        rules = RULES,
+        out = out.display(),
+    )
+}
+
+/// Pass 2: one area batch, described thoroughly.
+pub fn details_prompt(repo: &Path, map: &FlowMap, batch: &flows::Batch) -> String {
+    let out = parts_dir(repo).join(format!("{}.json", batch.id));
+    let list: Vec<String> = batch
+        .features
+        .iter()
+        .filter_map(|id| map.feature(id))
+        .map(|f| format!("- {} · «{}» · {}\n  точки входа: {}", f.id, f.title, f.summary, if f.entries.is_empty() { "—".into() } else { f.entries.join(", ") }))
+        .collect();
+    format!(
+        r#"[iv3 flows] Детали фич проекта {repo}: «{title}» ({n} фич) — проход 2, одна пачка.
+
+Опиши подробно ТОЛЬКО эти фичи (остальные описывают другие агенты):
+{list}
+
+Для каждой фичи: 1–3 пути (paths) — цепочка шагов, каждый шаг: screen (где пользователь), action (что делает), result (что видит после), entities (имена компонентов/функций/сторов, через которые идёт шаг), files (пути от корня репозитория). Пройди по коду от точек входа, не угадывай. proofs — только реально существующие тесты/скриншоты/видео в репозитории (reference = путь или команда, covers = id шагов; at не заполняй); нет доказательств — пустой список. Если фича на деле две — можно добавить ещё одну фичу в той же области с новым id. id из списка не меняй.
+
+{rules}
+
+Запиши результат в {out}:
+
+{{
+  "upsert": [
+    {{
+      "id": "<id из списка>",
+      "title": "…",
+      "area": "…",
+      "summary": "…",
+      "aliases": [],
+      "entries": [],
+      "paths": [
+        {{
+          "id": "from-daily",
+          "title": "Из ежедневной карты",
+          "steps": [
+            {{"id": "open", "screen": "Rewards Hub", "action": "Нажать «Выбрать Джокера»", "result": "Открывается диалог", "entities": ["GlobalDailyCard"], "files": ["apps/web/src/…/GlobalDailyCard.tsx"]}}
+          ]
+        }}
+      ],
+      "proofs": [{{"kind": "test", "title": "Диалог выбора", "reference": "apps/web/src/…/JokerPickDialog.test.tsx", "covers": ["open"]}}]
+    }}
+  ]
+}}
+
+kind в proofs: test | screenshot | video | cli | manual. В конце одной строкой: сколько путей и доказательств описал."#,
+        repo = repo.display(),
+        title = batch.title,
+        n = batch.features.len(),
+        list = list.join("\n"),
+        rules = RULES,
+        out = out.display(),
+    )
+}
+
+/// Pass 3: match tests, stories and media to features and steps.
+pub fn proofs_prompt(repo: &Path, map: &FlowMap, inv: &Inventory, media: &[PathBuf]) -> String {
+    let out = parts_dir(repo).join("proofs.json");
+    let features: Vec<String> = map
+        .features
+        .iter()
+        .map(|f| {
+            let steps: Vec<String> = f.paths.iter().flat_map(|p| p.steps.iter().map(|s| format!("{} ({})", s.id, s.action))).collect();
+            format!("- {} «{}»: шаги {}; сейчас доказательств: {}", f.id, f.title, steps.join("; "), f.proofs.len())
+        })
+        .collect();
+    let take = |v: &[String], n: usize| v.iter().take(n).cloned().collect::<Vec<_>>().join("\n");
+    format!(
+        r#"[iv3 flows] Доказательства для карты флоу проекта {repo} — проход 3.
+
+Карта: {map}. Сопоставь доказательства с фичами и шагами: что реально проверяет, что фича работает.
+
+Фичи:
+{features}
+
+Тесты ({tests_n}):
+{tests}
+
+Storybook ({stories_n}):
+{stories}
+
+Скриншоты и видео прошлых сессий ({media_n}):
+{media}
+
+Для каждой фичи, у которой есть хоть одно доказательство, дай ПОЛНЫЙ список её доказательств (включая уже указанные, если они верны): kind (test | screenshot | video | cli | manual), title, reference (путь или команда), covers (id шагов; пусто = вся фича). Открой тест и убедись, что он правда проверяет эту фичу. at не заполняй. Фичи без доказательств не перечисляй.
+
+{rules}
+
+Запиши результат в {out}:
+
+{{
+  "features": [
+    {{"feature": "rewards.joker-pick", "proofs": [{{"kind": "test", "title": "Диалог выбора", "reference": "apps/web/…/JokerPickDialog.test.tsx", "covers": ["pick"]}}]}}
+  ]
+}}
+
+В конце одной строкой: у скольких фич нашлись доказательства."#,
+        repo = repo.display(),
+        map = flows::path(repo).display(),
+        features = features.join("\n"),
+        tests_n = inv.tests.len(),
+        tests = if inv.tests.is_empty() { "—".into() } else { take(&inv.tests, 300) },
+        stories_n = inv.stories.len(),
+        stories = if inv.stories.is_empty() { "—".into() } else { take(&inv.stories, 150) },
+        media_n = media.len(),
+        media = if media.is_empty() { "—".into() } else { media.iter().map(|m| m.display().to_string()).collect::<Vec<_>>().join("\n") },
+        rules = RULES,
+        out = out.display(),
+    )
+}
+
+/// Pass 4: entry points the map still misses.
+pub fn cover_prompt(repo: &Path, uncovered: &[&EntryPoint], key: &str) -> String {
+    let out = parts_dir(repo).join(format!("{key}.json"));
+    let groups = flowscan::by_area(uncovered);
+    let list: Vec<String> = groups.iter().map(|(area, items)| format!("{area}:\n  - {}", items.join("\n  - "))).collect();
+    format!(
+        r#"[iv3 flows] Сверка покрытия карты флоу проекта {repo} — проход 4.
+
+Карта: {map}. Эти точки входа ({n}) не попали ни в одну фичу:
+{list}
+
+Для каждой реши одно:
+- она часть существующей фичи → в "attach": {{"feature": "<id>", "entries": ["<точка входа>"]}};
+- это новая фича → в "upsert": полная фича (id, title, area из существующих областей, summary, entries, paths со steps, proofs) — как в карте;
+- она не нужна на карте (служебная, редирект, отладка) → в "ignored": {{"entry": "<точка входа>", "reason": "…"}}.
+Не переписывай существующие фичи целиком — только attach.
+
+{rules}
+
+Запиши результат в {out}: {{"upsert": [], "attach": [], "ignored": []}}. В конце одной строкой: сколько привязал, добавил, исключил."#,
+        repo = repo.display(),
+        map = flows::path(repo).display(),
+        n = uncovered.len(),
+        list = list.join("\n"),
+        rules = RULES,
+        out = out.display(),
     )
 }
 
@@ -655,7 +1552,7 @@ impl FlowsView {
         });
         let pending = self.pending().len();
         let has_map = self.map.is_some();
-        let building = self.building.is_some();
+        let building = self.is_building();
         v_flex()
             .px(px(28.))
             .pt(px(22.))
@@ -708,14 +1605,52 @@ impl FlowsView {
                                 .icon(IconName::RefreshCw)
                                 .loading(building)
                                 .label(match (building, has_map) {
-                                    (true, _) => "Агент строит карту…",
+                                    (true, _) => "Карта строится…",
                                     (false, true) => "Обновить карту",
                                     (false, false) => "Построить карту",
                                 })
                                 .on_click(cx.listener(|this, _, _, cx| this.build(cx))),
                         )
+                    })
+                    .when(building, |d| {
+                        d.child(
+                            PressButton::new("flows-stop")
+                                .small()
+                                .icon(IconName::Close)
+                                .label("Остановить")
+                                .on_click(cx.listener(|this, _, _, cx| this.stop_build(cx))),
+                        )
                     }),
             )
+            .when_some(self.lag.clone().filter(|_| !building), |d, lag| {
+                d.child(
+                    h_flex()
+                        .gap(px(10.))
+                        .px(px(12.))
+                        .py(px(8.))
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(ui::mix(p.amber.solid, p.border, 0.5))
+                        .bg(ui::mix(p.amber.soft, p.surface, 0.6))
+                        .child(Icon::new(IconName::TriangleAlert).small().text_color(p.amber.text))
+                        .child(
+                            div().flex_1().min_w_0().text_size(px(13.)).text_color(p.fg).child(format!(
+                                "Карта отстала{} · изменено файлов карты: {}",
+                                if lag.commits > 0 { format!(" на {} {}", lag.commits, commits_word(lag.commits)) } else { " (незакоммиченные правки)".into() },
+                                lag.relevant.len()
+                            )),
+                        )
+                        .child(ui::mono(lag.relevant.iter().take(3).cloned().collect::<Vec<_>>().join(", "), theme).max_w(px(360.)).truncate().text_color(p.muted))
+                        .child(
+                            PressButton::new("flows-sync")
+                                .primary()
+                                .small()
+                                .icon(IconName::RefreshCw)
+                                .label("Синхронизировать")
+                                .on_click(cx.listener(|this, _, _, cx| this.sync(cx))),
+                        ),
+                )
+            })
             .child(self.render_projects(p, theme, cx))
     }
 
@@ -764,13 +1699,14 @@ impl FlowsView {
             )
             .into_any_element();
         }
-        if let Some(b) = &self.building {
-            if self.map.is_none() || b.update {
-                // Keep the old map visible while it updates; show progress over it.
-                if self.map.is_none() {
-                    return self.render_building(p, theme).into_any_element();
-                }
-            }
+        if self.pipeline.is_some() && self.map.is_none() {
+            // Nothing merged yet: the pipeline is the page.
+            return v_flex()
+                .size_full()
+                .items_center()
+                .pt(px(60.))
+                .child(div().w(px(760.)).child(self.render_pipeline(p, theme, cx)))
+                .into_any_element();
         }
         let Some(map) = self.map.clone() else {
             return v_flex()
@@ -800,34 +1736,212 @@ impl FlowsView {
         if !self.placed && self.viewport.get().is_some() {
             self.place();
         }
-        h_flex()
+        let strip = self.pipeline.is_some().then(|| self.render_pipeline(p, theme, cx));
+        v_flex()
             .size_full()
-            .child(div().flex_1().min_w_0().h_full().relative().child(self.render_canvas(&map, &lay, p, theme, cx)))
-            .when_some(self.selected.clone(), |d, sel| d.child(self.render_panel(&map, sel, p, theme, cx)))
+            .when_some(strip, |d, strip| d.child(div().px(px(20.)).pt(px(12.)).pb(px(8.)).child(strip)))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(div().flex_1().min_w_0().h_full().relative().child(self.render_canvas(&map, &lay, p, theme, cx)))
+                    .when_some(self.selected.clone(), |d, sel| d.child(self.render_panel(&map, sel, p, theme, cx))),
+            )
             .into_any_element()
     }
 
-    fn render_building(&self, p: &Palette, theme: &Theme) -> impl IntoElement {
-        let b = self.building.as_ref().expect("building");
-        let secs = b.started.elapsed().as_secs();
-        v_flex().size_full().items_center().justify_center().child(
-            ui::frame("flows-building", p).w(px(520.)).child(
+    /// Pipeline progress: stages, area batches, coverage.
+    fn render_pipeline(&self, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let Some(pipe) = &self.pipeline else { return div().into_any_element() };
+        let running = pipe.running();
+        let secs = pipe.finished_at.map_or(pipe.started.elapsed().as_secs(), |f| (f - pipe.started_at).num_seconds().max(0) as u64);
+        let done_batches = pipe.batches.iter().filter(|b| matches!(b.state, BatchState::Done(_))).count();
+        let failed = pipe.batches.iter().filter(|b| matches!(b.state, BatchState::Failed(_))).count();
+        let title = match (running, pipe.stopped, &pipe.error, pipe.stage) {
+            (_, _, Some(_), _) => "Карта не достроена",
+            (_, true, _, _) => "Построение остановлено",
+            (true, ..) if pipe.update => "Обновляю карту флоу",
+            (true, ..) => "Строю карту флоу",
+            _ => "Карта построена",
+        };
+        let stage_chip = |stage: Stage| {
+            let order = |s: Stage| Stage::PIPELINE.iter().position(|x| *x == s).unwrap_or(4);
+            let (cur, me) = (order(pipe.stage), order(stage));
+            let state = if pipe.stage == Stage::Done || me < cur {
+                if stage == Stage::Details && failed > 0 { 3 } else { 2 }
+            } else if me == cur {
+                if pipe.error.is_some() { 3 } else if running { 1 } else { 0 }
+            } else {
+                0
+            };
+            let label = match stage {
+                Stage::Details if !pipe.batches.is_empty() => format!("Детали · {done_batches} из {}", pipe.batches.len()),
+                Stage::Coverage if pipe.stage == Stage::Done => {
+                    if pipe.uncovered.is_empty() { "Сверка · всё покрыто".into() } else { format!("Сверка · не покрыто {}", pipe.uncovered.len()) }
+                }
+                s => s.title().to_owned(),
+            };
+            let (bg, fg, icon): (Hsla, Hsla, AnyElement) = match state {
+                1 => (p.blue.soft, p.blue.text, Spinner::new().xsmall().color(p.blue.solid).into_any_element()),
+                2 => (p.green.soft, p.green.text, Icon::new(IconName::CircleCheck).xsmall().text_color(p.green.solid).into_any_element()),
+                3 => (p.red.soft, p.red.text, Icon::new(IconName::TriangleAlert).xsmall().text_color(p.red.solid).into_any_element()),
+                _ => (p.surface2, p.faint, div().size(px(10.)).rounded_full().border_1().border_dashed().border_color(p.faint).into_any_element()),
+            };
+            h_flex().h(px(26.)).px(px(9.)).gap(px(6.)).rounded(px(13.)).bg(bg).text_size(px(12.)).text_color(fg).child(icon).child(label)
+        };
+        let arrow = || div().text_size(px(12.)).text_color(p.faint).child("→");
+        let jobs: Vec<(String, u64, String)> = pipe
+            .jobs
+            .iter()
+            .map(|j| {
+                let who = match j.key.as_str() {
+                    "inventory" => "Опись".to_owned(),
+                    "proofs" => "Доказательства".to_owned(),
+                    k if k.starts_with("cover-") => "Сверка".to_owned(),
+                    k => pipe.batches.iter().find(|b| b.batch.id == k).map(|b| b.batch.title.clone()).unwrap_or_else(|| k.to_owned()),
+                };
+                (who, j.started.elapsed().as_secs(), j.steps.last().cloned().unwrap_or_else(|| "запускается…".into()))
+            })
+            .collect();
+        let tiles = pipe.batches.iter().map(|run| {
+            let id = run.batch.id.clone();
+            let (bg, border, badge): (Hsla, Hsla, AnyElement) = match &run.state {
+                BatchState::Waiting => (p.surface, p.border, ui::mono("ждёт", theme).text_color(p.faint).into_any_element()),
+                BatchState::Running => (
+                    ui::mix(p.blue.soft, p.surface, 0.5),
+                    ui::mix(p.blue.solid, p.border, 0.5),
+                    h_flex().gap(px(4.)).child(Spinner::new().xsmall().color(p.blue.solid)).child(ui::mono("идёт", theme).text_color(p.blue.text)).into_any_element(),
+                ),
+                BatchState::Done(secs) => (p.surface, ui::mix(p.green.solid, p.border, 0.4), ui::mono(format!("✓ {}", crate::live_card::mmss(*secs)), theme).text_color(p.green.text).into_any_element()),
+                BatchState::Failed(_) => (
+                    ui::mix(p.red.soft, p.surface, 0.5),
+                    ui::mix(p.red.solid, p.border, 0.5),
+                    PressButton::new(SharedString::from(format!("flows-retry-{id}")))
+                        .xsmall()
+                        .icon(IconName::RefreshCw)
+                        .label("Повторить")
+                        .on_click(cx.listener(move |this, _, _, cx| this.retry_batch(id.clone(), cx)))
+                        .into_any_element(),
+                ),
+            };
+            let error = match &run.state {
+                BatchState::Failed(e) => Some(e.clone()),
+                _ => None,
+            };
+            v_flex()
+                .w(px(170.))
+                .p(px(8.))
+                .gap(px(4.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(border)
+                .bg(bg)
+                .child(div().truncate().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(p.ink).child(run.batch.title.clone()))
+                .child(h_flex().gap(px(6.)).child(ui::mono(format!("{} фич", run.batch.features.len()), theme).text_color(p.muted)).child(div().flex_1()).child(badge))
+                .when_some(error, |d, e| d.child(div().text_size(px(11.)).text_color(p.red.text).line_height(px(14.)).max_h(px(28.)).overflow_hidden().child(e)))
+        });
+        let uncovered = flowscan::by_area(&pipe.uncovered.iter().collect::<Vec<_>>());
+        let show_cover = pipe.stage == Stage::Done && !pipe.uncovered.is_empty();
+        ui::frame("flows-pipeline", p)
+            .child(
                 ui::inner(p)
-                    .p(px(16.))
+                    .p(px(14.))
                     .gap(px(10.))
                     .child(
                         h_flex()
                             .gap(px(10.))
-                            .child(Spinner::new().small().color(p.blue.solid))
-                            .child(div().flex_1().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(p.ink).child(if b.update { "Обновляю карту флоу" } else { "Строю карту флоу" }))
-                            .child(ui::mono(crate::live_card::mmss(secs), theme).text_color(p.blue.text)),
+                            .when(running, |d| d.child(Spinner::new().small().color(p.blue.solid)))
+                            .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(p.ink).child(title))
+                            .child(ui::mono(format!("сборка #{} · {}", pipe.n, pipe.who), theme).text_color(p.faint))
+                            .child(div().flex_1())
+                            .child(ui::mono(crate::live_card::mmss(secs), theme).text_color(if running { p.blue.text } else { p.muted }))
+                            .when(!running, |d| {
+                                d.child(
+                                    PressButton::new("flows-pipeline-close")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::Close)
+                                        .tooltip("Скрыть")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.pipeline = None;
+                                            cx.notify();
+                                        })),
+                                )
+                            }),
                     )
-                    .child(div().text_size(px(12.5)).text_color(p.muted).child(format!("{} изучает маршруты, экраны и тесты проекта", b.who)))
-                    .children(b.steps.iter().rev().take(6).collect::<Vec<_>>().into_iter().rev().map(|s| {
-                        h_flex().gap(px(8.)).child(Icon::new(IconName::CircleCheck).xsmall().text_color(p.muted)).child(ui::mono(s.clone(), theme).truncate().text_color(p.muted))
-                    })),
-            ),
-        )
+                    .child(
+                        h_flex()
+                            .gap(px(6.))
+                            .flex_wrap()
+                            .child(stage_chip(Stage::Inventory))
+                            .child(arrow())
+                            .child(stage_chip(Stage::Details))
+                            .child(arrow())
+                            .child(stage_chip(Stage::Proofs))
+                            .child(arrow())
+                            .child(stage_chip(Stage::Coverage)),
+                    )
+                    .when(pipe.stage == Stage::Inventory && pipe.inventory.is_none() && running, |d| {
+                        d.child(div().text_size(px(12.5)).text_color(p.muted).child("Ищу точки входа по коду: маршруты, экраны, меню, тесты…"))
+                    })
+                    .when_some(pipe.inventory.as_ref(), |d, inv| {
+                        d.child(
+                            div().text_size(px(12.5)).text_color(p.muted).child(format!(
+                                "Чек-лист покрытия: {} точек входа · {} тестов{}",
+                                inv.entries.len(),
+                                inv.tests.len(),
+                                if inv.stacks.is_empty() { String::new() } else { format!(" · {}", inv.stacks.join(", ")) }
+                            )),
+                        )
+                    })
+                    .children(jobs.into_iter().map(|(who, secs, step)| {
+                        h_flex()
+                            .gap(px(8.))
+                            .child(Spinner::new().xsmall().color(p.blue.solid))
+                            .child(div().w(px(160.)).truncate().text_size(px(12.5)).text_color(p.fg).child(who))
+                            .child(ui::mono(crate::live_card::mmss(secs), theme).text_color(p.blue.text))
+                            .child(ui::mono(step, theme).flex_1().min_w_0().truncate().text_color(p.muted))
+                    }))
+                    .when(!pipe.batches.is_empty(), |d| d.child(h_flex().flex_wrap().gap(px(8.)).children(tiles)))
+                    .when(show_cover, |d| {
+                        d.child(
+                            v_flex()
+                                .gap(px(6.))
+                                .p(px(10.))
+                                .rounded(px(8.))
+                                .bg(ui::mix(p.amber.soft, p.surface, 0.5))
+                                .child(
+                                    h_flex()
+                                        .gap(px(8.))
+                                        .child(div().flex_1().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(p.amber.text).child(format!(
+                                            "Не покрыто картой: {} точек входа",
+                                            pipe.uncovered.len()
+                                        )))
+                                        .child(
+                                            PressButton::new("flows-cover-more")
+                                                .xsmall()
+                                                .icon(IconName::Plus)
+                                                .label("Дополнить")
+                                                .on_click(cx.listener(|this, _, _, cx| this.cover_more(cx))),
+                                        ),
+                                )
+                                .children(uncovered.into_iter().take(8).map(|(area, items)| {
+                                    let more = items.len().saturating_sub(4);
+                                    v_flex()
+                                        .gap(px(2.))
+                                        .child(ui::mono(area, theme).text_color(p.muted))
+                                        .children(items.into_iter().take(4).map(|i| ui::mono(i, theme).truncate().text_color(p.fg)))
+                                        .when(more > 0, |d| d.child(ui::mono(format!("… ещё {more}"), theme).text_color(p.faint)))
+                                })),
+                        )
+                    })
+                    .when(pipe.stage == Stage::Done && pipe.uncovered.is_empty() && pipe.error.is_none() && !pipe.stopped, |d| {
+                        d.child(div().text_size(px(12.5)).text_color(p.green.text).child("Все точки входа из чек-листа есть на карте (или исключены с причиной)."))
+                    })
+                    .when_some(pipe.error.clone(), |d, e| d.child(ui::badge(e, p.red))),
+            )
+            .into_any_element()
     }
 
     fn render_canvas(&self, map: &FlowMap, lay: &Layout, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -950,7 +2064,7 @@ impl FlowsView {
         let features = lay.features.iter().map(|&(fi, r)| {
             let f = &map.features[fi];
             let fresh = self.fresh.get(fi).copied().unwrap_or(Freshness::Missing);
-            let (tone, label) = freshness_tone(fresh, p);
+            let (tone, label) = if f.status == "draft" { (p.blue, "описывается") } else { freshness_tone(fresh, p) };
             let is_sel = selected == Some(fi);
             let was_touched = touched.keys().any(|(feat, _)| feat == &f.id);
             div()
@@ -1175,7 +2289,6 @@ impl FlowsView {
             .child(h_flex().gap(px(4.)).child(div().size(px(8.)).rounded_full().bg(p.blue.solid)).child("шли недавние сессии"))
             .child(ui::mono("тащи — двигать · ⌘ + колесо — масштаб · двойной клик — вписать", theme).text_size(px(10.5)).text_color(p.faint));
         let grabbing = self.drag.is_some_and(|d| d.moved);
-        let building = self.building.as_ref().map(|b| (b.started.elapsed().as_secs(), b.steps.last().cloned().unwrap_or_default()));
 
         div()
             .id("flows-canvas")
@@ -1250,24 +2363,6 @@ impl FlowsView {
             .children(proofs)
             .when(lay.features.is_empty(), |d| {
                 d.child(div().absolute().top(px(60.)).left(px(40.)).text_size(px(13.)).text_color(p.muted).child("Ничего не нашлось"))
-            })
-            .when_some(building, |d, (secs, step)| {
-                d.child(
-                    h_flex()
-                        .absolute()
-                        .top(px(10.))
-                        .left(px(12.))
-                        .gap(px(8.))
-                        .px(px(10.))
-                        .py(px(6.))
-                        .rounded(px(8.))
-                        .border_1()
-                        .border_color(ui::mix(p.blue.solid, p.border, 0.5))
-                        .bg(p.surface)
-                        .child(Spinner::new().xsmall().color(p.blue.solid))
-                        .child(div().text_size(px(12.)).text_color(p.fg).child("Агент обновляет карту"))
-                        .child(ui::mono(format!("{} · {}", crate::live_card::mmss(secs), step), theme).max_w(px(320.)).truncate().text_color(p.muted)),
-                )
             })
             .when_some(self.build_error.clone(), |d, e| d.child(div().absolute().top(px(10.)).left(px(12.)).child(ui::badge(e, p.red))))
             .child(legend)
@@ -1521,10 +2616,82 @@ mod tests {
     }
 
     #[core::prelude::v1::test]
-    fn prompt_carries_marker_and_schema() {
-        let p = prompt(Path::new("/tmp/demo"), false);
-        assert!(p.starts_with("[iv3 flows]"));
-        assert!(p.contains("/tmp/demo/.stepan_verify/flows.yaml") && p.contains("proofs:") && p.contains("covers"));
-        assert!(prompt(Path::new("/tmp/demo"), true).contains("ОБНОВИ"));
+    fn pass_prompts_carry_marker_and_outputs() {
+        let repo = Path::new("/tmp/demo");
+        let inv = inventory_prompt(repo, Path::new("/tmp/demo/.stepan_verify/flows.parts/checklist.json"), false);
+        assert!(inv.starts_with("[iv3 flows]") && inv.contains("flows.parts/inventory.json") && inv.contains("checklist.json") && inv.contains("\"status\": \"draft\""));
+        assert!(inventory_prompt(repo, Path::new("x"), true).contains("remove"));
+        let m = map();
+        let batch = flows::Batch { id: "a-1".into(), title: "Награды".into(), features: vec!["a1".into()] };
+        let d = details_prompt(repo, &m, &batch);
+        assert!(d.starts_with("[iv3 flows]") && d.contains("flows.parts/a-1.json") && d.contains("- a1 ") && !d.contains("- b1 "));
+        let pr = proofs_prompt(repo, &m, &Inventory { tests: vec!["x.test.ts".into()], ..Default::default() }, &[]);
+        assert!(pr.starts_with("[iv3 flows]") && pr.contains("x.test.ts") && pr.contains("proofs.json"));
+        let e = EntryPoint { kind: flowscan::EntryKind::Route, id: "/z".into(), file: "app/z/page.tsx".into(), area: "z".into() };
+        let c = cover_prompt(repo, &[&e], "cover-1");
+        assert!(c.starts_with("[iv3 flows]") && c.contains("/z") && c.contains("cover-1.json") && c.contains("attach"));
+    }
+
+    #[core::prelude::v1::test]
+    fn inventory_then_details_merge() {
+        let mut m = map();
+        let inv: FlowProposal = serde_yaml::from_str(
+            "areas: [{id: a, title: Награды}]\nupsert:\n  - {id: a1, title: Новое имя, area: a, entries: [/a]}\n  - {id: c1, title: Новая, area: a, entries: [/c], status: draft}\nignored: [{entry: /debug, reason: отладка}]",
+        )
+        .unwrap();
+        merge_inventory(&mut m, &inv);
+        let a1 = m.feature("a1").unwrap();
+        assert_eq!(a1.title, "Новое имя");
+        assert_eq!(a1.paths.len(), 2, "existing paths kept by the inventory pass");
+        assert!(a1.status.is_empty());
+        assert_eq!(m.feature("c1").unwrap().status, "draft");
+        assert_eq!(m.ignored.len(), 1);
+        let details: FlowProposal =
+            serde_yaml::from_str("upsert:\n  - id: c1\n    title: Новая\n    paths: [{id: p, steps: [{id: s, action: go, files: [app/c/page.tsx]}]}]").unwrap();
+        merge_details(&mut m, &details, false);
+        let c1 = m.feature("c1").unwrap();
+        assert!(c1.status.is_empty() && c1.paths.len() == 1);
+        assert_eq!(c1.entries, vec!["/c".to_owned()], "entries survive the detail pass");
+        assert_eq!(c1.area, "a", "area kept when the agent omits it");
+    }
+
+    #[core::prelude::v1::test]
+    fn pass_results_parse_json_yaml_and_fenced() {
+        let json = r#"{"upsert": [{"id": "x", "entries": ["/catalog/[id]", "app/(shop)/catalog/[id]/page.tsx"]}]}"#;
+        let p: FlowProposal = read_part(json).unwrap();
+        assert_eq!(p.upsert[0].entries[0], "/catalog/[id]");
+        let fenced = format!("```json\n{json}\n```");
+        assert!(read_part::<FlowProposal>(&fenced).is_ok());
+        assert!(read_part::<FlowProposal>("upsert:\n  - id: y").is_ok(), "YAML still accepted");
+        // The exact failure seen live: an unquoted route with brackets in a YAML flow list.
+        let bad = "upsert:\n  - id: z\n    entries: [/catalog/[id], \"app/x.tsx\"]";
+        assert!(check_part("catalog-1", bad).is_err());
+        assert!(repair_prompt(Path::new("/r/.stepan_verify/flows.parts/catalog-1.json"), "boom").starts_with("[iv3 flows]"));
+    }
+
+    #[core::prelude::v1::test]
+    fn deleted_page_touches_features_that_lead_to_it() {
+        let repo = std::env::temp_dir().join(format!("sv-del-{}", std::process::id()));
+        let _ = fs::create_dir_all(repo.join("app/auth/login"));
+        let _ = fs::write(repo.join("app/auth/login/page.tsx"), "x");
+        let changed = vec!["app/(auth)/auth/reset/page.tsx".to_owned(), "app/auth/login/page.tsx".to_owned(), "lib/a.ts".to_owned()];
+        assert_eq!(deleted_routes(&repo, &changed), vec!["/auth/reset".to_owned()]);
+        let mut login = feature("auth.login", "a", 1, 1, 0);
+        login.paths[0].steps[0].result = "Открывается страница /auth/reset".into();
+        assert!(mentions(&login, "/auth/reset"));
+        assert!(!mentions(&login, "/auth/res"));
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[core::prelude::v1::test]
+    fn cover_part_attaches_adds_and_ignores() {
+        let mut m = map();
+        let part: CoverPart = serde_yaml::from_str(
+            "attach: [{feature: b1, entries: [/b/x]}]\nupsert: [{id: n1, title: Ещё, area: b}]\nignored: [{entry: /old, reason: редирект}]",
+        )
+        .unwrap();
+        assert_eq!(merge_cover(&mut m, part), 3);
+        assert!(m.feature("b1").unwrap().entries.contains(&"/b/x".to_owned()));
+        assert!(m.feature("n1").is_some() && m.ignored.iter().any(|i| i.entry == "/old"));
     }
 }

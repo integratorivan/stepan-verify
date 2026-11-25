@@ -148,6 +148,29 @@ pub fn render(app: &AppView, _: &mut Window, cx: &mut Context<AppView>) -> impl 
         }),
     );
 
+    let on_off = |key: &'static str, current: bool, apply: fn(&mut stepan_verify_core::Config, bool), p: &Palette, cx: &mut Context<AppView>| {
+        segmented(
+            p,
+            [(true, "вкл"), (false, "выкл")].map(|(on, label)| {
+                let active = current == on;
+                segment(SharedString::from(format!("{key}-{label}")), active, p)
+                    .text_size(px(13.))
+                    .font_weight(if active { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+                    .text_color(if active { p.ink } else { p.muted })
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        settings::update(cx, move |c| apply(c, on));
+                        if key == "flows-skill" {
+                            crate::flows::sync_skill(&this.home, on);
+                        }
+                    }))
+                    .into_any_element()
+            }),
+        )
+    };
+    let flows_skill = on_off("flows-skill", config.flows.skill, |c, on| c.flows.skill = on, &p, cx);
+    let flows_auto = on_off("flows-auto", config.flows.auto_sync, |c, on| c.flows.auto_sync = on, &p, cx);
+
     let brief = segmented(
         &p,
         [(true, "вкл"), (false, "выкл")].map(|(on, label)| {
@@ -329,6 +352,18 @@ pub fn render(app: &AppView, _: &mut Window, cx: &mut Context<AppView>) -> impl 
                 media_modes,
                 &p,
             ))
+            .child(row(
+                "Скилл карты флоу",
+                "Скилл stepan-verify-flows для всех агентов Claude и Codex: читать карту флоу проекта и обновлять её в конце задачи, если поменялось поведение для пользователя. Ссылки в ~/.claude/skills и ~/.agents/skills; чужие папки с тем же именем не трогаются.",
+                flows_skill,
+                &p,
+            ))
+            .child(row(
+                "Синхронизация карты флоу",
+                "Сама подтягивать карту к коду, когда файлы фич изменились и правки затихли на 2 минуты. Выключено — только плашка «Карта отстала» и кнопка «Синхронизировать» (агенты стоят денег).",
+                flows_auto,
+                &p,
+            ))
             .child(row("Шрифт текста", "Интерфейс, документы, сообщения. Instrument Sans встроен в Stepan и есть всегда; остальные — из шрифтов этого Mac.", text_fonts, &p))
             .child(row("Шрифт кода", "Код, диффы, пути, команды, метки. Моноширинный — иначе колонки поедут.", mono_fonts, &p))
             .child(row(
@@ -339,13 +374,13 @@ pub fn render(app: &AppView, _: &mut Window, cx: &mut Context<AppView>) -> impl 
             ))
             .child(row(
                 "Документы · правила агентам",
-                "Каждая сессия из Stepan получает правила полки (разборы, решения, фактура проекта, вопросы тебе) и то, что полка уже знает о проекте: project.md, решения в силе, открытые вопросы.",
+                "Каждая сессия из Stepan получает память (твои поправки, запреты, как устроен проект), правила полки (разборы, решения, вопросы тебе) и то, что полка уже знает о проекте: решения в силе, открытые вопросы.",
                 brief,
                 &p,
             ))
             .child(row(
                 "Документы · итоги сессий",
-                "Когда сессия затихла, агент той же семьи (модель — как у «Изменений») читает новое в ней и записывает решения, фактуру проекта и открытые вопросы. Чаще всего записывать нечего — тогда он ничего не пишет.",
+                "Когда сессия затихла, агент той же семьи (модель — как у «Изменений») читает новое в ней: твои поправки и фактуру проекта записывает в память, решения и открытые вопросы — на полку. Чаще всего записывать нечего — тогда он ничего не пишет.",
                 distill,
                 &p,
             ))

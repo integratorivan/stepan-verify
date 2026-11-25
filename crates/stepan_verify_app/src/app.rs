@@ -30,6 +30,7 @@ pub enum Page {
     Tasks,
     Flows,
     Docs,
+    Memory,
     Skills,
     Settings,
     Session(usize),
@@ -58,6 +59,7 @@ pub struct Launch {
     project: Option<PathBuf>,
     /// `--build-flows`: start the flow-map agent for that project right away.
     build_flows: bool,
+    sync_flows: bool,
 }
 
 impl Launch {
@@ -80,6 +82,7 @@ impl Launch {
                 "--autopilot" => launch.autopilot = true,
                 "--preview" => launch.preview = args.next().map(|p| std::fs::canonicalize(&p).unwrap_or_else(|_| p.into())),
                 "--build-flows" => launch.build_flows = true,
+                "--sync-flows" => launch.sync_flows = true,
                 "--project" => launch.project = args.next().map(|p| std::fs::canonicalize(&p).unwrap_or_else(|_| p.into())),
                 "--doc" => {
                     launch.doc = args.next();
@@ -90,6 +93,7 @@ impl Launch {
                         Some("tasks") => Some(Page::Tasks),
                         Some("flows") => Some(Page::Flows),
                         Some("docs") => Some(Page::Docs),
+                        Some("memory") => Some(Page::Memory),
                         Some("skills") => Some(Page::Skills),
                         Some("settings") => Some(Page::Settings),
                         _ => Some(Page::Dashboard),
@@ -141,6 +145,7 @@ pub struct AppView {
     docs: Entity<DocsView>,
     flows: Entity<crate::flows::FlowsView>,
     skills_view: Entity<crate::skills::SkillsView>,
+    memory_view: Entity<crate::memory::MemoryView>,
     /// Text and code font pickers on the settings page, made on first visit.
     pub(crate) font_pickers: Option<[Entity<crate::settings_page::FontPicker>; 2]>,
     /// Sessions opened in this window, in opening order.
@@ -186,6 +191,7 @@ impl AppView {
         })
         .detach();
         let skills_view = cx.new(|cx| crate::skills::SkillsView::new(home.clone(), window, cx));
+        let memory_view = cx.new(|cx| crate::memory::MemoryView::new(home.clone(), launch.project.as_deref().and_then(stepan_verify_core::memory::project_of), window, cx));
         cx.subscribe_in(&skills_view, window, |this, _, event: &crate::skills::SkillsEvent, window, cx| match event {
             crate::skills::SkillsEvent::OpenSession(summary) => this.open_session(summary, window, cx),
             crate::skills::SkillsEvent::OpenFile(path) => this.open_preview(path.clone(), None, window, cx),
@@ -198,10 +204,14 @@ impl AppView {
                     this.open_session(&summary, window, cx);
                 }
             }
+            crate::flows::FlowsEvent::LagChanged => cx.notify(),
         })
         .detach();
         if launch.build_flows {
             flows.update(cx, |f, cx| f.build(cx));
+        }
+        if launch.sync_flows {
+            flows.update(cx, |f, cx| f.sync(cx));
         }
         cx.set_global(crate::preview::Opener(cx.entity().downgrade()));
         let mut this = Self {
@@ -218,6 +228,7 @@ impl AppView {
             flows,
             font_pickers: None,
             skills_view,
+            memory_view,
             open_sessions: Vec::new(),
             pickers: Vec::new(),
             launch,
@@ -802,6 +813,7 @@ impl AppView {
         let tasks_count = if waiting > 0 { Some((waiting.to_string(), true)) } else { (open_tasks > 0).then(|| (open_tasks.to_string(), false)) };
         let docs = self.docs.read(cx).count();
         let skills = self.skills_view.read(cx).count().unwrap_or(self.skills.len());
+        let memories = self.memory_view.read(cx).count();
         let live = self.live_sessions(cx);
         let live_count = live.len();
         let limit = crate::settings::config(cx).agents.autopilot_limit;
@@ -877,8 +889,9 @@ impl AppView {
                     .child(Self::nav_label("Рабочее", None, &p, &theme))
                     .child(self.nav_item("Дашборд", IconName::LayoutDashboard, Page::Dashboard, None, cx))
                     .child(self.nav_item("Задачи", IconName::Inbox, Page::Tasks, tasks_count, cx))
-                    .child(self.nav_item("Флоу", Icon::empty().path("icons/route.svg"), Page::Flows, None, cx))
+                    .child(self.nav_item("Флоу", Icon::empty().path("icons/route.svg"), Page::Flows, self.flows.read(cx).lag_badge().map(|n| (n, true)), cx))
                     .child(self.nav_item("Документы", IconName::FileText, Page::Docs, (docs > 0).then(|| (docs.to_string(), false)), cx))
+                    .child(self.nav_item("Память", Icon::empty().path("icons/brain.svg"), Page::Memory, (memories > 0).then(|| (memories.to_string(), false)), cx))
                     .child(self.nav_item("Скиллы", IconName::BookOpen, Page::Skills, (skills > 0).then(|| (skills.to_string(), false)), cx))
                     .child(self.nav_item("Настройки", IconName::Settings2, Page::Settings, None, cx)),
             )
@@ -967,6 +980,7 @@ impl Render for AppView {
             Page::Tasks => crate::board::render(self, window, cx).into_any_element(),
             Page::Docs => self.docs.clone().into_any_element(),
             Page::Flows => self.flows.clone().into_any_element(),
+            Page::Memory => self.memory_view.clone().into_any_element(),
             Page::Skills => self.skills_view.clone().into_any_element(),
             Page::Settings => {
                 crate::settings_page::ensure_pickers(self, window, cx);

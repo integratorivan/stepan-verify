@@ -7306,6 +7306,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "serde_yaml",
  "similar",
  "stepan_verify_agents",
  "stepan_verify_core",

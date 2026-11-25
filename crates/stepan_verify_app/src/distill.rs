@@ -45,6 +45,9 @@ struct PassRecord {
     at: Option<DateTime<Utc>>,
     #[serde(default)]
     wrote: Vec<String>,
+    /// Memory entries the pass added or changed.
+    #[serde(default)]
+    memory: Vec<String>,
     #[serde(default)]
     note: String,
     #[serde(default)]
@@ -175,16 +178,17 @@ fn context_md(input: &ChangesInput, project: Option<&str>, start: usize) -> Stri
 fn prompt(run: &Path, docs_dir: &Path, key: &str) -> String {
     format!(
         "Ты — летописец Stepan. Прочитай `{context}`: это новая часть рабочей сессии агента с пользователем. \
-Сохрани на полку документов то, что переживёт эту сессию, по правилам из твоих инструкций.\n\n\
+Сохрани то, что переживёт эту сессию, по правилам из твоих инструкций: решения и вопросы — на полку документов, поправки пользователя и фактуру проекта — в память.\n\n\
 Ищи только это:\n\
 1. **Решения.** Выбрали подход, библиотеку, схему, отказались от варианта — и понятно почему. `status: accepted`, если пользователь согласился или это уже сделано; `proposed`, если агент предложил, а ответа нет. Мелкие правки по ходу — не решения.\n\
-2. **Фактура проекта.** Как запускать и тестировать, где что лежит, инварианты, грабли, на которые наступили. Дополни `{docs}/project.md` (создай, если нет), не дублируя то, что там уже есть.\n\
-3. **Открытые вопросы.** Агент спросил пользователя о развилке, а ответа в сессии нет — разбор с полем `question`, вариантами и рекомендацией агента. Если вопрос из списка открытых получил ответ — поставь тому документу `status: answered` и запиши решение.\n\n\
+2. **Память: поправки и запреты пользователя.** Пользователь поправил агента, что-то запретил, сказал, как ему нравится («не делай так», «лучше …», «я же просил …»). Каждое такое — одна запись: `stepan_verify memory add \"повелительно, одной мыслью\" --kind dont|rule --quote \"его слова дословно\"`; `--global`, если это про пользователя вообще, а не про этот проект. Это самое ценное в сессии — не пропусти.\n\
+3. **Память: фактура проекта.** Как запускать и тестировать, где что лежит, инварианты, грабли, на которые наступили: `stepan_verify memory add \"…\" --kind fact`. Сначала посмотри, что уже есть (`stepan_verify memory list`), не дублируй; устаревшее поправь `memory edit` или убери `memory rm`.\n\
+4. **Открытые вопросы.** Агент спросил пользователя о развилке, а ответа в сессии нет — разбор с полем `question`, вариантами и рекомендацией агента. Если вопрос из списка открытых получил ответ — поставь тому документу `status: answered` и запиши решение.\n\n\
 Агент сессии мог уже записать документы сам — загляни в `{docs}/` и не дублируй, лучше дополни. \
 Не выдумывай: каждое утверждение должно опираться на context.md. Не пиши отчёт о сессии и пересказ правок. \
 Если записать нечего — ничего не пиши: это нормальный и частый исход.\n\n\
 Во фронтматтере: `author: авто`, `session: {key}`.\n\n\
-В конце обязательно запиши `{result}`: {{\"wrote\": [\"пути созданных и изменённых документов\"], \"note\": \"одна строка: что записал или почему ничего\"}}.",
+В конце обязательно запиши `{result}`: {{\"wrote\": [\"пути созданных и изменённых документов\"], \"memory\": [\"id записей памяти, которые добавил или поправил\"], \"note\": \"одна строка: что записал или почему ничего\"}}.",
         context = run.join("context.md").display(),
         docs = docs_dir.display(),
         result = run.join("result.json").display(),
@@ -332,7 +336,11 @@ fn launch(input: ChangesInput, project: Option<String>, cx: &mut App) {
         cwd: docs_dir.clone(),
         mode: Mode::FullAccess,
         image_cache: Some(home.state().join("images")),
-        env: Vec::new(),
+        // Memory entries it writes are signed «авто» and belong to the session's project, not to its cwd.
+        env: vec![
+            ("STEPAN_VERIFY_AGENT".to_owned(), "авто".to_owned()),
+            ("STEPAN_VERIFY_PROJECT".to_owned(), project.clone().unwrap_or_default()),
+        ],
         model,
         instructions: Some(stepan_verify_core::docs::agent_brief(&home, project.as_deref(), "авто", Some(&key))),
     };
@@ -364,6 +372,8 @@ struct ResultFile {
     #[serde(default)]
     wrote: Vec<String>,
     #[serde(default)]
+    memory: Vec<String>,
+    #[serde(default)]
     note: String,
 }
 
@@ -379,6 +389,7 @@ fn finish(key: &str, error: Option<String>, cx: &mut App) {
         match (&result, error) {
             (Some(r), None) => {
                 pass.wrote = r.wrote.clone();
+                pass.memory = r.memory.clone();
                 pass.note = r.note.clone();
             }
             (_, Some(e)) => pass.error = Some(e),
