@@ -172,8 +172,12 @@ pub fn install(cx: &mut App) {
         let result = cx.background_spawn(async move { replace_bundle(&bundle, &zip).map(|_| bundle) }).await;
         cx.update(|cx| match result {
             Ok(bundle) => {
-                // A fresh process from the new bundle once this one is gone.
-                let _ = Command::new("/bin/sh").arg("-c").arg(format!("sleep 1; open {}", shell_quote(&bundle))).spawn();
+                // A fresh process from the new bundle once this one is gone. A
+                // custom home (test instances) goes along; `open` drops our env.
+                let env = std::env::var_os("STEPAN_VERIFY_HOME")
+                    .map(|h| format!("--env {} ", shell_quote(Path::new(&format!("STEPAN_VERIFY_HOME={}", h.to_string_lossy())))))
+                    .unwrap_or_default();
+                let _ = Command::new("/bin/sh").arg("-c").arg(format!("sleep 1; open -n {env}{}", shell_quote(&bundle))).spawn();
                 cx.quit();
             }
             Err(err) => set(State::Failed(format!("{err:#}")), cx),
