@@ -1,4 +1,4 @@
-//! Settings: agent access mode, default agent, autopilot limit, report model,
+//! Settings: agent access mode, default agent and models, autopilot limit, report model,
 //! document rules and the post-session distiller, fonts, updates.
 
 use gpui_kit::component::{
@@ -70,6 +70,22 @@ pub fn render(app: &AppView, _: &mut Window, cx: &mut Context<AppView>) -> impl 
                 .into_any_element()
         }),
     );
+
+    // «по умолчанию» here = the CLI's own config (~/.claude/settings.json, ~/.codex/config.toml).
+    let agent_models = h_flex().flex_wrap().gap(px(16.)).children([Provider::Claude, Provider::Codex].map(|provider| {
+        h_flex().gap(px(8.)).child(ui::provider_chip(provider, &p, &theme)).child(crate::models::picker(
+            SharedString::from(format!("agent-model-{}", provider.label())),
+            provider,
+            config.agents.model(provider),
+            crate::models::cli_default(provider),
+            move |model, _, cx| {
+                settings::update(cx, move |c| match provider {
+                    Provider::Claude => c.agents.claude_model = model.unwrap_or_default(),
+                    Provider::Codex => c.agents.codex_model = model.unwrap_or_default(),
+                })
+            },
+        ))
+    }));
 
     let limits = h_flex()
         .gap(px(14.))
@@ -335,6 +351,12 @@ pub fn render(app: &AppView, _: &mut Window, cx: &mut Context<AppView>) -> impl 
                 &p,
             ))
             .child(row("Агент по умолчанию", "Кого запускает автопилот для задач без метки agent=codex.", providers, &p))
+            .child(row(
+                "Модель по умолчанию",
+                "На ней агенты берут задачи и стартуют новые сессии, если в задаче не выбрана своя. «По умолчанию» — модель из настроек самого Claude Code или Codex.",
+                agent_models,
+                &p,
+            ))
             .child(row("Автопилот", "Сколько агентов он может держать в работе одновременно.", limits, &p))
             .child(row(
                 "Отчёт «Изменения» · Claude",

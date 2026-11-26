@@ -46,6 +46,8 @@ pub struct Launch {
     open: Option<String>,
     send: Option<String>,
     new: bool,
+    /// Open «Новая задача» at start.
+    new_task: bool,
     start: Option<Provider>,
     cwd: Option<PathBuf>,
     /// Keep the dashboard in front after `--start`.
@@ -73,6 +75,7 @@ impl Launch {
                 "--open" => launch.open = args.next(),
                 "--send" => launch.send = args.next(),
                 "--new" => launch.new = true,
+                "--new-task" => launch.new_task = true,
                 "--start" => {
                     launch.start = match args.next().as_deref() {
                         Some("codex") => Some(Provider::Codex),
@@ -314,6 +317,9 @@ impl AppView {
         if std::mem::take(&mut self.launch.new) {
             self.open_new_session_dialog(window, cx);
         }
+        if std::mem::take(&mut self.launch.new_task) {
+            self.open_new_task_dialog(window, cx);
+        }
         if let (Some(provider), Some(cwd), Some(prompt)) =
             (self.launch.start.take(), self.launch.cwd.take(), self.launch.send.clone())
         {
@@ -550,6 +556,13 @@ impl AppView {
             Ok(task) if status == TaskStatus::Done && task.meta.worktree.is_some() => self.offer_worktree_cleanup(id, true, window, cx),
             Ok(_) => {}
             Err(err) => Self::toast_error(window, err, cx),
+        }
+        self.reload_tasks(cx);
+    }
+
+    pub fn set_task_model(&mut self, id: &str, provider: Provider, model: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(err) = self.board.set_model(id, "me", provider, model) {
+            Self::toast_error(window, err, cx);
         }
         self.reload_tasks(cx);
     }

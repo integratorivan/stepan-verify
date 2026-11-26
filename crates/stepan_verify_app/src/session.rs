@@ -152,7 +152,7 @@ impl SessionView {
             mode: crate::settings::agent_mode(cx),
             image_cache: Some(image_cache()),
             env: Vec::new(),
-            model: None,
+            model: crate::models::settings_default(provider, cx),
         };
         let mut this = Self::new(provider, title, project, spec, None, window, cx);
         this.send_message(stepan_verify_agents::Outgoing { text: prompt, images }, cx);
@@ -182,7 +182,7 @@ impl SessionView {
             mode: crate::settings::agent_mode(cx),
             image_cache: Some(image_cache()),
             env,
-            model: None,
+            model: crate::models::for_task(task, provider, cx),
         };
         let mut this = Self::new(provider, task.meta.title.clone(), project, spec, None, window, cx);
         this.task_id = Some(task.id.clone());
