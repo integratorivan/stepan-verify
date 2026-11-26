@@ -4,7 +4,7 @@ use std::borrow::Cow;
 
 use gpui_kit::*;
 
-gpui_kit::assets::icon_assets!(ExtraIcons, [CircleQuestionMark, ShieldAlert, MessageCircle, Paperclip, Link, Zap, Ellipsis, ListChecks, Pin, Archive, ArchiveRestore, Component, SquareFunction, Anchor, Braces, Settings2, FlaskConical, Globe, Database, Palette, Terminal, Shapes, Scan, Route, Footprints, Image, Video, Hand, Brain, Trash, Pencil, ScrollText, Rocket, AppWindow, MessageSquare, PanelBottom, PanelsTopLeft, PanelRight, ExternalLink, FileCode, GitBranch]);
+gpui_kit::assets::icon_assets!(ExtraIcons, [CircleQuestionMark, ShieldAlert, MessageCircle, Paperclip, Link, Zap, Ellipsis, ListChecks, Pin, Archive, ArchiveRestore, Component, SquareFunction, Anchor, Braces, Settings2, FlaskConical, Globe, Database, Palette, Terminal, Shapes, Scan, Route, Footprints, Image, Video, Hand, Brain, Trash, Pencil, ScrollText, Rocket, AppWindow, MessageSquare, PanelBottom, PanelsTopLeft, PanelRight, ExternalLink, FileCode, GitBranch, MessageSquarePlus, Reply, Send, ChartColumn]);
 
 /// The app's own picture (sidebar mark); the Dock icon is set in `main`.
 pub const LOGO: &str = "app/logo.png";

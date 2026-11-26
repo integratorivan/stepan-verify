@@ -16,7 +16,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use crate::zoom::px;
 use crate::ui::PressButton;
-use stepan_verify_core::{Provider, Task, TaskStatus, worktree::Isolation};
+use stepan_verify_core::{Phase, Provider, Task, TaskStatus, plans, worktree::Isolation};
 
 use crate::{
     app::AppView,
@@ -328,8 +328,29 @@ fn render_column(app: &AppView, col: &Column, visible: &[&Task], p: &Palette, th
         )
 }
 
+/// The newest plan iteration of a plan-first task.
+fn latest_plan(app: &AppView, task: &Task) -> Option<usize> {
+    task.meta.plan.then(|| plans::latest(&app.home, &task.id)).flatten()
+}
+
+/// «план» / «по плану #2» on a plan-first task.
+fn phase_chip(task: &Task, p: &Palette, theme: &Theme) -> Option<Div> {
+    let text = match (task.phase()?, task.meta.plan_approved) {
+        (Phase::Implement, Some(n)) => format!("по плану #{n}"),
+        (phase, _) => phase.label().to_owned(),
+    };
+    Some(
+        h_flex()
+            .gap(px(4.))
+            .child(Icon::new(IconName::Network).xsmall().text_color(p.blue.solid))
+            .child(ui::chip(text, p, theme)),
+    )
+}
+
 fn render_card(app: &AppView, task: &Task, done: bool, p: &Palette, theme: &Theme, cx: &mut Context<AppView>) -> impl IntoElement {
     let id = task.id.clone();
+    let plan_run = latest_plan(app, task);
+    let planning = task.phase() == Some(Phase::Plan);
     let selected = app.selected_task.as_deref() == Some(task.id.as_str());
     let open_deps = task.open_dependencies(&app.tasks);
     let live = app.task_session(&task.id, cx).map(|(_, v)| {
@@ -398,6 +419,7 @@ fn render_card(app: &AppView, task: &Task, done: bool, p: &Palette, theme: &Them
                     .when_some(project, |this, name| this.child(ui::chip(name, p, theme)))
                     .when_some(provider, |this, pr| this.child(ui::provider_chip(pr, p, theme)))
                     .when(task.meta.worktree.is_some(), |this| this.child(ui::branch_chip("копия", p, theme)))
+                    .when_some(phase_chip(task, p, theme), |this, chip| this.child(chip))
                     .children(task.meta.labels.iter().map(|l| ui::chip(l.clone(), p, theme))),
             )
             .child(
@@ -446,7 +468,7 @@ fn render_card(app: &AppView, task: &Task, done: bool, p: &Palette, theme: &Them
             .child(h_flex().child(ui::badge("Агенту нужен ответ", p.amber)))
             .when_some(task.meta.summary.clone(), |this, s| this.child(div().text_size(px(12.)).text_color(p.muted).line_clamp(3).text_ellipsis().child(s))),
         TaskStatus::Review => card
-            .child(h_flex().child(ui::badge("Сдал на ревью", p.green)))
+            .child(h_flex().child(if planning { ui::badge("План ждёт решения", p.blue) } else { ui::badge("Сдал на ревью", p.green) }))
             .when_some(task.meta.summary.clone(), |this, s| this.child(div().text_size(px(12.)).text_color(p.muted).line_clamp(3).text_ellipsis().child(s))),
         _ => card,
     };
@@ -464,9 +486,23 @@ fn render_card(app: &AppView, task: &Task, done: bool, p: &Palette, theme: &Them
                 this.run_task(id, Provider::Codex, window, cx)
             }),
         ],
-        TaskStatus::InProgress => vec![action(&id, "open", "Сессия", IconName::SquareTerminal, false, cx, |this, id, window, cx| {
-            this.open_task_session(id, window, cx)
-        })],
+        TaskStatus::InProgress => {
+            let mut list = vec![action(&id, "open", "Сессия", IconName::SquareTerminal, false, cx, |this, id, window, cx| {
+                this.open_task_session(id, window, cx)
+            })];
+            if plan_run.is_some() {
+                list.push(action(&id, "plan", "План", IconName::Network, false, cx, |this, id, window, cx| this.open_plan(id, window, cx)));
+            }
+            list
+        }
+        TaskStatus::Review if planning => {
+            let mut list = vec![action(&id, "plan", "План", IconName::Network, true, cx, |this, id, window, cx| this.open_plan(id, window, cx))];
+            if let Some(n) = plan_run {
+                list.push(action(&id, "approve", "Утвердить", IconName::Check, false, cx, move |this, id, window, cx| this.approve_plan(id, n, window, cx)));
+            }
+            list.push(action(&id, "reply", "Сессия", IconName::SquareTerminal, false, cx, |this, id, window, cx| this.open_task_session(id, window, cx)));
+            list
+        }
         TaskStatus::Blocked => vec![
             action(&id, "reply", "Ответить", IconName::SquareTerminal, true, cx, |this, id, window, cx| {
                 this.open_task_session(id, window, cx)
@@ -598,6 +634,8 @@ fn render_detail(app: &AppView, task: &Task, p: &Palette, theme: &Theme, cx: &mu
     let provider = task_provider(task, live);
     let blocked = task.meta.status == TaskStatus::Blocked;
     let review = task.meta.status == TaskStatus::Review;
+    let planning = task.phase() == Some(Phase::Plan);
+    let plan_run = latest_plan(app, task);
     let id = task.id.clone();
     let tone = status_tone(task.meta.status, p);
     let label = |text: &'static str| ui::eyebrow(text, p, theme);
@@ -705,10 +743,12 @@ fn render_detail(app: &AppView, task: &Task, p: &Palette, theme: &Theme, cx: &mu
                             .child(div().text_size(px(13.5)).text_color(p.fg).child(TextView::markdown(SharedString::from(format!("body:{}", task.id)), task.body.clone()).selectable(true))),
                     )
                 })
+                .child(render_workflow(task, plan_run, p, theme, cx))
                 .when_some(task.meta.cwd.clone(), |this, cwd| {
                     this.child(v_flex().gap(px(6.)).child(label("Папка")).child(ui::mono(cwd.display().to_string(), theme).text_color(p.muted)))
                         .child(render_workplace(app, task, p, theme, cx))
                 })
+                .child(render_models(task, p, theme, cx))
                 .when(!task.meta.attachments.is_empty(), |this| {
                     this.child(
                         v_flex()
@@ -777,7 +817,30 @@ fn render_detail(app: &AppView, task: &Task, p: &Palette, theme: &Theme, cx: &mu
                 .gap_2()
                 .border_t_1()
                 .border_color(p.border)
-                .when(review, |this| {
+                .when_some(plan_run.filter(|_| review && planning), |this, n| {
+                    let id = id.clone();
+                    this.child(
+                        PressButton::new("detail-approve-plan")
+                            .small()
+                            .primary()
+                            .icon(IconName::Check)
+                            .label("Утвердить план")
+                            .tooltip(format!("Итерация #{n} уйдёт агенту на реализацию"))
+                            .on_click(cx.listener(move |this, _, window, cx| this.approve_plan(&id, n, window, cx))),
+                    )
+                })
+                .when(plan_run.is_some(), |this| {
+                    let id = id.clone();
+                    this.child(
+                        PressButton::new("detail-plan")
+                            .small()
+                            .outline()
+                            .icon(IconName::Network)
+                            .label("Открыть план")
+                            .on_click(cx.listener(move |this, _, window, cx| this.open_plan(&id, window, cx))),
+                    )
+                })
+                .when(review && !planning, |this| {
                     let id = id.clone();
                     this.child(
                         PressButton::new("detail-accept")
@@ -797,6 +860,38 @@ fn render_detail(app: &AppView, task: &Task, p: &Palette, theme: &Theme, cx: &mu
                         .label("Открыть сессию")
                         .on_click(cx.listener(move |this, _, window, cx| this.open_task_session(&id, window, cx)))
                 }),
+        )
+}
+
+/// «Порядок работы»: straight to code, or a plan map to approve first.
+fn render_workflow(task: &Task, plan_run: Option<usize>, p: &Palette, theme: &Theme, cx: &mut Context<AppView>) -> impl IntoElement {
+    let option = |key: &'static str, text: &'static str, value: bool, cx: &mut Context<AppView>| {
+        let id = task.id.clone();
+        ui::segment(key, text, task.meta.plan == value, p)
+            .h(px(26.))
+            .px(px(10.))
+            .text_size(px(12.5))
+            .on_click(cx.listener(move |this, _, window, cx| this.set_task_plan(&id, value, window, cx)))
+    };
+    let hint = match (task.phase(), task.meta.plan_approved, plan_run) {
+        (None, _, _) => "Агент сразу берётся за код".to_owned(),
+        (Some(Phase::Implement), Some(n), _) => format!("План утверждён (итерация #{n}) — агент делает его по этапам"),
+        (Some(_), _, Some(n)) => format!("Агент нарисовал план · итераций: {n}"),
+        (Some(_), _, None) => "Агент сначала нарисует карту того, к чему приведёт код".to_owned(),
+    };
+    v_flex()
+        .gap(px(6.))
+        .child(ui::eyebrow("Порядок работы", p, theme))
+        .child(
+            h_flex()
+                .gap(px(10.))
+                .child(
+                    ui::segmented(p)
+                        .flex_shrink_0()
+                        .child(option("detail-workflow-direct", "Сразу делать", false, cx))
+                        .child(option("detail-workflow-plan", "Сначала план", true, cx)),
+                )
+                .child(div().min_w_0().truncate().text_size(px(12.)).text_color(p.faint).child(hint)),
         )
 }
 
@@ -867,9 +962,32 @@ fn render_workplace(app: &AppView, task: &Task, p: &Palette, theme: &Theme, cx: 
         })
 }
 
+/// «Модель»: what Claude and Codex run on when they take the task next.
+fn render_models(task: &Task, p: &Palette, theme: &Theme, cx: &mut Context<AppView>) -> impl IntoElement {
+    let choice = |provider: Provider, cx: &mut Context<AppView>| {
+        let id = task.id.clone();
+        let fallback = crate::models::settings_default(provider, cx).or_else(|| crate::models::cli_default(provider));
+        let view = cx.entity().downgrade();
+        h_flex().gap(px(8.)).child(ui::provider_chip(provider, p, theme)).child(crate::models::picker(
+            SharedString::from(format!("detail-model-{}", provider.label())),
+            provider,
+            task.model(provider).map(str::to_owned),
+            fallback,
+            move |model, window, cx| {
+                view.update(cx, |this, cx| this.set_task_model(&id, provider, model, window, cx)).ok();
+            },
+        ))
+    };
+    v_flex()
+        .gap(px(6.))
+        .child(ui::eyebrow("Модель", p, theme))
+        .child(h_flex().gap(px(16.)).child(choice(Provider::Claude, cx)).child(choice(Provider::Codex, cx)))
+}
+
 fn event_label(kind: &str) -> &'static str {
     match kind {
         "isolation" => "выбрал, где работать",
+        "model" => "выбрал модель",
         "worktree" => "отдельная копия",
         "create" => "создал",
         "claim" => "взял в работу",
@@ -878,6 +996,9 @@ fn event_label(kind: &str) -> &'static str {
         "block" => "спрашивает",
         "release" => "вернул в очередь",
         "status" => "сменил статус",
+        "workflow" => "выбрал порядок работы",
+        "plan_ready" => "сдал план",
+        "plan_approved" => "утвердил план",
         _ => "",
     }
 }

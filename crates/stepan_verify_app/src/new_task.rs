@@ -8,10 +8,11 @@ use gpui_kit::component::{
 use gpui_kit::*;
 use crate::zoom::px;
 use crate::ui::PressButton;
-use stepan_verify_core::{NewTask, TaskStatus, worktree::Isolation};
+use stepan_verify_core::{NewTask, Provider, TaskStatus, worktree::Isolation};
 
 use crate::{
     attach::{self, Attachments, AttachmentsEvent},
+    models,
     project_picker::{Picked, ProjectPicker},
     ui::{self, Palette},
 };
@@ -33,6 +34,11 @@ pub struct NewTaskForm {
     ready: bool,
     /// Separate copy, the project folder, or decide at run time (None).
     isolation: Option<Isolation>,
+    /// Model per agent; None = Настройки → «Модель по умолчанию» at run time.
+    claude_model: Option<String>,
+    codex_model: Option<String>,
+    /// «Сначала план»: the agent draws the target state for approval before coding.
+    plan: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -55,7 +61,7 @@ impl NewTaskForm {
             cx.subscribe(&picker, |_, _, _: &Picked, cx| cx.notify()),
             cx.subscribe(&attachments, |_, _, _: &AttachmentsEvent, cx| cx.notify()),
         ];
-        Self { picker, title, body, labels, attachments, ready: true, isolation: None, _subscriptions: subscriptions }
+        Self { picker, title, body, labels, attachments, ready: true, isolation: None, claude_model: None, codex_model: None, plan: false, _subscriptions: subscriptions }
     }
 
     fn can_create(&self, cx: &App) -> bool {
@@ -83,8 +89,42 @@ impl NewTaskForm {
             depends_on: Vec::new(),
             status: if self.ready { TaskStatus::Todo } else { TaskStatus::Inbox },
             isolation: self.isolation,
+            claude_model: self.claude_model.clone(),
+            codex_model: self.codex_model.clone(),
             attachments: self.attachments.read(cx).paths().to_vec(),
+            plan: self.plan,
         }));
+    }
+}
+
+impl NewTaskForm {
+    /// The agent's chip and its model dropdown; «по умолчанию» follows Настройки.
+    fn model_choice(&self, provider: Provider, p: &Palette, theme: &gpui_kit::component::Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = match provider {
+            Provider::Claude => self.claude_model.clone(),
+            Provider::Codex => self.codex_model.clone(),
+        };
+        let fallback = models::settings_default(provider, cx).or_else(|| models::cli_default(provider));
+        let form = cx.entity().downgrade();
+        h_flex()
+            .gap_2()
+            .child(ui::provider_chip(provider, p, theme))
+            .child(models::picker(
+                SharedString::from(format!("new-task-model-{}", provider.label())),
+                provider,
+                current,
+                fallback,
+                move |model, _, cx| {
+                    form.update(cx, |form, cx| {
+                        match provider {
+                            Provider::Claude => form.claude_model = model,
+                            Provider::Codex => form.codex_model = model,
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                },
+            ))
     }
 }
 
@@ -105,6 +145,17 @@ impl Render for NewTaskForm {
                 this.isolation = isolation;
                 cx.notify();
             }))
+        };
+        let plan_button = |id: &'static str, label: &'static str, plan: bool, cx: &mut Context<Self>| {
+            segment(id, label, self.plan == plan).on_click(cx.listener(move |this, _, _, cx| {
+                this.plan = plan;
+                cx.notify();
+            }))
+        };
+        let plan_hint = if self.plan {
+            "Агент нарисует карту того, к чему приведёт код; ты утвердишь — потом делает"
+        } else {
+            "Агент сразу берётся за код"
         };
         let isolation_hint = match self.isolation {
             None => "Отдельная копия, если в проекте уже работает другой агент",
@@ -179,6 +230,27 @@ impl Render for NewTaskForm {
                                 .child(isolation_button("isolation-here", "Здесь", Some(Isolation::Here), cx)),
                         )
                         .child(div().min_w_0().truncate().text_size(px(12.)).text_color(p.faint).child(isolation_hint)),
+                ),
+            )
+            .child(
+                v_flex().gap_2().child(field("Порядок работы")).child(
+                    h_flex()
+                        .gap_3()
+                        .child(
+                            ui::segmented(&p)
+                                .flex_shrink_0()
+                                .child(plan_button("workflow-direct", "Сразу делать", false, cx))
+                                .child(plan_button("workflow-plan", "Сначала план", true, cx)),
+                        )
+                        .child(div().min_w_0().truncate().text_size(px(12.)).text_color(p.faint).child(plan_hint)),
+                ),
+            )
+            .child(
+                v_flex().gap_2().child(field("Модель")).child(
+                    h_flex()
+                        .gap_4()
+                        .child(self.model_choice(Provider::Claude, &p, &theme, cx))
+                        .child(self.model_choice(Provider::Codex, &p, &theme, cx)),
                 ),
             )
             .child(v_flex().gap_2().child(field("Метки")).child(Input::new(&self.labels)))

@@ -48,11 +48,32 @@ pub struct AgentsConfig {
     pub default_provider: ProviderSetting,
     /// Parallel agents the autopilot may run.
     pub autopilot_limit: usize,
+    /// Model for new Claude tasks and sessions (`opus`, `sonnet`…); empty = Claude Code's own default.
+    pub claude_model: String,
+    /// Model for new Codex tasks and sessions (a slug); empty = Codex's own default.
+    pub codex_model: String,
 }
 
 impl Default for AgentsConfig {
     fn default() -> Self {
-        Self { mode: AgentMode::Full, default_provider: ProviderSetting::Claude, autopilot_limit: 2 }
+        Self {
+            mode: AgentMode::Full,
+            default_provider: ProviderSetting::Claude,
+            autopilot_limit: 2,
+            claude_model: String::new(),
+            codex_model: String::new(),
+        }
+    }
+}
+
+impl AgentsConfig {
+    /// The model new work of `provider` runs on; `None` = the CLI's own default.
+    pub fn model(&self, provider: Provider) -> Option<String> {
+        let model = match provider {
+            Provider::Claude => &self.claude_model,
+            Provider::Codex => &self.codex_model,
+        };
+        Some(model.clone()).filter(|m| !m.is_empty())
     }
 }
 
@@ -215,6 +236,16 @@ pub fn codex_models() -> Vec<(String, String)> {
         .collect()
 }
 
+/// Claude Code model aliases, newest family first; `--model` takes any of them.
+pub const CLAUDE_MODELS: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
+
+/// The model Claude Code uses when none is given (`model` in ~/.claude/settings.json).
+pub fn claude_default_model() -> Option<String> {
+    let text = fs::read_to_string(dirs::home_dir()?.join(".claude/settings.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v.get("model")?.as_str().filter(|m| !m.is_empty()).map(str::to_owned)
+}
+
 /// The model Codex uses when none is given (`model = ...` in ~/.codex/config.toml).
 pub fn codex_default_model() -> Option<String> {
     let text = fs::read_to_string(dirs::home_dir()?.join(".codex/config.toml")).ok()?;
@@ -290,5 +321,12 @@ mod tests {
         assert_eq!(config.agents.autopilot_limit, 2);
         let back: Config = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
         assert_eq!(back.agents.mode, AgentMode::Ask);
+    }
+
+    #[test]
+    fn empty_agent_model_means_cli_default() {
+        let config: Config = toml::from_str("[agents]\nclaude_model = \"opus\"\n").unwrap();
+        assert_eq!(config.agents.model(Provider::Claude).as_deref(), Some("opus"));
+        assert_eq!(config.agents.model(Provider::Codex), None);
     }
 }

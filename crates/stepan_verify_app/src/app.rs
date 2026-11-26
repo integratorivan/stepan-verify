@@ -37,6 +37,27 @@ pub enum Page {
     Skills,
     Settings,
     Session(usize),
+    /// The plan of a plan-first task (`AppView::plan_view`).
+    Plan,
+    /// «Чем пользуюсь».
+    Usage,
+}
+
+impl Page {
+    /// The page as a feature of `core::usage`; sessions and the plan count elsewhere.
+    fn usage_id(self) -> Option<&'static str> {
+        Some(match self {
+            Page::Dashboard => "page.dashboard",
+            Page::Tasks => "page.tasks",
+            Page::Flows => "page.flows",
+            Page::Docs => "page.docs",
+            Page::Memory => "page.memory",
+            Page::Skills => "page.skills",
+            Page::Settings => "page.settings",
+            Page::Usage => "page.usage",
+            Page::Session(_) | Page::Plan => return None,
+        })
+    }
 }
 
 /// Command-line launch options:
@@ -46,6 +67,8 @@ pub struct Launch {
     open: Option<String>,
     send: Option<String>,
     new: bool,
+    /// Open «Новая задача» at start.
+    new_task: bool,
     start: Option<Provider>,
     cwd: Option<PathBuf>,
     /// Keep the dashboard in front after `--start`.
@@ -62,6 +85,8 @@ pub struct Launch {
     project: Option<PathBuf>,
     /// `--build-flows`: start the flow-map agent for that project right away.
     build_flows: bool,
+    /// `--plan <task-id>`: open that task's plan.
+    plan: Option<String>,
     sync_flows: bool,
     /// `--task <id>`: open «Задачи» with this task's card.
     task: Option<String>,
@@ -75,6 +100,7 @@ impl Launch {
                 "--open" => launch.open = args.next(),
                 "--send" => launch.send = args.next(),
                 "--new" => launch.new = true,
+                "--new-task" => launch.new_task = true,
                 "--start" => {
                     launch.start = match args.next().as_deref() {
                         Some("codex") => Some(Provider::Codex),
@@ -84,6 +110,7 @@ impl Launch {
                 "--cwd" => launch.cwd = args.next().map(PathBuf::from),
                 "--stay" => launch.stay = true,
                 "--changes" => launch.changes = true,
+                "--plan" => launch.plan = args.next(),
                 "--autopilot" => launch.autopilot = true,
                 "--preview" => launch.preview = args.next().map(|p| std::fs::canonicalize(&p).unwrap_or_else(|_| p.into())),
                 "--build-flows" => launch.build_flows = true,
@@ -105,6 +132,7 @@ impl Launch {
                         Some("memory") => Some(Page::Memory),
                         Some("skills") => Some(Page::Skills),
                         Some("settings") => Some(Page::Settings),
+                        Some("usage") => Some(Page::Usage),
                         _ => Some(Page::Dashboard),
                     }
                 }
@@ -160,11 +188,14 @@ pub struct AppView {
     docs: Entity<DocsView>,
     flows: Entity<crate::flows::FlowsView>,
     skills_view: Entity<crate::skills::SkillsView>,
+    usage_view: Entity<crate::usage_page::UsageView>,
     memory_view: Entity<crate::memory::MemoryView>,
     /// Text and code font pickers on the settings page, made on first visit.
     pub(crate) font_pickers: Option<[Entity<crate::settings_page::FontPicker>; 2]>,
     /// Sessions opened in this window, in opening order.
     pub(crate) open_sessions: Vec<Entity<SessionView>>,
+    /// The plan on screen: (task id, its map).
+    plan_view: Option<(String, Entity<crate::changes::ChangesView>)>,
     /// Project pickers in open dialogs, refreshed when the scan finishes.
     pickers: Vec<WeakEntity<ProjectPicker>>,
     launch: Launch,
@@ -207,6 +238,13 @@ impl AppView {
                         this.show(Page::Session(*ix), cx);
                     }
                 }
+                DocsEvent::SendToSummary { summary, text } => {
+                    this.open_session(summary, window, cx);
+                    let view = this.open_sessions.iter().find(|s| s.read(cx).native_id.as_deref() == Some(summary.id.as_str())).cloned();
+                    if let Some(view) = view {
+                        view.update(cx, |v, cx| v.send_text(text.clone(), cx));
+                    }
+                }
                 DocsEvent::NewSession { provider, cwd, prompt } => {
                     let start = StartSession { provider: *provider, cwd: cwd.clone(), prompt: prompt.clone(), images: Vec::new() };
                     this.start_session(&start, window, cx);
@@ -217,6 +255,7 @@ impl AppView {
         })
         .detach();
         let skills_view = cx.new(|cx| crate::skills::SkillsView::new(home.clone(), window, cx));
+        let usage_view = cx.new(|_| crate::usage_page::UsageView::new(home.clone()));
         let memory_view = cx.new(|cx| crate::memory::MemoryView::new(home.clone(), launch.project.as_deref().and_then(stepan_verify_core::memory::project_of), window, cx));
         cx.subscribe_in(&skills_view, window, |this, _, event: &crate::skills::SkillsEvent, window, cx| match event {
             crate::skills::SkillsEvent::OpenSession(summary) => this.open_session(summary, window, cx),
@@ -257,8 +296,10 @@ impl AppView {
             flows,
             font_pickers: None,
             skills_view,
+            usage_view,
             memory_view,
             open_sessions: Vec::new(),
+            plan_view: None,
             pickers: Vec::new(),
             launch,
             preview: None,
@@ -289,6 +330,19 @@ impl AppView {
                 }
             }
         });
+        // A new release is news on any page, not only in «Настройки».
+        cx.observe_global_in::<crate::update::Updates>(window, |_, window, cx| {
+            if let Some(release) = crate::update::take_announcement(cx) {
+                announce_update(&release, window, cx);
+            }
+        })
+        .detach();
+        cx.observe_window_activation(window, |_, window, cx| {
+            if window.is_window_active() {
+                crate::update::check_if_stale(cx);
+            }
+        })
+        .detach();
         this
     }
 
@@ -321,6 +375,9 @@ impl AppView {
         if std::mem::take(&mut self.launch.new) {
             self.open_new_session_dialog(window, cx);
         }
+        if std::mem::take(&mut self.launch.new_task) {
+            self.open_new_task_dialog(window, cx);
+        }
         if let (Some(provider), Some(cwd), Some(prompt)) =
             (self.launch.start.take(), self.launch.cwd.take(), self.launch.send.clone())
         {
@@ -346,10 +403,14 @@ impl AppView {
         if let Some(path) = self.launch.preview.take() {
             self.open_preview(path, None, window, cx);
         }
+        if let Some(id) = self.launch.plan.take() {
+            self.open_plan(&id, window, cx);
+        }
     }
 
     /// Show a session inside the app, reusing the tab if it is already open.
     pub fn open_session(&mut self, summary: &SessionSummary, window: &mut Window, cx: &mut Context<Self>) {
+        stepan_verify_core::usage::hit("sessions.open");
         let existing = self
             .open_sessions
             .iter()
@@ -365,6 +426,7 @@ impl AppView {
     }
 
     fn start_session(&mut self, start: &StartSession, window: &mut Window, cx: &mut Context<Self>) {
+        stepan_verify_core::usage::hit("sessions.new");
         let (provider, cwd, prompt, images) = (start.provider, start.cwd.clone(), start.prompt.clone(), start.images.clone());
         let view = cx.new(|cx| SessionView::start(provider, cwd, prompt, images, window, cx));
         let ix = self.adopt(view, window, cx);
@@ -443,6 +505,7 @@ impl AppView {
 
     /// Show a file in the panel on the right, reusing the panel if it is open.
     pub(crate) fn open_preview(&mut self, path: PathBuf, root: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        stepan_verify_core::usage::hit("sessions.preview");
         if let Some(preview) = &self.preview {
             preview.update(cx, |p, cx| p.open(path, root, window, cx));
         } else {
@@ -561,6 +624,13 @@ impl AppView {
         self.reload_tasks(cx);
     }
 
+    pub fn set_task_model(&mut self, id: &str, provider: Provider, model: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(err) = self.board.set_model(id, "me", provider, model) {
+            Self::toast_error(window, err, cx);
+        }
+        self.reload_tasks(cx);
+    }
+
     pub fn set_task_isolation(&mut self, id: &str, isolation: Option<Isolation>, window: &mut Window, cx: &mut Context<Self>) {
         if let Err(err) = self.board.set_isolation(id, "me", isolation) {
             Self::toast_error(window, err, cx);
@@ -675,23 +745,123 @@ impl AppView {
         if let Some((ix, _)) = self.task_session(id, cx) {
             return self.show(Page::Session(ix), cx);
         }
-        let linked = self.tasks.iter().find(|t| t.id == id).and_then(|t| t.meta.sessions.last().cloned());
-        let summary = linked
-            .and_then(|s| s.split_once(':').map(|(_, native)| native.to_owned()))
-            .and_then(|native| self.sessions.iter().find(|s| s.id == native).cloned());
-        match summary {
-            Some(mut summary) => {
-                // A worktree task resumes in its copy, wherever the index thought it ran.
-                if let Some(cwd) = self.tasks.iter().find(|t| t.id == id).filter(|t| t.meta.worktree.is_some()).and_then(worktree::session_cwd) {
-                    summary.cwd = Some(cwd);
-                }
-                self.open_session(&summary, window, cx);
-                if let Some(view) = self.open_sessions.last() {
-                    view.update(cx, |v, _| v.task_id = Some(id.to_owned()));
-                }
-            }
+        match self.resume_task_session(id, window, cx) {
+            Some(ix) => self.show(Page::Session(ix), cx),
             None => window.push_notification(Notification::warning("Сессия этой задачи не найдена — обнови список сессий"), cx),
         }
+    }
+
+    /// Open the task's last linked session in the background; its index in `open_sessions`.
+    fn resume_task_session(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) -> Option<usize> {
+        let linked = self.tasks.iter().find(|t| t.id == id).and_then(|t| t.meta.sessions.last().cloned());
+        let mut summary = linked
+            .and_then(|s| s.split_once(':').map(|(_, native)| native.to_owned()))
+            .and_then(|native| self.sessions.iter().find(|s| s.id == native).cloned())?;
+        // A worktree task resumes in its copy, wherever the index thought it ran.
+        if let Some(cwd) = self.tasks.iter().find(|t| t.id == id).filter(|t| t.meta.worktree.is_some()).and_then(worktree::session_cwd) {
+            summary.cwd = Some(cwd);
+        }
+        let existing = self.open_sessions.iter().position(|s| s.read(cx).native_id.as_deref() == Some(summary.id.as_str()));
+        let ix = match existing {
+            Some(ix) => ix,
+            None => {
+                let view = cx.new(|cx| SessionView::resume(&summary, window, cx));
+                self.adopt(view, window, cx)
+            }
+        };
+        self.open_sessions[ix].update(cx, |v, _| v.task_id = Some(id.to_owned()));
+        Some(ix)
+    }
+
+    // ------------------------------------------------------------- plans
+
+    pub fn set_task_plan(&mut self, id: &str, plan: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(err) = self.board.set_plan(id, "me", plan) {
+            Self::toast_error(window, err, cx);
+        }
+        self.reload_tasks(cx);
+    }
+
+    /// «Открыть план»: the task's plan map, drawn like «Изменения».
+    pub fn open_plan(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        stepan_verify_core::usage::hit("tasks.plan_open");
+        if self.plan_view.as_ref().is_some_and(|(t, _)| t == id) {
+            return self.show(Page::Plan, cx);
+        }
+        let Some(task) = self.tasks.iter().find(|t| t.id == id).cloned() else { return };
+        let provider = self.task_provider(&task, cx);
+        let input = crate::changes::ChangesInput {
+            key: task.id.clone(),
+            provider: match provider {
+                Provider::Claude => stepan_verify_agents::Provider::Claude,
+                Provider::Codex => stepan_verify_agents::Provider::Codex,
+            },
+            title: task.meta.title.clone(),
+            cwd: worktree::session_cwd(&task).unwrap_or_else(dirs_home),
+            requests: Vec::new(),
+            final_answer: String::new(),
+            patches: Vec::new(),
+            commands: Vec::new(),
+            screenshots: Vec::new(),
+            log: Vec::new(),
+            plan: None,
+        };
+        let task_id = task.id.clone();
+        let view = cx.new(|cx| crate::changes::ChangesView::plan(input, task_id.clone(), cx));
+        cx.subscribe_in(&view, window, move |this, _, event: &crate::changes::ChangesEvent, window, cx| {
+            use crate::changes::ChangesEvent;
+            match event {
+                ChangesEvent::Return(text) => this.send_plan_remarks(&task_id, text.clone(), window, cx),
+                ChangesEvent::ApprovePlan(n) => this.approve_plan(&task_id, *n, window, cx),
+                ChangesEvent::OpenSession => this.open_task_session(&task_id, window, cx),
+                ChangesEvent::Accept => {}
+            }
+        })
+        .detach();
+        self.plan_view = Some((task.id, view));
+        self.show(Page::Plan, cx);
+    }
+
+    /// The agent that works on a task: its open session, its last one, else the default.
+    fn task_provider(&self, task: &BoardTask, cx: &App) -> Provider {
+        let last = match task.meta.sessions.last().and_then(|s| s.split_once(':')).map(|(who, _)| who) {
+            Some("codex") => Some(Provider::Codex),
+            Some("claude") => Some(Provider::Claude),
+            _ => None,
+        };
+        self.task_session(&task.id, cx)
+            .map(|(_, v)| v.read(cx).provider)
+            .or(last)
+            .unwrap_or_else(|| crate::settings::config(cx).agents.default_provider.into())
+    }
+
+    /// Remarks on the plan go to the agent that writes it (resumed if closed);
+    /// it rewrites the plan as a new iteration.
+    fn send_plan_remarks(&mut self, id: &str, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        let ix = match self.task_session(id, cx) {
+            Some((ix, _)) => Some(ix),
+            None => self.resume_task_session(id, window, cx),
+        };
+        match ix {
+            Some(ix) => {
+                self.open_sessions[ix].update(cx, |v, cx| v.send_text(text, cx));
+                window.push_notification(Notification::info("Замечания ушли агенту — он перепишет план новой итерацией"), cx);
+            }
+            None => window.push_notification(Notification::warning("Сессия, где писался план, не найдена — обнови список сессий и отправь ещё раз"), cx),
+        }
+        self.reload_tasks(cx);
+    }
+
+    /// «Утвердить план»: the task moves to implementation and an agent starts on it.
+    pub fn approve_plan(&mut self, id: &str, run: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let task = match self.board.approve_plan(id, "me", run) {
+            Ok(task) => task,
+            Err(err) => return Self::toast_error(window, err, cx),
+        };
+        let provider = self.task_provider(&task, cx);
+        window.push_notification(Notification::success(format!("План утверждён (итерация #{run}) — {} делает его по этапам", provider.label())).title(task.meta.title.clone()), cx);
+        self.reload_tasks(cx);
+        self.run_task(id, provider, window, cx);
     }
 
     /// Keep the board in step with what the agent does in the session.
@@ -701,6 +871,11 @@ impl AppView {
             let Some(id) = v.task_id.clone() else { return };
             (id, v.provider.label().to_lowercase(), v.activity())
         };
+        // A plan-first task has a planning and an implementation session; only
+        // the newest open one moves the board.
+        if self.task_session(&task_id, cx).is_some_and(|(_, newest)| newest != view) {
+            return;
+        }
         let Some(task) = self.tasks.iter().find(|t| t.id == task_id) else { return };
         let result = match event {
             // You continued the conversation: the agent is on it again.
@@ -861,6 +1036,11 @@ impl AppView {
     }
 
     pub fn show(&mut self, page: Page, cx: &mut Context<Self>) {
+        if page != self.page {
+            if let Some(id) = page.usage_id() {
+                stepan_verify_core::usage::hit(id);
+            }
+        }
         self.page = page;
         if page != Page::Settings {
             crate::corner::silence(cx);
@@ -869,6 +1049,9 @@ impl AppView {
         self.docs.update(cx, |d, cx| d.set_visible(page == Page::Docs, cx));
         if page == Page::Skills {
             self.skills_view.update(cx, |v, cx| v.refresh_if_stale(cx));
+        }
+        if page == Page::Usage {
+            self.usage_view.update(cx, |v, cx| v.refresh(cx));
         }
         self.persist_workspace(cx);
         cx.notify();
@@ -885,7 +1068,9 @@ impl AppView {
             Page::Memory => ("memory", None),
             Page::Skills => ("skills", None),
             Page::Settings => ("settings", None),
+            Page::Usage => ("usage", None),
             Page::Session(ix) => ("session", Some(ix)),
+            Page::Plan => ("tasks", None),
         };
         let mut open = Vec::new();
         let mut session_at = None;
@@ -963,6 +1148,7 @@ impl AppView {
             ("memory", _) => Page::Memory,
             ("skills", _) => Page::Skills,
             ("settings", _) => Page::Settings,
+            ("usage", _) => Page::Usage,
             _ => Page::Dashboard,
         };
         // An explicit `--page` / `--doc` wins over last time.
@@ -1035,7 +1221,8 @@ impl AppView {
     fn nav_item(&self, label: &'static str, icon: impl Into<Icon>, page: Page, count: Option<(String, bool)>, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let p = Palette::of(&theme);
-        let active = self.page == page;
+        // A task's plan lives under «Задачи».
+        let active = self.page == page || (page == Page::Tasks && self.page == Page::Plan);
         h_flex()
             .id(SharedString::from(format!("nav:{label}")))
             .h(px(31.))
@@ -1261,6 +1448,7 @@ impl AppView {
                             .child(self.nav_item("Документы", IconName::FileText, Page::Docs, (docs > 0).then(|| (docs.to_string(), false)), cx))
                             .child(self.nav_item("Память", Icon::empty().path("icons/brain.svg"), Page::Memory, (memories > 0).then(|| (memories.to_string(), false)), cx))
                             .child(self.nav_item("Скиллы", IconName::BookOpen, Page::Skills, (skills > 0).then(|| (skills.to_string(), false)), cx))
+                            .child(self.nav_item("Чем пользуюсь", Icon::empty().path("icons/chart-column.svg"), Page::Usage, None, cx))
                             .child(self.nav_item("Настройки", IconName::Settings2, Page::Settings, None, cx)),
                     )
                     .when(live_count > 0, |this| {
@@ -1339,6 +1527,7 @@ impl Render for AppView {
             Page::Flows => self.flows.clone().into_any_element(),
             Page::Memory => self.memory_view.clone().into_any_element(),
             Page::Skills => self.skills_view.clone().into_any_element(),
+            Page::Usage => self.usage_view.clone().into_any_element(),
             Page::Settings => {
                 crate::settings_page::ensure_pickers(self, window, cx);
                 crate::settings_page::render(self, window, cx).into_any_element()
@@ -1346,6 +1535,10 @@ impl Render for AppView {
             Page::Session(ix) => match self.open_sessions.get(ix) {
                 Some(view) => view.clone().into_any_element(),
                 None => dashboard::render(self, window, cx).into_any_element(),
+            },
+            Page::Plan => match &self.plan_view {
+                Some((_, view)) => view.clone().into_any_element(),
+                None => crate::board::render(self, window, cx).into_any_element(),
             },
         };
         let main = v_flex().size_full().min_w_0().child(content);
@@ -1372,6 +1565,27 @@ impl Render for AppView {
 
 fn dirs_home() -> PathBuf {
     std::env::var_os("HOME").map(Into::into).unwrap_or_default()
+}
+
+struct UpdateNote;
+
+/// Toast «Вышел Stepan …» with «Обновить»; also posted to the notification
+/// center, so it reaches you when Stepan is in the background.
+fn announce_update(release: &crate::update::Release, window: &mut Window, cx: &mut App) {
+    use gpui_kit::component::button::ButtonVariants as _;
+    let bundled = crate::update::running_bundle().is_some() && release.zip.is_some();
+    let note = Notification::info(format!("Вышел Stepan {} · у тебя {}", release.version, crate::update::VERSION))
+        .title("Доступно обновление")
+        .id::<UpdateNote>()
+        .in_app_and_system()
+        .action(move |_, _, _| {
+            gpui_kit::component::button::Button::new("update-now")
+                .primary()
+                .small()
+                .label(if bundled { "Обновить" } else { "Скачать" })
+                .on_click(|_, _, cx| crate::update::install(cx))
+        });
+    window.push_notification(note, cx);
 }
 
 /// «Доступна версия …» above the autopilot card, while there is one.

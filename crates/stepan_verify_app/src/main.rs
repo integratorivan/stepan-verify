@@ -13,6 +13,7 @@ mod live_card;
 mod loading;
 mod media;
 mod memory;
+mod models;
 mod new_session;
 mod new_task;
 mod preview;
@@ -23,6 +24,7 @@ mod settings_page;
 mod skills;
 mod ui;
 mod update;
+mod usage_page;
 mod workspace;
 mod zoom;
 
@@ -35,8 +37,19 @@ const MIN_HEIGHT: f32 = 600.;
 fn main() {
     let home = stepan_verify_core::Home::locate();
 
-    // `stepan_verify task …` (the board), `stepan_verify memory …` and `stepan_verify flows check|fmt` are CLIs for agents and scripts; no window.
+    // `stepan_verify task …` (the board), `stepan_verify memory …`, `stepan_verify doc …` (comments), `stepan_verify usage`
+    // and `stepan_verify flows check|fmt` are CLIs for agents and scripts; no window.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("usage") {
+        match stepan_verify_core::usage::cli(&home, &args[1..]) {
+            Ok(out) => println!("{out}"),
+            Err(err) => {
+                eprintln!("stepan_verify: {err:#}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if args.first().map(String::as_str) == Some("memory") {
         match stepan_verify_core::memory::run(&home, &args[1..]) {
             Ok(out) => println!("{out}"),
@@ -47,7 +60,20 @@ fn main() {
         }
         return;
     }
+    if args.first().map(String::as_str) == Some("doc") {
+        match stepan_verify_core::doc_comments::run(&home, &args[1..]) {
+            Ok(out) => println!("{out}"),
+            Err(err) => {
+                eprintln!("stepan_verify: {err:#}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if args.first().map(String::as_str) == Some("flows") {
+        if args.get(1).map(String::as_str) == Some("check") {
+            stepan_verify_core::usage::hit_cli(&home, "flows.check");
+        }
         match stepan_verify_core::flowdsl::cli(&args[1..]) {
             Ok((out, ok)) => {
                 println!("{out}");

@@ -152,7 +152,7 @@ impl SessionView {
             mode: crate::settings::agent_mode(cx),
             image_cache: Some(image_cache()),
             env: Vec::new(),
-            model: None,
+            model: crate::models::settings_default(provider, cx),
         };
         let mut this = Self::new(provider, title, project, spec, None, window, cx);
         this.send_message(stepan_verify_agents::Outgoing { text: prompt, images }, cx);
@@ -182,8 +182,12 @@ impl SessionView {
             mode: crate::settings::agent_mode(cx),
             image_cache: Some(image_cache()),
             env,
-            model: None,
+            model: crate::models::for_task(task, provider, cx),
         };
+        // A planning agent writes its plan here (see `changes::plan`).
+        if task.phase() == Some(stepan_verify_core::Phase::Plan) {
+            let _ = std::fs::create_dir_all(stepan_verify_core::plans::draft(&stepan_verify_core::Home::locate(), &task.id));
+        }
         let mut this = Self::new(provider, task.meta.title.clone(), project, spec, None, window, cx);
         this.task_id = Some(task.id.clone());
         // Attached images go with the message; other files are listed in it.
@@ -508,6 +512,7 @@ impl SessionView {
         }
         self.composer.update(cx, |c, cx| c.set_value("", window, cx));
         let images = self.attachments.update(cx, |a, cx| a.take(cx));
+        stepan_verify_core::usage::hit("sessions.send");
         self.send_message(stepan_verify_agents::Outgoing { text, images }, cx);
     }
 
@@ -1154,7 +1159,7 @@ impl SessionView {
         cx.subscribe(&view, |this, _, event: &crate::changes::ChangesEvent, cx| match event {
             crate::changes::ChangesEvent::Return(text) => this.send_text(text.clone(), cx),
             // TODO: a session tied to a board task could complete the task here.
-            crate::changes::ChangesEvent::Accept => {}
+            crate::changes::ChangesEvent::Accept | crate::changes::ChangesEvent::ApprovePlan(_) | crate::changes::ChangesEvent::OpenSession => {}
         })
         .detach();
         self.changes = Some(view.clone());
@@ -1224,6 +1229,7 @@ impl SessionView {
                     out
                 })
                 .collect(),
+            plan: self.task_id.as_deref().and_then(approved_plan),
         }
     }
 
@@ -1584,6 +1590,14 @@ fn agent_provider(p: Provider) -> stepan_verify_agents::Provider {
     }
 }
 
+/// report.json of the plan approved for task `id`, if it has one.
+fn approved_plan(id: &str) -> Option<PathBuf> {
+    let home = stepan_verify_core::Home::locate();
+    let task = stepan_verify_core::Board::new(home.clone()).get(id).ok()?;
+    let n = task.meta.plan_approved.filter(|_| task.meta.plan)?;
+    Some(stepan_verify_core::plans::report_path(&home, id, n)).filter(|p| p.exists())
+}
+
 fn task_prompt(task: &BoardTask) -> String {
     let body = task.body.trim();
     let summary = task.meta.summary.as_deref().map(|s| format!("\n\nПрошлый итог / вопрос по задаче: {s}")).unwrap_or_default();
@@ -1596,15 +1610,30 @@ fn task_prompt(task: &BoardTask) -> String {
         .map(|p| format!("- {}", p.display()))
         .collect();
     let files = if files.is_empty() { String::new() } else { format!("\n\nФайлы к задаче:\n{}", files.join("\n")) };
-    format!(
-        "Задача с доски Stepan: «{title}» (id {id}).\n\n{body}{summary}{files}\n\n\
-         Ты уже взял эту задачу. Команда `stepan_verify` есть в PATH, id задачи и твоё имя уже в окружении:\n\
-         - коротко отмечай важные шаги: `stepan_verify task log \"что сделано\"`\n\
-         - когда закончишь: `stepan_verify task complete \"итог; ссылка на PR, если есть\"` — задача уйдёт человеку на ревью\n\
-         - если нужен ответ человека: `stepan_verify task block \"вопрос\"` и остановись",
+    let head = format!(
+        "Задача с доски Stepan: «{title}» (id {id}).\n\n{body}{summary}{files}\n\n",
         title = task.meta.title,
         id = task.id,
         body = if body.is_empty() { "(без описания)" } else { body },
+    );
+    let home = stepan_verify_core::Home::locate();
+    if task.phase() == Some(stepan_verify_core::Phase::Plan) {
+        return format!(
+            "{head}Ты уже взял эту задачу. Команда `stepan_verify` есть в PATH, id задачи и твоё имя уже в окружении.\n\n{}",
+            crate::changes::plan::plan_brief(&home, task)
+        );
+    }
+    let plan = task
+        .meta
+        .plan_approved
+        .filter(|_| task.meta.plan)
+        .map(|n| format!("{}\n\n", crate::changes::plan::implement_brief(&stepan_verify_core::plans::report_path(&home, &task.id, n), n)))
+        .unwrap_or_default();
+    format!(
+        "{head}{plan}Ты уже взял эту задачу. Команда `stepan_verify` есть в PATH, id задачи и твоё имя уже в окружении:\n\
+         - коротко отмечай важные шаги: `stepan_verify task log \"что сделано\"`\n\
+         - когда закончишь: `stepan_verify task complete \"итог; ссылка на PR, если есть\"` — задача уйдёт человеку на ревью\n\
+         - если нужен ответ человека: `stepan_verify task block \"вопрос\"` и остановись"
     )
 }
 

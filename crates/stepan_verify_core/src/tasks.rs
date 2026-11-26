@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Home,
+    Home, Provider,
     events::{self, Event},
     worktree::{self, Isolation},
 };
@@ -62,6 +62,23 @@ impl TaskStatus {
     }
 }
 
+/// Where a plan-first task is: the agent writes a plan map, or implements the approved one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    Plan,
+    Implement,
+}
+
+impl Phase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Phase::Plan => "план",
+            Phase::Implement => "по плану",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TaskMeta {
     pub title: String,
@@ -83,6 +100,12 @@ pub struct TaskMeta {
     /// Its branch, `stepan/<id>`; stays when the copy is removed but the branch kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Model when Claude takes the task; unset = Настройки → «Модель по умолчанию».
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_model: Option<String>,
+    /// Model when Codex takes the task; unset = the default from settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_model: Option<String>,
     /// `key=value` labels, e.g. `kind=bug`, `area=admin`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
@@ -92,6 +115,15 @@ pub struct TaskMeta {
     /// Attached files (screenshots, logs…), copied to `tasks/<id>.files/`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<PathBuf>,
+    /// «Сначала план»: the agent first draws the target state, you approve it, then it implements.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plan: bool,
+    /// Phase of a plan-first task (unset on direct tasks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<Phase>,
+    /// The approved plan iteration: `state/plans/<id>/runs/<n>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_approved: Option<usize>,
     /// Who holds the task: "claude", "codex", a person…
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimed_by: Option<String>,
@@ -160,6 +192,14 @@ impl Task {
         self.meta.project.clone().or_else(|| self.meta.cwd.as_deref().and_then(worktree::project_name))
     }
 
+    /// The model chosen for `provider` on this task, if any.
+    pub fn model(&self, provider: Provider) -> Option<&str> {
+        match provider {
+            Provider::Claude => self.meta.claude_model.as_deref(),
+            Provider::Codex => self.meta.codex_model.as_deref(),
+        }
+    }
+
     pub fn lease_expired(&self, now: DateTime<Utc>) -> bool {
         self.meta.lease_until.is_some_and(|t| t < now)
     }
@@ -172,6 +212,11 @@ impl Task {
             .filter(|dep| all.iter().find(|t| &t.id == *dep).is_none_or(|t| t.meta.status != TaskStatus::Done))
             .map(String::as_str)
             .collect()
+    }
+
+    /// The phase a plan-first task is in; None for a direct task.
+    pub fn phase(&self) -> Option<Phase> {
+        self.meta.plan.then(|| self.meta.phase.unwrap_or(Phase::Plan))
     }
 
     /// Can an agent pick this up right now?
@@ -190,8 +235,13 @@ pub struct NewTask {
     pub depends_on: Vec<String>,
     pub status: TaskStatus,
     pub isolation: Option<Isolation>,
+    /// Per-agent model; `None` = the default from settings at run time.
+    pub claude_model: Option<String>,
+    pub codex_model: Option<String>,
     /// Files to attach; `create` copies them next to the task.
     pub attachments: Vec<PathBuf>,
+    /// «Сначала план».
+    pub plan: bool,
 }
 
 /// Board operations. Each one takes the board lock, re-reads the task from
@@ -228,9 +278,13 @@ impl Board {
                 status: new.status,
                 cwd: new.cwd,
                 isolation: new.isolation,
+                claude_model: new.claude_model.filter(|m| !m.is_empty()),
+                codex_model: new.codex_model.filter(|m| !m.is_empty()),
                 labels: new.labels,
                 depends_on: new.depends_on,
                 attachments,
+                plan: new.plan,
+                phase: new.plan.then_some(Phase::Plan),
                 created_at: Some(now),
                 updated_at: Some(now),
                 ..Default::default()
@@ -332,6 +386,47 @@ impl Board {
         })
     }
 
+    /// «Сначала план» on or off. Turning it on before a plan is approved starts at the plan phase.
+    pub fn set_plan(&self, id: &str, by: &str, plan: bool) -> Result<Task> {
+        self.update(id, by, "workflow", if plan { "сначала план" } else { "сразу делать" }, |task, _| {
+            task.meta.plan = plan;
+            task.meta.phase = match (plan, task.meta.plan_approved) {
+                (false, _) => None,
+                (true, Some(_)) => Some(Phase::Implement),
+                (true, None) => Some(Phase::Plan),
+            };
+            Ok(())
+        })
+    }
+
+    /// The agent wrote plan iteration `run`: hand it over for review as a plan.
+    pub fn plan_ready(&self, id: &str, by: &str, run: usize, summary: &str) -> Result<Task> {
+        let text = if summary.is_empty() { format!("итерация #{run}") } else { format!("итерация #{run} · {summary}") };
+        self.update(id, by, "plan_ready", &text, |task, _| {
+            check_planning(task)?;
+            task.meta.phase = Some(Phase::Plan);
+            task.meta.status = TaskStatus::Review;
+            task.meta.claimed_by = None;
+            task.meta.lease_until = None;
+            task.meta.summary = Some(if summary.is_empty() { format!("План готов: итерация #{run}") } else { summary.to_owned() });
+            Ok(())
+        })
+    }
+
+    /// You approved plan iteration `run`: the task goes back to the queue to be implemented.
+    pub fn approve_plan(&self, id: &str, by: &str, run: usize) -> Result<Task> {
+        self.update(id, by, "plan_approved", &format!("итерация #{run}"), |task, _| {
+            check_planning(task)?;
+            task.meta.phase = Some(Phase::Implement);
+            task.meta.plan_approved = Some(run);
+            task.meta.status = TaskStatus::Todo;
+            task.meta.claimed_by = None;
+            task.meta.lease_until = None;
+            task.meta.summary = None;
+            Ok(())
+        })
+    }
+
     pub fn set_isolation(&self, id: &str, by: &str, isolation: Option<Isolation>) -> Result<Task> {
         let text = match isolation {
             Some(Isolation::Worktree) => "отдельная копия",
@@ -340,6 +435,19 @@ impl Board {
         };
         self.update(id, by, "isolation", text, |task, _| {
             task.meta.isolation = isolation;
+            Ok(())
+        })
+    }
+
+    /// Choose the model `provider` runs this task on (`None` = settings default).
+    pub fn set_model(&self, id: &str, by: &str, provider: Provider, model: Option<String>) -> Result<Task> {
+        let model = model.filter(|m| !m.is_empty());
+        let text = format!("{}: {}", provider.label(), model.as_deref().unwrap_or("по умолчанию"));
+        self.update(id, by, "model", &text, |task, _| {
+            match provider {
+                Provider::Claude => task.meta.claude_model = model,
+                Provider::Codex => task.meta.codex_model = model,
+            }
             Ok(())
         })
     }
@@ -452,6 +560,15 @@ impl Board {
 
     fn lock(&self) -> Result<LockGuard> {
         LockGuard::acquire(self.home.state().join("board.lock"))
+    }
+}
+
+/// A plan can be written or approved only while the task is at its plan phase.
+fn check_planning(task: &Task) -> Result<()> {
+    match task.phase() {
+        None => bail!("у задачи нет этапа плана — включи «Сначала план»"),
+        Some(Phase::Implement) => bail!("план уже утверждён — задача на реализации"),
+        Some(Phase::Plan) => Ok(()),
     }
 }
 
@@ -607,6 +724,43 @@ mod tests {
         let missing = NewTask { title: "x".into(), attachments: vec![root.join("nope.png")], ..Default::default() };
         assert!(board.create(missing, "me").is_err());
         assert_eq!(board.tasks().len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plan_first_workflow_and_journal() {
+        let (board, root) = board();
+        let direct = board.create(NewTask { title: "d".into(), status: TaskStatus::Todo, ..Default::default() }, "me").unwrap();
+        assert_eq!(direct.phase(), None);
+        assert!(board.plan_ready(&direct.id, "claude", 1, "").is_err(), "direct tasks have no plan");
+
+        let t = board.create(NewTask { title: "p".into(), status: TaskStatus::Todo, plan: true, ..Default::default() }, "me").unwrap();
+        assert_eq!(t.phase(), Some(Phase::Plan));
+        board.claim(&t.id, "claude", Duration::from_secs(60)).unwrap();
+        let t2 = board.plan_ready(&t.id, "claude", 1, "три этапа").unwrap();
+        assert_eq!((t2.meta.status, t2.phase(), t2.meta.claimed_by.clone()), (TaskStatus::Review, Some(Phase::Plan), None));
+        // Remarks: the agent takes it again and writes iteration 2.
+        board.claim(&t.id, "claude", Duration::from_secs(60)).unwrap();
+        board.plan_ready(&t.id, "claude", 2, "").unwrap();
+        let t3 = board.approve_plan(&t.id, "me", 2).unwrap();
+        assert_eq!((t3.meta.status, t3.phase(), t3.meta.plan_approved), (TaskStatus::Todo, Some(Phase::Implement), Some(2)));
+        assert!(t3.is_ready(&board.tasks()));
+        assert!(board.plan_ready(&t.id, "claude", 3, "").is_err(), "approved plans stay");
+        assert!(board.approve_plan(&t.id, "me", 3).is_err());
+
+        // Off and on again keeps the approved phase; a fresh task starts at the plan.
+        assert_eq!(board.set_plan(&t.id, "me", false).unwrap().phase(), None);
+        assert_eq!(board.set_plan(&t.id, "me", true).unwrap().phase(), Some(Phase::Implement));
+        assert_eq!(board.set_plan(&direct.id, "me", true).unwrap().phase(), Some(Phase::Plan));
+
+        let journal: Vec<(String, String)> = board.events(Some(&t.id)).into_iter().map(|e| (e.kind, e.text)).collect();
+        let kinds: Vec<&str> = journal.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(kinds, ["create", "claim", "plan_ready", "claim", "plan_ready", "plan_approved", "workflow", "workflow"]);
+        assert_eq!(journal[2].1, "итерация #1 · три этапа");
+        assert_eq!(journal[5].1, "итерация #2");
+        // Survives a reload from disk.
+        let saved = board.get(&t.id).unwrap();
+        assert!(saved.meta.plan && saved.meta.plan_approved == Some(2));
         let _ = fs::remove_dir_all(root);
     }
 

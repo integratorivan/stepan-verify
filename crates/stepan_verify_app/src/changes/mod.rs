@@ -4,9 +4,13 @@
 //! (`~/.stepan_verify/state/changes/<session>/runs/<n>/`), so the map keeps its history:
 //! you can step through iterations and see which decisions the agent took.
 
+mod arch;
 pub(crate) mod canvas;
+mod contracts;
 mod map;
 pub mod media;
+pub mod plan;
+mod reviewed;
 mod runs;
 
 use std::{
@@ -41,6 +45,7 @@ use crate::{
     ui::{self, Palette, PressButton, Tone},
 };
 use map::{EdgeKind, Graph, Mode as MapMode, NodeStatus};
+use reviewed::Review;
 use runs::{Meta, Run, RunKind};
 
 // ------------------------------------------------------------------ input
@@ -71,6 +76,8 @@ pub struct ChangesInput {
     pub screenshots: Vec<PathBuf>,
     /// The whole session as a log; batches read the part after the last run.
     pub log: Vec<LogItem>,
+    /// report.json of the approved plan of the session's task: the map shows plan vs fact.
+    pub plan: Option<PathBuf>,
 }
 
 /// Folder of a session's reports.
@@ -89,7 +96,13 @@ pub fn follows(key: &str) -> bool {
 #[serde(default)]
 pub struct Report {
     pub title: String,
+    /// «К чему идём»: one sentence on where this session takes the project.
+    pub goal: String,
     pub summary: String,
+    /// Why each module of arch.json was added or changed, in the reviewer's words.
+    pub modules: Vec<ModuleNote>,
+    /// Why each dependency of arch.json was added, removed or bumped.
+    pub deps: Vec<DepNote>,
     pub flow: Option<Diagram>,
     pub structure: Option<Diagram>,
     /// Extra diagrams of whatever type tells the story best: sequence, state, ER, class, …
@@ -113,6 +126,27 @@ pub struct Report {
     pub tests: Vec<TestRef>,
     /// The project's user flows this session went through, and changes to the flow map.
     pub flows: ReportFlows,
+    /// A plan: vertical slices, each with what you can run after it and how to check.
+    pub stages: Vec<stepan_verify_core::plans::Stage>,
+    /// A plan: decisions for you, with the agent's recommendation.
+    pub questions: Vec<stepan_verify_core::plans::Question>,
+}
+
+/// The reviewer's word on a module the app found changed (`arch.json`).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ModuleNote {
+    /// Path from the repository root, as in arch.json.
+    pub path: String,
+    pub note: String,
+}
+
+/// The reviewer's word on a dependency change.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct DepNote {
+    pub name: String,
+    pub why: String,
 }
 
 /// `flows` of a report: which steps of `.stepan_verify/flows.yaml` the session
@@ -263,11 +297,27 @@ pub struct Diagram {
     pub caption: String,
 }
 
-/// Two looks at one report: the canvas of entries and links, or show-me views.
+/// Looks at one report: modules and imports, the contract surface, before/after
+/// media; and the older canvas and show-me views.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Lens {
+    Arch,
+    Contracts,
+    Media,
     Map,
     Views,
+}
+
+impl Lens {
+    fn usage_id(self) -> &'static str {
+        match self {
+            Lens::Arch => "changes.arch",
+            Lens::Contracts => "changes.contracts",
+            Lens::Media => "changes.media",
+            Lens::Map => "changes.map",
+            Lens::Views => "changes.views",
+        }
+    }
 }
 
 /// One show-me view of how the change works.
@@ -528,6 +578,21 @@ pub enum ChangesEvent {
     Return(String),
     /// «Принять».
     Accept,
+    /// «Утвердить план»: this iteration.
+    ApprovePlan(usize),
+    /// Show the session that writes the plan.
+    OpenSession,
+}
+
+/// The view shows a task's plan instead of a session's changes.
+struct PlanMode {
+    task: String,
+    /// The task as on disk, re-read while the view is open.
+    meta: Option<stepan_verify_core::Task>,
+    /// Iteration numbers seen on disk.
+    seen: Vec<usize>,
+    /// A stage you clicked: its nodes light up on the canvas.
+    stage: Option<usize>,
 }
 
 /// Another family's agent trying to prove (or refute) one risk.
@@ -578,12 +643,23 @@ pub struct ChangesView {
     panel: Option<Panel>,
     /// Show the added / changed / removed columns instead of the map.
     show_list: bool,
-    /// The canvas of the change, or the show-me views of how it works.
+    /// Which look at the report is on screen.
     lens: Lens,
+    /// «Архитектура»: было / стало / разница, and the module in the side panel.
+    arch_mode: arch::Mode,
+    arch_sel: Option<String>,
+    /// arch.json of the run on screen, laid out (by run folder).
+    arch_cache: std::cell::RefCell<Option<(PathBuf, Option<Rc<arch::Graph>>)>>,
     /// Ticked rows of «Проверь руками».
     checked: HashSet<usize>,
     /// Node keys put into the remark for the agent.
     remarks: Vec<String>,
+    /// «Просмотрено» marks of this session (reviewed.json).
+    reviewed: reviewed::Marks,
+    /// Each reviewable node of the map on screen: its review state and current fingerprint.
+    review: std::collections::HashMap<String, (Review, String)>,
+    /// «Только новое»: hide nodes reviewed and unchanged since.
+    only_new: bool,
     accepted: bool,
     /// git.patch of each run (by run number), parsed once.
     git_patches: std::collections::HashMap<usize, Vec<(String, String)>>,
@@ -613,8 +689,13 @@ pub struct ChangesView {
     verifying: Option<VerifyJob>,
     /// Risks waiting for «Проверить все»: (run, risk key).
     verify_queue: Vec<(usize, String)>,
+    /// Set when the view shows a task's plan.
+    plan: Option<PlanMode>,
+    /// The approved plan this session implements, for «План: выполнено N из M».
+    fact_plan: Option<Report>,
     _ticker: Task<()>,
     _verify_ticker: Task<()>,
+    _plan_watch: Task<()>,
 }
 
 impl EventEmitter<ChangesEvent> for ChangesView {}
@@ -626,44 +707,18 @@ impl ChangesView {
         if let Err(err) = runs::migrate(&out) {
             eprintln!("stepan_verify: changes: migrate {}: {err}", out.display());
         }
-        let follow = runs::follows(&out);
-        let mut this = Self {
-            input,
-            out,
-            runs: Vec::new(),
-            selected: None,
-            running: None,
-            pending: false,
-            follow,
-            mode: MapMode::Diff,
-            hovered: None,
-            hovered_dto: None,
-            panel: None,
-            show_list: false,
-            lens: Lens::Map,
-            checked: HashSet::new(),
-            remarks: Vec::new(),
-            accepted: false,
-            git_patches: Default::default(),
-            news: false,
-            live_git: None,
-            view: canvas::View::default(),
-            fit_key: None,
-            drag: None,
-            fit_size: (0., 0.),
-            touched: false,
-            dragged: false,
-            viewport: Rc::new(Cell::new(None)),
-            flow_map: None,
-            flow_focus: None,
-            verify: Default::default(),
-            verifying: None,
-            verify_queue: Vec::new(),
-            _ticker: Task::ready(()),
-            _verify_ticker: Task::ready(()),
-        };
+        let mut this = Self::blank(input, out, None, cx);
+        stepan_verify_core::usage::hit("changes.open");
         media::observe(cx);
         this.reload(None);
+        // Debug hook: STEPAN_VERIFY_CHANGES_LENS=arch|contracts|media|map|views opens that tab.
+        this.lens = match std::env::var("STEPAN_VERIFY_CHANGES_LENS").as_deref() {
+            Ok("contracts") => Lens::Contracts,
+            Ok("media") => Lens::Media,
+            Ok("map") => Lens::Map,
+            Ok("views") => Lens::Views,
+            _ => Lens::Arch,
+        };
         if this.runs.is_empty() {
             this.start(cx);
         } else {
@@ -685,9 +740,108 @@ impl ChangesView {
         this
     }
 
+    /// The plan of task `task`: the map of the target state the planning
+    /// agent wrote (`state/plans/<task>`), newest iteration first. Nothing
+    /// runs from here; the view follows the folder as the agent writes.
+    pub fn plan(input: ChangesInput, task: String, cx: &mut Context<Self>) -> Self {
+        let home = stepan_verify_core::Home::locate();
+        let out = stepan_verify_core::plans::dir(&home, &task);
+        let mode = PlanMode { task, meta: None, seen: Vec::new(), stage: None };
+        let mut this = Self::blank(input, out, Some(mode), cx);
+        this.poll_plan(cx);
+        this._plan_watch = cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            if this.update(cx, |this, cx| this.poll_plan(cx)).is_err() {
+                break;
+            }
+        });
+        this
+    }
+
+    /// New plan iterations and task changes on disk.
+    fn poll_plan(&mut self, cx: &mut Context<Self>) {
+        let Some(plan) = &self.plan else { return };
+        let home = stepan_verify_core::Home::locate();
+        let seen = stepan_verify_core::plans::runs(&home, &plan.task);
+        let meta = stepan_verify_core::Board::new(home).get(&plan.task).ok();
+        let fresh = seen != plan.seen;
+        let moved = meta.as_ref().map(|t| (t.meta.status, t.meta.phase, t.meta.plan_approved)) != plan.meta.as_ref().map(|t| (t.meta.status, t.meta.phase, t.meta.plan_approved));
+        if let Some(plan) = &mut self.plan {
+            plan.seen = seen;
+            plan.meta = meta;
+        }
+        if fresh {
+            // A new iteration is what you are waiting for: show it.
+            self.reload(None);
+        }
+        if fresh || moved {
+            cx.notify();
+        }
+    }
+
+    fn plan_mode(&self) -> bool {
+        self.plan.is_some()
+    }
+
+    fn blank(input: ChangesInput, out: PathBuf, plan: Option<PlanMode>, _cx: &mut Context<Self>) -> Self {
+        let follow = plan.is_none() && runs::follows(&out);
+        let marks = if plan.is_none() { reviewed::load(&out) } else { Default::default() };
+        let fact_plan = input.plan.as_deref().and_then(load_report);
+        Self {
+            input,
+            out,
+            runs: Vec::new(),
+            selected: None,
+            running: None,
+            pending: false,
+            follow,
+            mode: MapMode::Diff,
+            hovered: None,
+            hovered_dto: None,
+            panel: None,
+            show_list: false,
+            lens: if plan.is_some() { Lens::Map } else { Lens::Arch },
+            arch_mode: arch::Mode::default(),
+            arch_sel: None,
+            arch_cache: Default::default(),
+            checked: HashSet::new(),
+            remarks: Vec::new(),
+            reviewed: marks,
+            review: Default::default(),
+            only_new: false,
+            accepted: false,
+            git_patches: Default::default(),
+            news: false,
+            live_git: None,
+            view: canvas::View::default(),
+            fit_key: None,
+            drag: None,
+            fit_size: (0., 0.),
+            touched: false,
+            dragged: false,
+            viewport: Rc::new(Cell::new(None)),
+            flow_map: None,
+            flow_focus: None,
+            verify: Default::default(),
+            verifying: None,
+            verify_queue: Vec::new(),
+            plan,
+            fact_plan,
+            _ticker: Task::ready(()),
+            _verify_ticker: Task::ready(()),
+            _plan_watch: Task::ready(()),
+        }
+    }
+
     /// Reread runs from disk; select `select` (a run number) or the newest good one.
     fn reload(&mut self, select: Option<usize>) {
         self.runs = runs::load_all(&self.out);
+        if self.plan_mode() {
+            // A plan has no session diff, no flows and no risk checks.
+            let by_n = select.and_then(|n| self.runs.iter().position(|r| r.n == n));
+            self.selected = by_n.or_else(|| self.runs.iter().rposition(|r| r.ok().is_some())).or(self.runs.len().checked_sub(1));
+            return;
+        }
         self.flow_map = FlowMap::load(&self.input.cwd).ok().flatten();
         for run in &self.runs {
             let checks = fs::read_to_string(run.dir.join("verify.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
@@ -716,6 +870,9 @@ impl ChangesView {
     /// The session moved on (a turn finished). With «Следить» on, a batch
     /// covers what happened since the last run.
     pub fn session_progressed(&mut self, input: ChangesInput, cx: &mut Context<Self>) {
+        if input.plan != self.input.plan {
+            self.fact_plan = input.plan.as_deref().and_then(load_report);
+        }
         self.input = input;
         self.news = self.has_news();
         if !self.follow || !self.news {
@@ -738,11 +895,19 @@ impl ChangesView {
             return true;
         }
         let commands = delta.iter().any(|i| matches!(i, LogItem::Command(_)));
-        commands && last.meta.git_snapshot.as_deref().is_some_and(|snap| !runs::diff(&self.input.cwd, Some(snap), last.meta.at.map(Into::into)).trim().is_empty())
+        commands
+            && match &last.meta.tree {
+                Some(tree) => runs::capture(&self.input.cwd, &self.out, tree).is_some_and(|c| !c.files.is_empty()),
+                // Runs from before the shadow capture.
+                None => last.meta.git_snapshot.as_deref().is_some_and(|snap| !runs::diff(&self.input.cwd, Some(snap), last.meta.at.map(Into::into)).trim().is_empty()),
+            }
     }
 
     fn toggle_follow(&mut self, on: bool, cx: &mut Context<Self>) {
         self.follow = on;
+        if on {
+            stepan_verify_core::usage::hit("changes.follow");
+        }
         runs::set_follow(&self.out, on);
         if on && self.running.is_none() && !self.runs.is_empty() && self.has_news() {
             self.launch(RunKind::Batch, cx);
@@ -764,22 +929,46 @@ impl ChangesView {
         let provider = self.input.provider;
         let model = crate::settings::report_model(provider, cx);
         let reviewer = reviewer_name(provider, model.as_deref());
-        let snapshot = runs::snapshot(&self.input.cwd);
+        // The session's diff base: resolved on its first run, then kept.
+        let git_base = self
+            .runs
+            .iter()
+            .find_map(|r| r.meta.base.clone())
+            .filter(|b| runs::base_ok(&self.input.cwd, b))
+            .or_else(|| runs::resolve_base(&self.input.cwd, media::session_base(&self.input.key).as_deref()));
         let mut meta = Meta {
             at: Some(chrono::Utc::now()),
             kind,
             upto: self.input.log.len(),
             base_run: base.as_ref().filter(|_| kind == RunKind::Batch).map(|b| b.0),
-            git_snapshot: snapshot,
+            git_snapshot: None,
+            base: git_base.clone(),
+            tree: None,
             edits: 0,
             reviewer: reviewer.clone(),
             error: None,
             cwd: Some(self.input.cwd.clone()),
         };
         let written = match (kind, &base) {
-            (RunKind::Batch, Some((_, base_dir, base_meta))) => self.write_batch_context(&dir, base_dir, base_meta),
-            _ => self.write_full_context(&dir),
+            (RunKind::Batch, Some((_, base_dir, base_meta))) => self.write_batch_context(&dir, base_dir, base_meta, git_base.as_deref()),
+            _ => self.write_full_context(&dir, git_base.as_deref()),
         };
+        // Modules, imports and dependencies, computed from the files: the «Архитектура»
+        // and «Контракты» tabs draw them, the reviewer only adds what they are for.
+        // A batch keeps the base of the first run, so the graph covers the whole session;
+        // a full run starts from the session's diff base, so the agent's commits stay in.
+        let arch_base = base
+            .as_ref()
+            .filter(|_| kind == RunKind::Batch)
+            .and_then(|(_, base_dir, _)| arch::load(base_dir))
+            .map(|a| a.base)
+            .or_else(|| git_base.clone())
+            .unwrap_or_else(|| "HEAD".to_owned());
+        if let Some(a) = stepan_verify_core::arch::compute(&self.input.cwd, &arch_base, &runs::is_noise) {
+            if let Ok(text) = serde_json::to_string_pretty(&a) {
+                let _ = fs::write(dir.join("arch.json"), text);
+            }
+        }
         // The flow map as it is now (compiled from the flow language): the reviewer reads it and proposes changes.
         if let Ok(Some(map)) = FlowMap::load(&self.input.cwd) {
             if let Ok(text) = serde_yaml::to_string(&map) {
@@ -787,7 +976,10 @@ impl ChangesView {
             }
         }
         match written {
-            Ok(edits) => meta.edits = edits,
+            Ok((edits, tree)) => {
+                meta.edits = edits;
+                meta.tree = tree;
+            }
             Err(err) => meta.error = Some(format!("Не удалось подготовить контекст: {err:#}")),
         }
         let _ = runs::save_meta(&dir, &meta);
@@ -888,6 +1080,35 @@ impl ChangesView {
         cx.notify();
     }
 
+    /// Review state of every card of the map on screen, against its content now.
+    fn refresh_review(&mut self, g: &Graph) {
+        let patches = self.patches();
+        self.review = g
+            .nodes
+            .iter()
+            .filter(|n| reviewed::reviewable(n))
+            .map(|n| {
+                let fp = reviewed::fingerprint(n, &node_hunks(n, &patches));
+                (n.key.clone(), (reviewed::review(&self.reviewed, &n.key, &fp), fp))
+            })
+            .collect();
+    }
+
+    /// Mark a node reviewed as it is now, or take the mark off a reviewed one.
+    fn toggle_reviewed(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some((state, fp)) = self.review.get(key).cloned() else { return };
+        if state == Review::Seen {
+            self.reviewed.remove(key);
+        } else {
+            let run = self.selected.and_then(|i| self.runs.get(i)).map_or(0, |r| r.n);
+            self.reviewed.insert(key.to_owned(), reviewed::Mark { run, fingerprint: fp, at: Some(chrono::Utc::now()) });
+        }
+        if let Err(err) = reviewed::save(&self.out, &self.reviewed) {
+            eprintln!("stepan_verify: changes: reviewed.json: {err}");
+        }
+        cx.notify();
+    }
+
     fn cancel(&mut self, cx: &mut Context<Self>) {
         if let Some(r) = &self.running {
             r.handle.interrupt();
@@ -896,8 +1117,45 @@ impl ChangesView {
         self.finish(Some("Отменено".into()), cx);
     }
 
-    /// context.md + session.patch (+ git.patch) for a full run. Returns the edit count.
-    fn write_full_context(&self, dir: &Path) -> anyhow::Result<usize> {
+    /// git.patch (this session's files) and other.patch (the rest of the
+    /// folder) from `from` to the work tree now, listed in `md` under
+    /// `heading`. Returns the captured tree; None outside git.
+    fn write_git(&self, dir: &Path, from: &str, heading: &str, md: &mut String) -> anyhow::Result<Option<String>> {
+        let i = &self.input;
+        let Some(cap) = runs::capture(&i.cwd, &self.out, from) else { return Ok(None) };
+        let edits: Vec<&str> = i.patches.iter().map(|(p, _)| p.as_str()).collect();
+        let (own, other) = runs::split_own(&cap, &i.cwd, &edits, &i.commands);
+        fs::write(dir.join("git.patch"), runs::tree_diff(&cap.top, from, &cap.tree, &own))?;
+        let list = |md: &mut String, files: &[&runs::Changed]| {
+            for f in files.iter().take(200) {
+                match &f.from {
+                    Some(old) => md.push_str(&format!("- {} {old} → {}\n", f.status, f.path)),
+                    None => md.push_str(&format!("- {} {}\n", f.status, f.path)),
+                }
+            }
+            if files.len() > 200 {
+                md.push_str(&format!("- … и ещё {}\n", files.len() - 200));
+            }
+        };
+        if !own.is_empty() {
+            md.push_str(heading);
+            list(md, &own);
+        }
+        if !other.is_empty() {
+            fs::write(dir.join("other.patch"), runs::tree_diff(&cap.top, from, &cap.tree, &other))?;
+            md.push_str(
+                "\n## Изменено в папке, но не этой сессией (возможно, другим агентом или пользователем)\n\n\
+                 Сессия не правила эти файлы инструментами и не называла их в командах. Не приписывай их ей; диффы — в other.patch. \
+                 Бери файл в карту, только если по командам сессии видно, что это её работа (скрипт, генератор, сборка).\n\n",
+            );
+            list(md, &other);
+        }
+        Ok(Some(cap.tree))
+    }
+
+    /// context.md + session.patch + git.patch (+ other.patch) for a full run.
+    /// Returns the edit count and the captured work tree.
+    fn write_full_context(&self, dir: &Path, base: Option<&str>) -> anyhow::Result<(usize, Option<String>)> {
         let i = &self.input;
         let mut md = format!("# Сессия: {}\n\nПроект: {}\n\n## Что просили\n\n", i.title, i.cwd.display());
         for r in &i.requests {
@@ -925,15 +1183,27 @@ impl ChangesView {
                 md.push_str(&format!("- {}\n", s.display()));
             }
         }
+        let heading = |base: &str| {
+            format!(
+                "\n## Изменения этой сессии в git (git.patch)\n\nС базы `{}` до рабочего дерева сейчас: и коммиты агента после неё, и новые неотслеживаемые файлы.\n\n",
+                &base[..base.len().min(10)]
+            )
+        };
+        let tree = match base {
+            Some(base) => self.write_git(dir, base, &heading(base), &mut md)?,
+            None => None,
+        };
+        if tree.is_none() {
+            fs::write(dir.join("git.patch"), runs::diff(&i.cwd, None, None))?;
+        }
         fs::write(dir.join("context.md"), md)?;
         let patch: String = i.patches.iter().map(|(p, d)| format!("--- a/{p}\n+++ b/{p}\n{d}\n")).collect();
         fs::write(dir.join("session.patch"), patch)?;
-        fs::write(dir.join("git.patch"), runs::diff(&i.cwd, None, None))?;
-        Ok(i.patches.len())
+        Ok((i.patches.len(), tree))
     }
 
     /// The part of the session after the base run, plus the base map.
-    fn write_batch_context(&self, dir: &Path, base_dir: &Path, base_meta: &Meta) -> anyhow::Result<usize> {
+    fn write_batch_context(&self, dir: &Path, base_dir: &Path, base_meta: &Meta, base: Option<&str>) -> anyhow::Result<(usize, Option<String>)> {
         let i = &self.input;
         let delta = i.log.get(base_meta.upto..).unwrap_or(&[]);
         let mut md = format!(
@@ -956,10 +1226,19 @@ impl ChangesView {
                 }
             }
         }
+        // From the work tree the base run saw; its files now, minus the rest of the folder.
+        let heading = "\n## Изменения этой сессии в git с прошлого прогона (git.patch)\n\n";
+        let tree = match &base_meta.tree {
+            Some(prev) => self.write_git(dir, prev, heading, &mut md)?,
+            None => {
+                // A base run from before the shadow capture: the old diff, and a tree for the next batch.
+                let since = base_meta.at.map(Into::into);
+                fs::write(dir.join("git.patch"), runs::diff(&i.cwd, base_meta.git_snapshot.as_deref(), since))?;
+                base.and_then(|b| runs::capture(&i.cwd, &self.out, b)).map(|c| c.tree)
+            }
+        };
         fs::write(dir.join("context.md"), md)?;
         fs::write(dir.join("session.patch"), patch)?;
-        let since = base_meta.at.map(Into::into);
-        fs::write(dir.join("git.patch"), runs::diff(&i.cwd, base_meta.git_snapshot.as_deref(), since))?;
         // The base map with picture paths made absolute, so a copied field still resolves.
         let text = fs::read_to_string(base_dir.join("report.json"))?;
         let mut v: serde_json::Value = serde_json::from_str(&text)?;
@@ -991,7 +1270,7 @@ impl ChangesView {
             }
         }
         fs::write(dir.join("base.json"), serde_json::to_string_pretty(&v)?)?;
-        Ok(edits)
+        Ok((edits, tree))
     }
 
     fn report(&self) -> Option<&Report> {
@@ -1231,7 +1510,14 @@ impl ChangesView {
 
     fn remark_text(&self, graph: &Graph, note: &str) -> String {
         let title = self.report().map(|r| r.title.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| self.input.title.clone());
-        let mut text = format!("Ревью изменений «{title}» — верни на доработку:\n");
+        let mut text = match &self.plan {
+            Some(plan) => {
+                let draft = stepan_verify_core::plans::draft(&stepan_verify_core::Home::locate(), &plan.task);
+                let run = self.selected.and_then(|i| self.runs.get(i)).map(|r| format!("Смотрел итерацию #{}.\n", r.n)).unwrap_or_default();
+                format!("{}{run}", plan::remarks_header(&title, &draft))
+            }
+            None => format!("Ревью изменений «{title}» — верни на доработку:\n"),
+        };
         for key in &self.remarks {
             if let Some(n) = graph.index(key).map(|i| &graph.nodes[i]) {
                 let file = if n.file.is_empty() { String::new() } else { format!(" ({})", n.file) };
@@ -1331,7 +1617,9 @@ fn find_skill() -> Option<PathBuf> {
         .find(|dir| dir.join("scripts/diagram.mjs").exists())
 }
 
-const SCHEMA: &str = "{\"title\": \"заголовок изменений\", \"summary\": \"2–4 предложения простым языком: что изменилось для продукта и пользователя\",\n\
+const SCHEMA: &str = "{\"title\": \"заголовок изменений\", \"goal\": \"к чему идём: одна фраза, куда сессия ведёт проект (не что сделано, а зачем)\", \"summary\": \"2–4 предложения простым языком: что изменилось для продукта и пользователя\",\n\
+ \"modules\": [{\"path\": \"путь из arch.json\", \"note\": \"зачем этот модуль появился или что в нём поменялось, одной фразой\"}],\n\
+ \"deps\": [{\"name\": \"пакет из arch.json\", \"why\": \"зачем добавлен, убран или обновлён\"}],\n\
  \"flow\": {\"title\": \"…\", \"image\": \"flow.png\", \"mermaid\": \"исходник\", \"caption\": \"одна фраза\"} или null,\n\
  \"structure\": {\"title\": \"…\", \"image\": \"structure.png\", \"caption\": \"…\"} или null,\n\
  \"diagrams\": [{\"title\": \"…\", \"image\": \"lifecycle.png\", \"mermaid\": \"исходник\", \"caption\": \"…\"}],\n\
@@ -1377,11 +1665,18 @@ const MAP_RULES: &str = "Карта — главное в отчёте: прил
 Если интерфейс поменялся — прежний в `signature_before`. `dtos` — все данные, которые передаются между узлами карты: пропсы компонентов, аргументы, тела и ответы API, события, куски состояния; \
 у каждой структуры поля с типами, изменённые поля помечай `status`. В `uses` указывай `via` — какой DTO едет по связи; `inputs`/`outputs` у записи — какие DTO она принимает и отдаёт. \
 Если session.patch пуст, агент правил файлы командами — бери изменения из git.patch. \
+other.patch (если есть) — файлы, изменённые в папке не этой сессией (другим агентом или человеком): в карту их не бери, если по командам сессии не видно, что это её работа. \
 Человек смотрит на карту как на канвас смыслов, а не реализации: сгруппируй записи в `features` по смыслу — функциональность для пользователя (kind `feature`, «эти штуки делают функционал X», 1–5 групп), \
 то, что ей помогает (`helper`: утилиты, константы, стили, обёртки, типы), инфраструктура и конфиг (`infra`). Каждая запись — ровно в одной группе; группы называй по-человечески, не по файлам; \
 `summary` группы — одна фраза, что она даёт. У каждой записи `role` (кто это: компонент, функция, хук, тип, конфиг…) и `entity` — короткое человеческое имя («Диалог выбора Джокера», «Полёт карты в альбом»). \
 Низкоуровневые мелочи не плоди отдельными узлами — сворачивай в helper-группу. `tests` — тесты, которые сессия добавила или поменяла, и существующие, что проверяют изменённое (поищи в проекте рядом с файлами); \
 `verifies` — id узлов, которые тест проверяет; `result` — только если видно, что тест запускали. Если тестов нет — оставь `tests` пустым, это тоже сигнал.";
+
+const ARCH_RULES: &str = "Структура: $OUT/arch.json посчитало приложение из файлов, а не модель — модули (файлы) со статусом added|changed|removed|same и +/- строк, \
+импорты между ними было/стало (`edges`: from импортирует to, status added|removed|same), изменения зависимостей в манифестах (`deps`) и lock-файлах (`locks`). \
+Не пересказывай и не исправляй его: человек увидит граф сам. Твоя часть — смысл: `goal` (к чему идём), `modules` — по фразе на каждый added/changed/removed модуль из arch.json \
+(`path` ровно как там: зачем модуль появился, что в нём теперь, почему удалён), `deps` — по фразе на каждый пакет из arch.json deps (зачем). \
+В `code` у записей пиши `file` тем же путём, что в arch.json, чтобы записи легли в свои модули. Если arch.json нет или он пуст — пропусти `modules` и `deps`.";
 
 const VIEW_RULES: &str = "Как устроено (`views`, приём скилла show-me): 1–4 компактных вида того, КАК теперь работает сделанное — то, что человек иначе выяснял бы чтением кода. \
 Бери самый маленький вид, который объясняет суть: поток выполнения — `call_tree` (дерево вызовов, отступ 2 пробела); UI — `component_tree` (компоненты с путями файлов в скобках, хуки и границы состояния, которые важны); \
@@ -1408,10 +1703,12 @@ fn prompt_full(out: &Path) -> String {
     format!(
         "[stepan_verify changes] Ты — ревьюер изменений. Задача: показать человеку, что изменила сессия агента, так, чтобы он понял это за минуту, не читая код.\n\n\
          Папка для результата: {out} (дальше $OUT). Там лежат context.md (что просили, что ответил агент, файлы, команды, скриншоты), \
-         session.patch (правки инструментами) и git.patch (git diff рабочего дерева). Текущая папка — проект.\n\n\
+         session.patch (правки инструментами), git.patch (файлы этой сессии в git с начала сессии, включая коммиты агента), \
+         если есть, other.patch (изменено в папке не этой сессией) и arch.json (модули и импорты было/стало, зависимости — посчитано приложением). Текущая папка — проект.\n\n\
          Шаги:\n\
-         1. Прочитай $OUT/context.md, $OUT/session.patch и $OUT/git.patch.\n\
+         1. Прочитай $OUT/context.md, $OUT/session.patch, $OUT/git.patch и $OUT/arch.json.\n\
          2. Что добавлено, удалено и изменено на уровне функций, компонентов, хуков, эндпоинтов, роутов, типов, таблиц, конфигов. Имена — как в коде. {MAP_RULES}\n\
+         2а. {ARCH_RULES}\n\
          3. Флоу: схема, как теперь работает то, что делала сессия: 5–12 узлов, подписи по-русски, в $OUT/flow.mmd. Тип выбирай под историю, а не всегда flowchart: \
 поток запроса — sequenceDiagram, кто что делает — swimlane-beta, жизненный цикл — stateDiagram-v2. Если поменялась структура модулей — before.mmd/after.mmd (тем же типом), иначе пропусти. \
 Если сессия меняла то, что лучше видно другой схемой (схема БД — erDiagram, классы/интерфейсы — classDiagram, статусы — stateDiagram-v2, папки — treeView-beta, план — gantt), \
@@ -1433,12 +1730,13 @@ fn prompt_batch(out: &Path) -> String {
     format!(
         "[stepan_verify changes] Ты ведёшь карту изменений длинной сессии агента и обновляешь её очередной порцией.\n\n\
          Папка: {out} ($OUT). $OUT/base.json — карта на прошлом шаге (полный отчёт). $OUT/context.md — что произошло с тех пор: \
-         сообщения человека и агента, команды, правки. $OUT/session.patch — новые правки инструментами, $OUT/git.patch — изменения рабочего дерева с прошлого шага. Текущая папка — проект.\n\n\
+         сообщения человека и агента, команды, правки. $OUT/session.patch — новые правки инструментами, $OUT/git.patch — изменения файлов сессии в git с прошлого шага, $OUT/other.patch (если есть) — изменено в папке не этой сессией. Текущая папка — проект.\n\n\
          Сделай:\n\
          1. Прочитай base.json и дельту. Не перечитывай весь проект: только то, что нужно, чтобы понять новые правки.\n\
          2. Обнови карту: сохрани id и записи из base.json, добавь новые узлы, поменяй статус/описание/связи затронутых, перенеси откаты. {MAP_RULES}\n\
+         2а. {ARCH_RULES} arch.json — за всю сессию на сейчас: перепиши `modules` и `deps` под него.\n\
          3. `decisions` — ТОЛЬКО решения из этой порции: что агент выбрал и почему, к каким узлам; `at` — момент в сессии.\n\
-         4. title/summary/риски/проверки обнови под итог на сейчас. Поля flow/structure/diagrams/ui скопируй из base.json как есть (схемы не перерисовывай).\n\
+         4. title/goal/summary/риски/проверки обнови под итог на сейчас. Поля flow/structure/diagrams/ui скопируй из base.json как есть (схемы не перерисовывай).\n\
          4а. {FLOW_RULES} В батче `flows.touched` — шаги, задетые за всю сессию (объедини с base.json), `proposal` — все предложения сессии на сейчас (объедини с base.json).\n\
          4б. {EVIDENCE_RULES}\n\
          4в. `views` (как устроено): оставь виды из base.json; поправь или добавь текстовый вид, только если порция поменяла форму кода (дерево вызовов, компонентов, файлов, псевдокод). Вид `html` копируй как есть. {VIEW_RULES}\n\
@@ -1462,6 +1760,7 @@ fn humanize_step(title: &str, out: &Path) -> String {
         ("context.md", "Читаю, что делала сессия"),
         ("session.patch", "Читаю диффы сессии"),
         ("git.patch", "Читаю изменения рабочего дерева"),
+        ("other.patch", "Смотрю чужие изменения в папке"),
         ("shoot.mjs", "Снимаю скриншот"),
         (".mmd", "Составляю схему"),
     ];
@@ -1484,6 +1783,20 @@ fn dirs_home() -> PathBuf {
     std::env::var_os("HOME").map(Into::into).unwrap_or_default()
 }
 
+/// A report from disk; None when missing or unreadable.
+fn load_report(path: &Path) -> Option<Report> {
+    fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok())
+}
+
+impl ChangesView {
+    /// A screenshot path from the report: the run folder first, then the project
+    /// (pr-before-after keeps pairs in `docs/pr/<slug>/`).
+    fn resolve_shot(&self, dir: &Path, p: &str) -> PathBuf {
+        let in_run = resolve(dir, p);
+        if in_run.exists() { in_run } else { self.input.cwd.join(p) }
+    }
+}
+
 fn resolve(out: &Path, p: &str) -> PathBuf {
     let path = PathBuf::from(p);
     if path.is_absolute() { path } else { out.join(path) }
@@ -1496,22 +1809,6 @@ fn themed_image(path: &Path, dark: bool) -> PathBuf {
         Some(path.with_file_name(format!("{stem}-dark.{}", ext.to_string_lossy())))
     });
     dark_twin.filter(|twin| twin.exists()).unwrap_or_else(|| path.to_path_buf())
-}
-
-/// Lines added / removed across patches.
-fn line_stats(patches: &[(String, String)]) -> (usize, usize) {
-    let mut added = 0;
-    let mut removed = 0;
-    for (_, patch) in patches {
-        for line in patch.lines() {
-            if line.starts_with('+') && !line.starts_with("+++") {
-                added += 1;
-            } else if line.starts_with('-') && !line.starts_with("---") {
-                removed += 1;
-            }
-        }
-    }
-    (added, removed)
 }
 
 /// Hunks of one file (each starts at its `@@` line).
@@ -1652,12 +1949,17 @@ fn status_tone(s: NodeStatus, p: &Palette) -> Option<Tone> {
     }
 }
 
-fn status_label(s: NodeStatus) -> &'static str {
-    match s {
-        NodeStatus::Added => "новое",
-        NodeStatus::Changed => "изменено",
-        NodeStatus::Removed => "удалено",
-        NodeStatus::Context => "не менялось",
+/// A node's status in words; a plan speaks of the future.
+fn status_label(s: NodeStatus, plan: bool) -> &'static str {
+    match (s, plan) {
+        (NodeStatus::Added, false) => "новое",
+        (NodeStatus::Changed, false) => "изменено",
+        (NodeStatus::Removed, false) => "удалено",
+        (NodeStatus::Context, false) => "не менялось",
+        (NodeStatus::Added, true) => "появится",
+        (NodeStatus::Changed, true) => "изменится",
+        (NodeStatus::Removed, true) => "уберётся",
+        (NodeStatus::Context, true) => "не меняется",
     }
 }
 
@@ -1726,7 +2028,16 @@ impl Render for ChangesView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let p = Palette::of(&theme);
-        let graph = self.report().map(|r| map::build_report(r));
+        let mut graph = self.report().map(|r| map::build_report(r));
+        match &mut graph {
+            Some(g) if !self.plan_mode() => {
+                self.refresh_review(g);
+                if self.only_new {
+                    g.hidden = self.review.iter().filter(|(_, (s, _))| *s == Review::Seen).map(|(k, _)| k.clone()).collect();
+                }
+            }
+            _ => self.review.clear(),
+        }
         // Drop a panel that points at a node this iteration does not have.
         if let (Some(Panel::Node(key)), Some(g)) = (&self.panel, &graph) {
             if g.index(key).is_none() {
@@ -1746,7 +2057,7 @@ impl Render for ChangesView {
         // Fit the canvas to its content when the map on screen changes.
         if let Some(g) = &graph {
             let run = self.selected.and_then(|i| self.runs.get(i)).map_or(0, |r| r.n);
-            let key = format!("{run}-{:?}", self.mode);
+            let key = format!("{run}-{:?}-{}", self.mode, self.only_new);
             let size = self.viewport.get().map(|b| (units(b.size.width), units(b.size.height)));
             let resized = size.is_some_and(|(w, h)| (w - self.fit_size.0).abs() > 1. || (h - self.fit_size.1).abs() > 1.);
             if self.fit_key.as_deref() != Some(key.as_str()) || (resized && !self.touched) {
@@ -1769,10 +2080,17 @@ impl Render for ChangesView {
             (Some(g), _, _) => {
                 // The canvas takes most of the window height; the page scrolls around it.
                 let canvas_h = (units(window.viewport_size().height) - 340.).max(440.);
-                self.render_report(g, canvas_h, &p, &theme, cx).into_any_element()
+                self.render_report(g, canvas_h, &p, &theme, window, cx).into_any_element()
             }
             (None, _, Some(r)) if self.selected.is_none() || self.selected.and_then(|i| self.runs.get(i)).is_some_and(|run| run.n == r.n) => {
                 self.render_running(&p, &theme, cx).into_any_element()
+            }
+            (None, run, _) if self.plan_mode() => {
+                let err = run.and_then(|r| match &r.report {
+                    Some(Err(e)) => Some(e.clone()),
+                    _ => r.meta.error.clone(),
+                });
+                self.render_plan_pending(err, &p, &theme, cx).into_any_element()
             }
             (None, run, _) => self.render_failed(run.and_then(|r| r.meta.error.clone()), &p, &theme, cx).into_any_element(),
         };
@@ -1791,7 +2109,8 @@ impl Render for ChangesView {
                         .child(self.render_header(&p, &theme, cx))
                         .when(self.runs.len() > 1 || self.running.is_some() && !self.runs.is_empty(), |this| this.child(self.render_iterations(&p, &theme, cx)))
                         .child(body)
-                        .child(media::render(&self.input, window, cx)),
+                        // With a report the scenes live in «До / После»; without one, here. A plan has no scenes.
+                        .when(!self.plan_mode() && graph.is_none(), |this| this.child(media::render(&self.input, window, cx))),
                 ),
             )
             .when_some(graph.as_ref(), |this, g| this.child(self.render_bar(g, &p, &theme, cx)));
@@ -1803,7 +2122,10 @@ impl Render for ChangesView {
 }
 
 impl ChangesView {
-    fn render_header(&self, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_header(&self, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(plan) = &self.plan {
+            return self.render_plan_header(plan, p, theme, cx).into_any_element();
+        }
         let run = self.selected.and_then(|i| self.runs.get(i));
         let r = self.report();
         let provider = self.input.provider;
@@ -1874,6 +2196,7 @@ impl ChangesView {
                     .text_color(p.ink)
                     .child(r.map(|r| r.title.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| self.input.title.clone())),
             )
+            .into_any_element()
     }
 
     /// One chip per run: the history of the map.
@@ -1894,14 +2217,18 @@ impl ChangesView {
         let running_n = self.running.as_ref().map(|r| r.n);
         v_flex()
             .gap(px(8.))
-            .child(ui::section_title("Итерации", Some(self.runs.len().to_string()), p, theme).child(ui::mono("каждый «Пересобрать» и каждый батч — отдельный снимок карты", theme).text_color(p.faint)))
+            .child(ui::section_title("Итерации", Some(self.runs.len().to_string()), p, theme).child(
+                ui::mono(if self.plan_mode() { "каждое «Отправить агенту» — новая итерация плана" } else { "каждый «Пересобрать» и каждый батч — отдельный снимок карты" }, theme).text_color(p.faint),
+            ))
             .child(
                 div().id("iterations-scroll").overflow_x_scroll().child(
                     h_flex().gap(px(6.)).pb(px(2.)).children(self.runs.iter().enumerate().map(|(i, run)| {
                         let active = self.selected == Some(i);
                         let is_running = running_n == Some(run.n);
                         let failed = run.ok().is_none() && !is_running;
+                        let approved = self.plan.as_ref().and_then(|pl| pl.meta.as_ref()).and_then(|t| t.meta.plan_approved) == Some(run.n);
                         let kind = match run.meta.kind {
+                            _ if self.plan_mode() => "план".to_owned(),
                             RunKind::Full => "полный".to_owned(),
                             RunKind::Batch => format!("батч · +{} {}", run.meta.edits, edits_word(run.meta.edits)),
                         };
@@ -1916,6 +2243,7 @@ impl ChangesView {
                             .child(div().font_family(mono.clone()).text_size(px(11.)).text_color(p.faint).child(hhmm(run.meta.at)))
                             .when(is_running, |d| d.child(Spinner::new().xsmall().color(p.blue.solid)))
                             .when(failed, |d| d.child(ui::badge("ошибка", p.red)))
+                            .when(approved, |d| d.child(ui::badge("утверждён", p.green)))
                             .when(decisions > 0, |d| d.child(ui::badge(format!("{decisions} реш."), p.blue)))
                     })),
                 ),
@@ -1993,11 +2321,11 @@ impl ChangesView {
         )
     }
 
-    fn render_report(&self, g: &Graph, canvas_h: f32, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_report(&self, g: &Graph, canvas_h: f32, p: &Palette, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(r) = self.report() else { return div().into_any_element() };
-        let patches = self.patches();
-        let files = patches.iter().map(|(f, _)| f.as_str()).collect::<std::collections::BTreeSet<_>>().len();
-        let (plus, minus) = line_stats(&patches);
+        if self.plan_mode() {
+            return self.render_plan_report(g, r, canvas_h, p, theme, cx);
+        }
         let dir = self.run_dir();
         // Nodes that are new or different compared with the previous good iteration.
         let fresh: HashSet<String> = self
@@ -2022,45 +2350,59 @@ impl ChangesView {
                         .child(format!("Батч #{} собирается · {} · {}", run.n, run.model, run.steps.last().cloned().unwrap_or_else(|| "читает новые ходы".into()))),
                 )
             })
-            // Which user flows the session went through, then the canvas of what changed.
-            .child(self.render_flows(g, r, p, theme, cx))
+            // Where the session takes the project, what it did, then the looks at the change.
+            .child(self.render_goal(r, &dir, p, theme))
+            // How the session covers its task's approved plan.
+            .when_some(self.fact_plan.as_ref(), |this, plan| this.child(self.render_coverage(plan, g, p, theme, cx)))
             .child(self.render_lens_tabs(r, p, theme, cx))
             .child(match self.lens {
+                Lens::Arch => v_flex()
+                    .gap(px(22.))
+                    .child(self.render_arch(r, p, theme, cx))
+                    // The reviewer's diagrams explain the same structure in pictures.
+                    .when_some(r.flow.clone(), |this, d| this.child(self.render_diagram("flow".into(), &d, &dir, p, theme)))
+                    .when_some(r.structure.clone(), |this, d| this.child(self.render_diagram("structure".into(), &d, &dir, p, theme)))
+                    .children(r.diagrams.iter().enumerate().map(|(i, d)| self.render_diagram(format!("extra-{i}"), d, &dir, p, theme)))
+                    .into_any_element(),
+                Lens::Contracts => self.render_contracts(r, p, theme),
+                Lens::Media => v_flex()
+                    .gap(px(22.))
+                    .children(r.ui.iter().enumerate().map(|(i, u)| self.render_ui_pair(i, u, &dir, p)))
+                    .child(media::render(&self.input, window, cx))
+                    .into_any_element(),
                 Lens::Map => self.render_map_section(g, r, &fresh, canvas_h, p, theme, cx).into_any_element(),
                 Lens::Views => self.render_views(g, r, &dir, p, theme, cx),
+            })
+            .child(self.render_risks(g, r, p, theme, cx))
+            .when_some(self.render_decisions(g, p, theme, cx), |this, d| this.child(d))
+            // Which user flows the session went through: below the structure, not in its way.
+            .child(self.render_flows(g, r, p, theme, cx))
+            .into_any_element()
+    }
+
+    /// «К чему идём» and what the session did, above the tabs.
+    fn render_goal(&self, r: &Report, dir: &Path, p: &Palette, theme: &Theme) -> impl IntoElement {
+        v_flex()
+            .gap(px(8.))
+            .max_w(px(860.))
+            .when(!r.goal.is_empty(), |this| {
+                this.child(
+                    h_flex()
+                        .gap(px(10.))
+                        .items_baseline()
+                        .child(ui::eyebrow("к чему идём", p, theme).flex_shrink_0())
+                        .child(div().text_size(px(15.)).line_height(px(22.)).font_weight(FontWeight::SEMIBOLD).text_color(p.ink).child(r.goal.clone())),
+                )
             })
             .when(!r.summary.is_empty(), |this| {
                 this.child(
                     div()
-                        .max_w(px(780.))
                         .text_size(px(14.))
                         .line_height(px(22.))
                         .text_color(p.fg)
                         .child(TextView::markdown(SharedString::from(format!("changes-summary-{}", dir.display())), r.summary.clone()).selectable(true)),
                 )
             })
-            .child(metrics(files, plus, minus, &r.code, r.risks.len(), p, theme))
-
-            .when_some(self.render_decisions(g, p, theme, cx), |this, d| this.child(d))
-            .child(
-                h_flex()
-                    .gap(px(14.))
-                    .items_start()
-                    .child(div().flex_1().min_w_0().child(self.render_files(g, &patches, p, theme, cx)))
-                    .child(div().flex_1().min_w_0().child(self.render_risks(g, r, p, theme, cx))),
-            )
-            .when_some(r.flow.clone(), |this, d| this.child(self.render_diagram("flow".into(), &d, &dir, p, theme)))
-            .when_some(r.structure.clone(), |this, d| this.child(self.render_diagram("structure".into(), &d, &dir, p, theme)))
-            .children(r.diagrams.iter().enumerate().map(|(i, d)| self.render_diagram(format!("extra-{i}"), d, &dir, p, theme)))
-            .when(!r.ui.is_empty(), |this| {
-                this.child(
-                    v_flex()
-                        .gap(px(12.))
-                        .child(ui::section_title("Интерфейс", None, p, theme).child(ui::mono("было → стало", theme).text_color(p.faint)))
-                        .children(r.ui.iter().enumerate().map(|(i, u)| self.render_ui_pair(i, u, &dir, p))),
-                )
-            })
-            .into_any_element()
     }
 
     /// «Затронутые флоу»: user flows of the project the session went through,
@@ -2299,6 +2641,10 @@ impl ChangesView {
                 .child(label)
         };
         let has_nodes = g.nodes.iter().any(|n| !n.implicit);
+        let plan = self.plan_mode();
+        let reviewable = self.review.len();
+        let seen = self.review.values().filter(|(s, _)| *s == Review::Seen).count();
+        let changed_since = self.review.values().filter(|(s, _)| *s == Review::ChangedSince).count();
         v_flex()
             .gap(px(10.))
             .child(
@@ -2313,8 +2659,8 @@ impl ChangesView {
                             .border_1()
                             .border_color(p.border)
                             .bg(p.sunken)
-                            .child(mode_btn("map-before", "Было", MapMode::Before, cx))
-                            .child(mode_btn("map-after", "Стало", MapMode::After, cx))
+                            .child(mode_btn("map-before", if plan { "Сейчас" } else { "Было" }, MapMode::Before, cx))
+                            .child(mode_btn("map-after", if plan { "Станет" } else { "Стало" }, MapMode::After, cx))
                             .child(mode_btn("map-diff", "Разница", MapMode::Diff, cx))
                             .child(
                                 h_flex()
@@ -2332,18 +2678,75 @@ impl ChangesView {
                                     .child("Списком"),
                             ),
                     )
-                    .child(legend(format!("новое · {}", count(NodeStatus::Added)), Some(p.green), false))
-                    .child(legend(format!("изменено · {}", count(NodeStatus::Changed)), Some(p.amber), false))
-                    .child(legend(format!("удалено · {}", count(NodeStatus::Removed)), Some(p.red), false))
-                    .when(removed_links > 0, |d| d.child(legend(format!("убрана связь · {removed_links}"), Some(p.red), true)))
-                    .child(legend("не менялось".into(), None, true))
+                    .when(plan, |d| d.child(ui::mono("станет:", theme).text_color(p.faint)))
+                    .child(legend(format!("{} · {}", status_label(NodeStatus::Added, plan), count(NodeStatus::Added)), Some(p.green), false))
+                    .child(legend(format!("{} · {}", status_label(NodeStatus::Changed, plan), count(NodeStatus::Changed)), Some(p.amber), false))
+                    .child(legend(format!("{} · {}", status_label(NodeStatus::Removed, plan), count(NodeStatus::Removed)), Some(p.red), false))
+                    .when(removed_links > 0, |d| d.child(legend(format!("{} · {removed_links}", if plan { "уберётся связь" } else { "убрана связь" }), Some(p.red), true)))
+                    .child(legend(status_label(NodeStatus::Context, plan).into(), None, true))
                     .when(!fresh.is_empty(), |d| {
                         d.child(h_flex().gap(px(5.)).text_size(px(12.)).text_color(p.blue.text).child(div().size(px(8.)).rounded_full().bg(p.blue.solid)).child(format!("новое в итерации · {}", fresh.len())))
+                    })
+                    .when(reviewable > 0 && !self.show_list, |d| {
+                        d.child(div().flex_1()).child(
+                            h_flex()
+                                .flex_shrink_0()
+                                .gap(px(12.))
+                                .when(changed_since > 0, |d| {
+                                d.child(
+                                    h_flex()
+                                        .gap(px(5.))
+                                        .text_size(px(12.))
+                                        .text_color(p.accent.text)
+                                        .child(Icon::new(IconName::RefreshCw).xsmall().text_color(p.accent.solid))
+                                        .child(format!("изменилось после просмотра · {changed_since}")),
+                                )
+                            })
+                            .child(
+                                h_flex()
+                                    .gap(px(5.))
+                                    .text_size(px(12.))
+                                    .text_color(p.muted)
+                                    .child(Icon::new(IconName::CircleCheck).xsmall().text_color(if seen > 0 { p.green.solid } else { p.faint }))
+                                    .child(format!("просмотрено {seen} из {reviewable}")),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap(px(6.))
+                                    .child(Switch::new("map-only-new").checked(self.only_new).on_click(cx.listener(|this, on: &bool, _, cx| {
+                                        this.only_new = *on;
+                                        if *on {
+                                            stepan_verify_core::usage::hit("changes.only_new");
+                                        }
+                                        cx.notify();
+                                    })))
+                                    .child(div().text_size(px(12.5)).font_weight(FontWeight::MEDIUM).text_color(if self.only_new { p.ink } else { p.muted }).child("Только новое")),
+                            ),
+                        )
                     }),
             )
             .map(|this| {
                 if self.show_list || !has_nodes {
                     this.child(render_columns(&r.code, p, theme))
+                } else if self.only_new && seen == reviewable && reviewable > 0 {
+                    this.child(
+                        v_flex()
+                            .h(px(160.))
+                            .items_center()
+                            .justify_center()
+                            .gap(px(10.))
+                            .rounded(px(10.))
+                            .border_1()
+                            .border_dashed()
+                            .border_color(p.border_strong)
+                            .bg(p.sunken)
+                            .child(h_flex().gap(px(6.)).text_size(px(13.5)).text_color(p.fg).child(Icon::new(IconName::CircleCheck).small().text_color(p.green.solid)).child("Всё на карте просмотрено"))
+                            .child(div().text_size(px(12.5)).text_color(p.muted).child("Новое и изменённое после просмотра появится здесь со следующим прогоном"))
+                            .child(PressButton::new("map-show-all").xsmall().outline().label("Показать всю карту").on_click(cx.listener(|this, _, _, cx| {
+                                this.only_new = false;
+                                cx.notify();
+                            }))),
+                    )
                 } else {
                     let dtos: Vec<(usize, &map::MapDto)> = g.visible_dtos(self.mode).collect();
                     let dto_focus = self
@@ -2412,8 +2815,10 @@ impl ChangesView {
                 .collect();
             Some(hits)
         });
+        // A stage of the plan you clicked: its nodes.
+        let stage_lit: Option<HashSet<usize>> = self.plan.as_ref().and_then(|pl| pl.stage).and_then(|si| r.stages.get(si)).map(|s| plan::stage_nodes(g, &s.nodes));
         let lit: Option<HashSet<usize>> = match (dto_focus, focus_ix, group_focus) {
-            (None, None, _) if flow_lit.is_some() => flow_lit.clone(),
+            (None, None, _) if stage_lit.is_some() || flow_lit.is_some() => stage_lit.clone().or(flow_lit.clone()),
             (Some(d), _, _) => Some(g.dtos[d].users.iter().copied().collect()),
             (None, Some(f), _) => {
                 let mut s: HashSet<usize> = g.edges.iter().filter(|e| (e.from == f || e.to == f) && g.edge_visible(e, mode)).flat_map(|e| [e.from, e.to]).collect();
@@ -2614,7 +3019,8 @@ impl ChangesView {
                                             .text_color(tone.map_or(p.muted, |t| t.text))
                                             .child(format!("{} · {count}", gr.kind.label())),
                                     )
-                                    .when(gr.kind == map::GroupKind::Feature, |d| {
+                                    // A plan proves nothing yet.
+                                    .when(gr.kind == map::GroupKind::Feature && !self.plan_mode(), |d| {
                                         let (label, tone) = evidence_badge(group_rank(r, g, gi), p);
                                         d.child(
                                             div()
@@ -2655,6 +3061,8 @@ impl ChangesView {
             let untested = has_tests && g.untested(i);
             let file = n.file.rsplit('/').next().unwrap_or_default().to_owned();
             let test_result = n.test.as_ref().map(|t| t.result.clone()).filter(|r| !r.is_empty());
+            let rev = self.review.get(&n.key).map(|(s, _)| *s);
+            let review_key = n.key.clone();
             // At rest: role and the human name. Pointed at: grows over its
             // neighbours with the code name, signature and file.
             let expanded = text && self.hovered.as_deref() == Some(n.key.as_str()) && !self.drag.is_some_and(|d| d.moved);
@@ -2676,6 +3084,8 @@ impl ChangesView {
                 .gap(px(zl(4.)))
                 .cursor_pointer()
                 .when(dim, |d| d.opacity(0.25))
+                // Reviewed and unchanged since: steps back until you point at it.
+                .when(!dim && rev == Some(Review::Seen) && !is_sel && !expanded, |d| d.opacity(0.5))
                 .map(|d| {
                     if ctx {
                         d.border_dashed().border_color(p.border_strong).bg(ui::mix(p.surface, p.sunken, 0.55))
@@ -2718,7 +3128,7 @@ impl ChangesView {
                             .child(Icon::empty().path(role.icon()).with_size(px(zl(12.))).text_color(if role == map::Role::Test { p.blue.solid } else { p.muted }))
                             .child(div().flex_1().min_w_0().truncate().font_family(mono.clone()).text_size(px(zl(10.))).text_color(p.muted).child(role.label().to_uppercase()))
                             .when_some(status_tone(n.status, p).filter(|_| n.status != NodeStatus::Context), |d, t| {
-                                d.child(div().flex_shrink_0().px(px(zl(5.))).rounded(px(zl(4.))).bg(t.soft).text_size(px(zl(10.))).font_weight(FontWeight::SEMIBOLD).text_color(t.text).child(status_label(n.status)))
+                                d.child(div().flex_shrink_0().px(px(zl(5.))).rounded(px(zl(4.))).bg(t.soft).text_size(px(zl(10.))).font_weight(FontWeight::SEMIBOLD).text_color(t.text).child(status_label(n.status, self.plan_mode())))
                             })
                             .when(risks > 0, |d| {
                                 d.child(
@@ -2741,6 +3151,34 @@ impl ChangesView {
                                     _ => ("не запускался", p.amber),
                                 };
                                 d.child(div().flex_shrink_0().px(px(zl(5.))).rounded(px(zl(4.))).bg(t.soft).text_size(px(zl(10.))).text_color(t.text).child(label))
+                            })
+                            // «Просмотрено»: a mark on reviewed cards, a toggle on the one you point at.
+                            .when_some(rev.filter(|r| *r != Review::New || expanded), |d, r| {
+                                let (icon, color, tip) = match r {
+                                    Review::Seen => (IconName::CircleCheck, p.green.solid, "Просмотрено · снять отметку"),
+                                    Review::ChangedSince => (IconName::RefreshCw, p.accent.solid, "Изменилось после просмотра · отметить просмотренным"),
+                                    Review::New => (IconName::Check, p.faint, "Отметить просмотренным"),
+                                };
+                                d.child(
+                                    div()
+                                        .id(SharedString::from(format!("node-review-{review_key}")))
+                                        .flex_shrink_0()
+                                        .size(px(zl(15.)))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(zl(4.)))
+                                        .hover(|s| s.bg(p.surface2))
+                                        .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip).build(window, cx))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if this.dragged {
+                                                return;
+                                            }
+                                            cx.stop_propagation();
+                                            this.toggle_reviewed(&review_key, cx);
+                                        }))
+                                        .child(Icon::new(icon).with_size(px(zl(12.))).text_color(color)),
+                                )
                             }),
                     )
                     .child(
@@ -2913,7 +3351,7 @@ impl ChangesView {
             .gap(px(8.))
             .child(ui::mono("тащи — двигать · ⌘ + колесо или щипок — масштаб · двойной клик — вписать", theme).text_size(px(10.5)).text_color(p.faint))
             .when(!has_tests && g.nodes.iter().any(|n| !n.implicit && n.status != NodeStatus::Context), |d| {
-                d.child(ui::badge("тестов нет — изменения ничем не проверены", p.amber).text_size(px(10.5)))
+                d.child(ui::badge(if self.plan_mode() { "в плане нет тестов" } else { "тестов нет — изменения ничем не проверены" }, p.amber).text_size(px(10.5)))
             });
         let grabbing = self.drag.is_some_and(|d| d.moved);
 
@@ -3076,7 +3514,9 @@ impl ChangesView {
 
     fn render_decisions(&self, g: &Graph, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let upto = self.selected?;
-        let groups: Vec<(&Run, &Report)> = self.runs[..=upto].iter().filter_map(|r| r.ok().map(|rep| (r, rep))).filter(|(_, rep)| !rep.decisions.is_empty()).collect();
+        // A plan iteration is whole: only its own decisions.
+        let from = if self.plan_mode() { upto } else { 0 };
+        let groups: Vec<(&Run, &Report)> = self.runs[from..=upto].iter().filter_map(|r| r.ok().map(|rep| (r, rep))).filter(|(_, rep)| !rep.decisions.is_empty()).collect();
         if groups.is_empty() {
             return None;
         }
@@ -3085,9 +3525,11 @@ impl ChangesView {
         Some(
             v_flex()
                 .gap(px(12.))
-                .child(ui::section_title("Решения агента", Some(total.to_string()), p, theme).child(ui::mono("как и почему менялась карта, по итерациям", theme).text_color(p.faint)))
+                .child(ui::section_title("Решения агента", Some(total.to_string()), p, theme).child(
+                    ui::mono(if self.plan_mode() { "что агент выбрал для плана и почему" } else { "как и почему менялась карта, по итерациям" }, theme).text_color(p.faint),
+                ))
                 .child(ui::card(p).overflow_hidden().children(groups.into_iter().enumerate().map(|(gi, (run, rep))| {
-                    let kind = if run.meta.kind == RunKind::Full { "полный" } else { "батч" };
+                    let kind = if self.plan_mode() { "план" } else if run.meta.kind == RunKind::Full { "полный" } else { "батч" };
                     v_flex()
                         .when(gi > 0, |d| d.border_t_1().border_color(p.border))
                         .child(
@@ -3156,51 +3598,6 @@ impl ChangesView {
             .child(div().size(px(7.)).rounded(px(2.)).bg(tone.map_or(p.border_strong, |t| t.solid)))
             .child(div().font_family(theme.mono_font_family.clone()).text_size(px(11.5)).text_color(p.ink).child(n.name.clone()))
             .into_any_element()
-    }
-
-    fn render_files(&self, g: &Graph, patches: &[(String, String)], p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut files: Vec<String> = Vec::new();
-        for n in g.nodes.iter().filter(|n| !n.file.is_empty() && n.status != NodeStatus::Context) {
-            if !files.contains(&n.file) {
-                files.push(n.file.clone());
-            }
-        }
-        for (f, _) in patches {
-            if !files.iter().any(|x| x == f || f.ends_with(&format!("/{x}")) || x.ends_with(&format!("/{f}"))) {
-                files.push(f.clone());
-            }
-        }
-        let root = self.input.cwd.clone();
-        v_flex()
-            .gap(px(10.))
-            .child(ui::section_title("Файлы", Some(files.len().to_string()), p, theme))
-            .child(ui::card(p).overflow_hidden().when(files.is_empty(), |c| c.child(div().p(px(14.)).text_size(px(12.5)).text_color(p.faint).child("—"))).children(files.iter().enumerate().map(|(fi, f)| {
-                let hunks = file_hunks(patches, f);
-                let (plus, minus) = line_stats(&hunks.iter().map(|h| (f.clone(), h.clone())).collect::<Vec<_>>());
-                let members: Vec<&map::MapNode> = g.nodes.iter().filter(|n| &n.file == f && !n.implicit).collect();
-                let all_new = !members.is_empty() && members.iter().all(|n| n.status == NodeStatus::Added);
-                let (open, root) = (root.join(f), root.clone());
-                v_flex()
-                    .px(px(14.))
-                    .py(px(10.))
-                    .gap(px(7.))
-                    .when(fi > 0, |d| d.border_t_1().border_color(p.border))
-                    .child(
-                        h_flex()
-                            .id(SharedString::from(format!("file-{fi}")))
-                            .gap(px(8.))
-                            .cursor_pointer()
-                            .on_click(move |_, window, cx| crate::preview::open_in_app(open.clone(), Some(root.clone()), window, cx))
-                            .child(ui::badge(if all_new { "NEW" } else { "MOD" }, if all_new { p.green } else { p.amber }).font_family(theme.mono_font_family.clone()).text_size(px(10.)))
-                            .child(div().flex_1().min_w_0().truncate().font_family(theme.mono_font_family.clone()).text_size(px(12.)).text_color(p.ink).child(f.clone()))
-                            .when(plus + minus > 0, |h| {
-                                h.child(ui::mono(format!("+{plus}"), theme).text_color(p.green.text)).child(ui::mono(format!("−{minus}"), theme).text_color(p.red.text))
-                            }),
-                    )
-                    .when(!members.is_empty(), |v| {
-                        v.child(h_flex().gap(px(5.)).flex_wrap().children(members.iter().enumerate().map(|(mi, n)| self.node_chip(SharedString::from(format!("file-{fi}-node-{mi}")), &n.key, g, p, theme, cx))))
-                    })
-            })))
     }
 
     /// Risks with their proof level; each can be handed to an agent of the
@@ -3446,7 +3843,11 @@ impl ChangesView {
                 .py(px(14.))
                 .gap(px(4.))
                 .child(div().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).text_color(p.ink).child("В этой итерации видов нет"))
-                .child(div().text_size(px(12.5)).text_color(p.muted).child("Их пишет ревьюер с Stepan 0.2.6 — нажми «Пересобрать» или «Дополнить»."))
+                .child(div().text_size(px(12.5)).text_color(p.muted).child(if self.plan_mode() {
+                    "Агент не показал, как будет устроено, — попроси в замечаниях дерево вызовов или макет."
+                } else {
+                    "Их пишет ревьюер с Stepan 0.2.6 — нажми «Пересобрать» или «Дополнить»."
+                }))
                 .into_any_element();
         }
         div().flex().flex_wrap().gap(px(12.)).items_start().children(cards).into_any_element()
@@ -3468,12 +3869,33 @@ impl ChangesView {
                 .map(|d| if active { d.bg(p.surface).text_color(p.ink).shadow(ui::card_shadow()) } else { d.text_color(p.muted).hover(|s| s.text_color(p.ink)) })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.lens = lens;
+                    stepan_verify_core::usage::hit(lens.usage_id());
                     cx.notify();
                 }))
                 .child(Icon::new(icon).small())
                 .child(label)
-                .when_some(count, |d, n| d.child(div().font_family(theme.mono_font_family.clone()).text_size(px(11.5)).text_color(p.faint).child(n.to_string())))
+                .when_some(count.filter(|n| *n > 0), |d, n| d.child(div().font_family(theme.mono_font_family.clone()).text_size(px(11.5)).text_color(p.faint).child(n.to_string())))
         };
+        // The older looks stay reachable, quietly.
+        let old = |key: &'static str, label: &'static str, lens: Lens, cx: &mut Context<Self>| {
+            let active = self.lens == lens;
+            div()
+                .id(key)
+                .cursor_pointer()
+                .text_size(px(12.5))
+                .text_color(if active { p.ink } else { p.faint })
+                .when(active, |d| d.font_weight(FontWeight::SEMIBOLD))
+                .hover(|s| s.text_color(p.ink))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.lens = lens;
+                    stepan_verify_core::usage::hit(lens.usage_id());
+                    cx.notify();
+                }))
+                .child(label)
+        };
+        let modules = self.arch_graph().map(|g| g.arch.modules.iter().filter(|m| m.status != stepan_verify_core::arch::Status::Same).count());
+        let scenes: usize = r.ui.len() + media::load_all(&self.input.key).iter().filter_map(|m| m.manifest.as_ref()?.as_ref().ok()).map(|m| m.items.len()).sum::<usize>();
+        let types = contracts::type_count(r);
         h_flex()
             .gap(px(12.))
             .child(
@@ -3484,10 +3906,33 @@ impl ChangesView {
                     .border_1()
                     .border_color(p.border)
                     .bg(p.sunken)
-                    .child(tab("lens-map", IconName::Network, "Карта", None, Lens::Map, cx))
-                    .child(tab("lens-views", IconName::Eye, "Как устроено", Some(r.views.len()), Lens::Views, cx)),
+                    .map(|d| {
+                        if self.plan_mode() {
+                            // A plan has no diff yet: its looks are the canvas and «как будет устроено».
+                            d.child(tab("lens-map", IconName::Network, "Карта", None, Lens::Map, cx))
+                                .child(tab("lens-views", IconName::Eye, "Как устроено", Some(r.views.len()), Lens::Views, cx))
+                        } else {
+                            d.child(tab("lens-arch", IconName::Network, "Архитектура", modules, Lens::Arch, cx))
+                                .child(tab("lens-contracts", IconName::Frame, "Контракты", Some(types), Lens::Contracts, cx))
+                                .child(tab("lens-media", IconName::Eye, "До / После", Some(scenes), Lens::Media, cx))
+                        }
+                    }),
             )
-            .child(ui::mono(if self.lens == Lens::Map { "канвас: что изменилось и как связано" } else { "show-me: деревья, псевдокод, было → стало" }, theme).text_color(p.faint))
+            .child(ui::mono(
+                match (self.plan_mode(), self.lens) {
+                    (true, Lens::Views) => "как будет устроено: деревья, данные, макет",
+                    (true, _) => "канвас: к чему придёт код",
+                    (false, Lens::Arch) => "модули и импорты: было → стало",
+                    (false, Lens::Contracts) => "типы, сигнатуры, зависимости",
+                    (false, Lens::Media) => "скриншоты, GIF и видео до и после",
+                    (false, Lens::Map) => "канвас: что изменилось и как связано",
+                    (false, Lens::Views) => "show-me: деревья, псевдокод, было → стало",
+                },
+                theme,
+            )
+            .text_color(p.faint))
+            .child(div().flex_1())
+            .when(!self.plan_mode(), |this| this.child(h_flex().gap(px(12.)).child(old("lens-map", "Карта", Lens::Map, cx)).child(old("lens-views", "Как устроено", Lens::Views, cx))))
     }
 
     fn render_diagram(&self, key: String, d: &Diagram, dir: &Path, p: &Palette, theme: &Theme) -> impl IntoElement {
@@ -3564,14 +4009,17 @@ impl ChangesView {
                 h_flex()
                     .gap(px(12.))
                     .items_center()
-                    .child(shot("Было", u.before.as_ref().map(|path| resolve(dir, path))))
+                    .child(shot("Было", u.before.as_ref().map(|path| self.resolve_shot(dir, path))))
                     .child(Icon::new(IconName::ArrowRight).small().text_color(p.faint))
-                    .child(shot("Стало", u.after.as_ref().map(|path| resolve(dir, path)))),
+                    .child(shot("Стало", u.after.as_ref().map(|path| self.resolve_shot(dir, path)))),
             )
     }
 
     /// Sticky decision bar under the report.
-    fn render_bar(&self, _g: &Graph, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_bar(&self, _g: &Graph, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(plan) = &self.plan {
+            return self.render_plan_bar(plan, p, theme, cx);
+        }
         let checks = self.report().map_or(0, |r| r.check.len());
         let done = self.checked.len().min(checks);
         h_flex()
@@ -3623,6 +4071,7 @@ impl ChangesView {
                         cx.notify();
                     })),
             )
+            .into_any_element()
     }
 
     fn render_panel(&self, panel: Panel, g: &Graph, p: &Palette, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3640,7 +4089,10 @@ impl ChangesView {
                 None => ("Группа".into(), div().into_any_element()),
             },
             Panel::Checks => ("Проверь руками".into(), self.render_checks_panel(p, theme, cx).into_any_element()),
-            Panel::Return => ("Вернуть с замечанием".into(), self.render_return_panel(g, p, theme, window, cx).into_any_element()),
+            Panel::Return => (
+                if self.plan_mode() { "Замечания к плану".into() } else { "Вернуть с замечанием".into() },
+                self.render_return_panel(g, p, theme, window, cx).into_any_element(),
+            ),
         };
         v_flex()
             .w(px(420.))
@@ -3696,7 +4148,7 @@ impl ChangesView {
                         .child(div().truncate().text_size(px(13.)).font_weight(FontWeight::MEDIUM).text_color(p.ink).child(n.title().to_owned()))
                         .child(div().truncate().font_family(theme.mono_font_family.clone()).text_size(px(11.)).text_color(p.faint).child(format!("{} · {}", role.label(), n.name))),
                 )
-                .when_some(status_tone(n.status, p).filter(|_| n.status != NodeStatus::Context), |d, t| d.child(ui::badge(status_label(n.status), t)))
+                .when_some(status_tone(n.status, p).filter(|_| n.status != NodeStatus::Context), |d, t| d.child(ui::badge(status_label(n.status, self.plan_mode()), t)))
         };
         // «Что доказывает»: the reviewer's evidence, tests, linked checks, this session's before/after.
         let report = self.report();
@@ -3739,7 +4191,7 @@ impl ChangesView {
             .gap(px(14.))
             .child(h_flex().gap(px(8.)).child(ui::chip(gr.kind.label(), p, theme)).child(ui::mono(format!("{} сущностей", members.len()), theme).text_color(p.faint)))
             .when(!gr.summary.is_empty(), |d| d.child(div().text_size(px(13.5)).line_height(px(20.)).text_color(p.fg).child(gr.summary.clone())))
-            .when(gr.kind == map::GroupKind::Feature, |d| d.child(proof))
+            .when(gr.kind == map::GroupKind::Feature && !self.plan_mode(), |d| d.child(proof))
             .child(v_flex().gap(px(2.)).child(label("Сущности")).children(members.iter().map(|&i| row(i, cx).into_any_element()).collect::<Vec<_>>()))
             .when(!tests.is_empty(), |d| d.child(v_flex().gap(px(2.)).child(label("Проверяют тесты")).children(tests.iter().map(|&i| row(i, cx).into_any_element()).collect::<Vec<_>>())))
             .when(!untested.is_empty(), |d| {
@@ -3767,6 +4219,8 @@ impl ChangesView {
             .map(|r| r.check.iter().cloned().enumerate().filter(|(_, c)| !c.id.is_empty() && n.check_ids.contains(&c.id)).collect())
             .unwrap_or_default();
         let hunks = node_hunks(n, &self.patches());
+        let review = self.review.get(&n.key).map(|(s, _)| *s);
+        let reviewed_on = self.reviewed.get(&n.key).map(|m| m.run);
         let in_remarks = self.remarks.contains(&n.key);
         let key = n.key.clone();
         let file_path = self.input.cwd.join(&n.file);
@@ -3809,11 +4263,26 @@ impl ChangesView {
                 h_flex()
                     .gap(px(8.))
                     .child(match status_tone(n.status, p) {
-                        Some(t) => ui::dot_badge(status_label(n.status), t).into_any_element(),
-                        None => ui::chip(status_label(n.status), p, theme).into_any_element(),
+                        Some(t) => ui::dot_badge(status_label(n.status, self.plan_mode()), t).into_any_element(),
+                        None => ui::chip(status_label(n.status, self.plan_mode()), p, theme).into_any_element(),
                     })
                     .when(!n.kind.is_empty(), |h| h.child(div().text_size(px(12.)).text_color(p.muted).child(kind_label(&n.kind))))
                     .child(div().flex_1())
+                    .when_some(review, |h, state| {
+                        let key = n.key.clone();
+                        h.child(
+                            PressButton::new("node-reviewed")
+                                .xsmall()
+                                .icon(if state == Review::Seen { IconName::CircleCheck } else { IconName::Check })
+                                .label(match state {
+                                    Review::Seen => "просмотрено",
+                                    Review::New => "отметить просмотренным",
+                                    Review::ChangedSince => "просмотрено снова",
+                                })
+                                .tooltip(if state == Review::Seen { "Снять отметку «просмотрено»" } else { "Узел пригаснет на карте, пока не изменится" })
+                                .on_click(cx.listener(move |this, _, _, cx| this.toggle_reviewed(&key, cx))),
+                        )
+                    })
                     .child(
                         PressButton::new("node-remark")
                             .xsmall()
@@ -3830,6 +4299,23 @@ impl ChangesView {
                     ),
             )
             .child(div().font_family(mono.clone()).text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).text_color(p.ink).when(n.status == NodeStatus::Removed, |d| d.line_through()).child(n.name.clone()))
+            .when(review == Some(Review::ChangedSince), |v| {
+                v.child(
+                    h_flex()
+                        .gap(px(8.))
+                        .px(px(10.))
+                        .py(px(7.))
+                        .rounded(px(8.))
+                        .bg(p.accent.soft)
+                        .text_size(px(12.5))
+                        .text_color(p.accent.text)
+                        .child(Icon::new(IconName::RefreshCw).small().text_color(p.accent.solid))
+                        .child(match reviewed_on {
+                            Some(run) if run > 0 => format!("Изменилось после просмотра (просмотрено в итерации #{run})"),
+                            _ => "Изменилось после просмотра".to_owned(),
+                        }),
+                )
+            })
             .when(!n.file.is_empty(), |v| {
                 v.child(
                     div()
@@ -3849,7 +4335,15 @@ impl ChangesView {
                 v.child(
                     v_flex()
                         .gap(px(6.))
-                        .child(ui::eyebrow(if changed { "сигнатура · было → стало" } else { "сигнатура" }, p, theme))
+                        .child(ui::eyebrow(
+                            match (changed, self.plan_mode()) {
+                                (true, false) => "сигнатура · было → стало",
+                                (true, true) => "сигнатура · сейчас → станет",
+                                _ => "сигнатура",
+                            },
+                            p,
+                            theme,
+                        ))
                         .when(changed, |v| {
                             v.child(
                                 div()
@@ -3926,13 +4420,13 @@ impl ChangesView {
                     })),
                 )
             })
-            .child(
+            .when(!self.plan_mode(), |v| v.child(
                 v_flex()
                     .gap(px(8.))
                     .child(ui::eyebrow("дифф", p, theme))
                     .when(hunks.is_empty(), |v| v.child(div().text_size(px(12.5)).text_color(p.faint).child(if n.status == NodeStatus::Context { "Этот узел сессия не меняла" } else { "Ханки этого узла не нашлись в диффе" })))
                     .children(hunks.into_iter().take(4).enumerate().map(|(hi, h)| render_hunk(hi, &h, p, theme))),
-            )
+            ))
     }
 
     fn render_dto_panel(&self, d: usize, g: &Graph, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3947,8 +4441,8 @@ impl ChangesView {
                 h_flex()
                     .gap(px(8.))
                     .child(match status_tone(dto.status, p) {
-                        Some(t) => ui::dot_badge(status_label(dto.status), t).into_any_element(),
-                        None => ui::chip(status_label(dto.status), p, theme).into_any_element(),
+                        Some(t) => ui::dot_badge(status_label(dto.status, self.plan_mode()), t).into_any_element(),
+                        None => ui::chip(status_label(dto.status, self.plan_mode()), p, theme).into_any_element(),
                     })
                     .child(div().text_size(px(12.)).text_color(p.muted).child(dto_kind_label(&dto.kind))),
             )
@@ -4067,7 +4561,11 @@ impl ChangesView {
         let send = note.clone();
         v_flex()
             .gap(px(12.))
-            .child(div().text_size(px(12.5)).text_color(p.muted).child("Узлы добавляются кнопкой «в замечания» в панели узла. Текст уйдёт агенту в эту сессию."))
+            .child(div().text_size(px(12.5)).text_color(p.muted).child(if self.plan_mode() {
+                "Узлы добавляются кнопкой «в замечания» в панели узла, ответы на вопросы пиши как «В1: …». Текст уйдёт агенту, который пишет план, — он перепишет его новой итерацией."
+            } else {
+                "Узлы добавляются кнопкой «в замечания» в панели узла. Текст уйдёт агенту в эту сессию."
+            }))
             .child(h_flex().gap(px(5.)).flex_wrap().when(self.remarks.is_empty(), |h| h.child(div().text_size(px(12.5)).text_color(p.faint).child("Узлов пока нет"))).children(self.remarks.iter().enumerate().map(|(i, k)| self.node_chip(SharedString::from(format!("remark-{i}")), k, g, p, theme, cx))))
             .child(Input::new(&note))
             .child(ui::card(p).p(px(10.)).bg(p.surface2).child(ui::mono(preview, theme).text_color(p.fg).whitespace_normal()))
@@ -4260,38 +4758,6 @@ fn render_columns(code: &CodeChanges, p: &Palette, theme: &Theme) -> impl IntoEl
         .child(column("added", "Добавлено", "+", p.green, &code.added))
         .child(column("changed", "Изменено", "~", p.amber, &code.changed))
         .child(column("removed", "Удалено", "−", p.red, &code.removed))
-}
-
-/// Four numbers under the summary: files, lines, functions, risks.
-fn metrics(files: usize, plus: usize, minus: usize, code: &CodeChanges, risks: usize, p: &Palette, theme: &Theme) -> impl IntoElement {
-    let big = |text: String, color: Hsla| div().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).text_color(color).child(text);
-    let sep = || div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).text_color(p.faint).child("·");
-    let cells: Vec<(&'static str, AnyElement)> = vec![
-        ("Файлов", big(files.to_string(), p.ink).into_any_element()),
-        ("Строк", h_flex().gap(px(8.)).child(big(format!("+{plus}"), p.green.text)).child(big(format!("−{minus}"), p.red.text)).into_any_element()),
-        (
-            "Функций",
-            h_flex()
-                .gap(px(6.))
-                .child(big(format!("+{}", code.added.len()), p.green.text))
-                .child(sep())
-                .child(big(format!("~{}", code.changed.len()), p.amber.text))
-                .child(sep())
-                .child(big(format!("−{}", code.removed.len()), p.red.text))
-                .into_any_element(),
-        ),
-        ("Риски", big(risks.to_string(), if risks > 0 { p.amber.text } else { p.ink }).into_any_element()),
-    ];
-    ui::card(p).child(h_flex().children(cells.into_iter().enumerate().map(|(i, (label, value))| {
-        v_flex()
-            .flex_1()
-            .px(px(16.))
-            .py(px(12.))
-            .gap(px(4.))
-            .when(i > 0, |d| d.border_l_1().border_color(p.border))
-            .child(ui::eyebrow(label, p, theme))
-            .child(div().h(px(30.)).flex().items_center().child(value))
-    })))
 }
 
 #[cfg(test)]
