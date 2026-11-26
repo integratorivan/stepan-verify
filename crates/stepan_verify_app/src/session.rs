@@ -118,6 +118,7 @@ pub struct SessionView {
 
 impl SessionView {
     pub fn resume(summary: &SessionSummary, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let project = summary.project();
         let spec = SessionSpec {
             provider: agent_provider(summary.provider),
             native_id: Some(summary.id.clone()),
@@ -125,7 +126,7 @@ impl SessionView {
             cwd: summary.cwd.clone().unwrap_or_else(home_dir),
             mode: crate::settings::agent_mode(cx),
             image_cache: Some(image_cache()),
-            env: Vec::new(),
+            env: linked_project_env(summary.cwd.as_deref(), &project),
             model: None,
             instructions: docs_brief(summary.provider, summary.cwd.as_deref(), Some(&summary.id), cx),
         };
@@ -138,7 +139,7 @@ impl SessionView {
             Provider::Claude => true,
             Provider::Codex => written.is_some_and(|t| t.elapsed().unwrap_or_default() < Duration::from_secs(30 * 60)),
         };
-        let mut this = Self::new(summary.provider, summary.title.clone(), summary.project(), spec, follow.then(|| summary.file.clone()), window, cx);
+        let mut this = Self::new(summary.provider, summary.title.clone(), project, spec, follow.then(|| summary.file.clone()), window, cx);
         this.external_at = written;
         this
     }
@@ -159,10 +160,10 @@ impl SessionView {
             native_id: None,
             transcript: None,
             instructions: docs_brief(provider, Some(cwd.as_path()), None, cx),
+            env: linked_project_env(Some(&cwd), &project),
             cwd,
             mode: crate::settings::agent_mode(cx),
             image_cache: Some(image_cache()),
-            env: Vec::new(),
             model: crate::models::settings_default(provider, cx),
         };
         let mut this = Self::new(provider, title, project, spec, None, window, cx);
@@ -1555,6 +1556,14 @@ impl SessionView {
                         ),
                 )
         }))
+    }
+}
+
+fn linked_project_env(cwd: Option<&std::path::Path>, project: &str) -> Vec<(String, String)> {
+    if cwd.and_then(stepan_verify_core::worktree::linked).is_some() {
+        vec![("STEPAN_VERIFY_PROJECT".into(), project.into())]
+    } else {
+        Vec::new()
     }
 }
 
