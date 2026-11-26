@@ -1,13 +1,19 @@
 feature: Запуск новой сессии Claude или Codex
 area: Сессии агентов
-summary: Пользователь выбирает проект, агента и пишет первую задачу, добавляя вложения или скриншот
+summary: Пользователь выбирает проект, место работы и агента, затем пишет первую задачу с вложениями или скриншотом
 aliases: [запустить агента, новый агент, новая сессия Claude, новая сессия]
 entries: [crates/stepan_verify_app/src/new_session.rs, crates/stepan_verify_app/src/project_picker.rs, crates/stepan_verify_agents/src/claude.rs, crates/stepan_verify_agents/src/codex.rs]
 
 paths:
   Через диалог «Новая сессия»:
-    - Дашборд / сайдбар: Нажать «Новая сессия» -> Открывается диалог с полями «Проект», «Агент», «Задача»  [NewSessionDialog, ProjectPicker, crates/stepan_verify_app/src/new_session.rs, crates/stepan_verify_app/src/project_picker.rs]
+    - Дашборд / сайдбар: Нажать «Новая сессия» -> Открывается диалог с полями «Проект», «Где работать», «Агент», «Задача»  [NewSessionForm, ProjectPicker, crates/stepan_verify_app/src/new_session.rs, crates/stepan_verify_app/src/project_picker.rs]
     - Диалог «Новая сессия»: Выбрать недавний проект или «Другая папка…» -> Проект выбран, папка запоминается в недавних  [ProjectPicker, crates/stepan_verify_app/src/project_picker.rs]
-    - Диалог «Новая сессия»: Выбрать Claude/Codex, написать задачу и нажать «Запустить» (или Enter) -> Открывается экран сессии, агент начинает работать  [AppView::start_session, SessionView::start, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/session.rs]
+    - Диалог «Новая сессия»: Оставить «Текущий checkout», выбрать Claude/Codex, написать задачу и нажать «Запустить» (или Enter) -> Агент начинает работать в выбранной папке  [NewSessionForm::confirm, SessionView::start, crates/stepan_verify_app/src/new_session.rs, crates/stepan_verify_app/src/session.rs]
+    - Диалог «Новая сессия»: Для Git-проекта выбрать «Отдельный worktree» и нажать «Запустить» (или Enter) -> Stepan готовит новую копию с отдельной веткой и запускает агента в соответствующей папке копии  [NewSessionForm::confirm, worktree::create_session, crates/stepan_verify_app/src/new_session.rs, crates/stepan_verify_core/src/worktree.rs]
+    - Диалог «Новая сессия»: Дождаться ошибки подготовки worktree -> Диалог показывает ошибку и сохраняет введённую задачу для повторного запуска  [NewSessionForm::confirm, crates/stepan_verify_app/src/new_session.rs]
   Из командной строки:
     - Терминал: Запустить stepan_verify --new / --start claude --cwd <папка> --send <текст> -> Приложение открывается сразу с диалогом или с запущенной сессией  [Launch::from_args, crates/stepan_verify_app/src/app.rs]
+
+proofs:
+  - manual: Нативная сборка macOS с тестовым Claude CLI и временными Git-репозиториями  covers: 1, 2, 3, 4, 5  at: 2026-11-26T08:40:44Z  title: Проверены рабочие папки и ветки обоих режимов, запуск через Enter и повтор с сохранённой задачей после ошибки
+  - test: crates/stepan_verify_core/src/worktree.rs::session_worktrees_start_from_the_selected_checkout_and_keep_its_subdirectory  covers: 4  at: 2026-11-26T08:40:44Z

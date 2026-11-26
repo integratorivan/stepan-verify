@@ -4,10 +4,13 @@
 //! Claude: `claude -p --input-format stream-json --output-format stream-json`,
 //!         permission prompts answered over stdio (`can_use_tool`).
 //! Codex:  `codex app-server`, newline-delimited JSON-RPC.
+//!
+//! Both run under a [`host`] so they outlive the window.
 
 mod claude;
 mod codex;
 mod follow;
+pub mod host;
 mod model;
 pub mod peek;
 
@@ -68,7 +71,8 @@ pub(crate) enum Command {
     Shutdown,
 }
 
-/// Handle to a running session. Dropping it shuts the agent process down.
+/// Handle to a running session. Dropping it lets go of the agent: it finishes
+/// its turn under its host and exits once idle (see [`host`]).
 pub struct AgentHandle {
     tx: mpsc::Sender<Command>,
 }
@@ -113,6 +117,8 @@ fn launch(spec: SessionSpec, follow: Option<PathBuf>) -> (AgentHandle, async_cha
     std::thread::Builder::new()
         .name(format!("stepan_verify-{:?}", spec.provider).to_lowercase())
         .spawn(move || {
+            // Our own host runs it: talk to the host, not watch the file.
+            let follow = follow.filter(|_| !spec.native_id.as_deref().is_some_and(|id| host::running(spec.provider, id)));
             let result = match (&follow, spec.provider) {
                 (Some(file), _) => follow::run(spec, file, rx, &events),
                 (None, Provider::Claude) => claude::run(spec, rx, &events),

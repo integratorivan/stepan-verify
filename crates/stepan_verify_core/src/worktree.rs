@@ -1,6 +1,6 @@
-//! A separate checkout per board task, so two agents on one project never
-//! edit the same files: `git worktree add ~/.stepan_verify/worktrees/<project>/<task-id>
-//! -b stepan/<task-id> <source>`, prepared by `<repo>/.stepan_verify/workspace.yaml`
+//! Separate checkouts for board tasks and interactive sessions under
+//! `~/.stepan_verify/worktrees/<project>/<id>` on `stepan/<id>` branches.
+//! Preparation follows `<repo>/.stepan_verify/workspace.yaml`
 //! (copy `.env`-like files, clone `node_modules` copy-on-write, run a setup command).
 //!
 //! Also the one place that knows which project a working directory belongs
@@ -11,7 +11,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Mutex, OnceLock},
+    sync::{Mutex, OnceLock, atomic::{AtomicU64, Ordering}},
 };
 
 use anyhow::{Context, Result, bail};
@@ -200,14 +200,42 @@ pub struct Created {
 /// Make (or take back) the copy for task `task_id` of the repo around `cwd`.
 /// Blocking: git, file copies and the setup command; run it off the UI thread.
 pub fn create(home: &Home, cwd: &Path, task_id: &str) -> Result<Created> {
-    let main = git_toplevel(cwd).with_context(|| format!("{} — не git-репозиторий", cwd.display()))?;
-    let config = WorkspaceConfig::load(&main)?;
-    let name = main.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "project".into());
-    let path = home.worktrees().join(name).join(task_id);
+    let checkout = git_toplevel(cwd).with_context(|| format!("{} — не git-репозиторий", cwd.display()))?;
+    let path = copy_path(home, &checkout, task_id);
+    create_at(home, &checkout, path, task_id, true)
+}
+
+/// Prepare a fresh session's worktree and map the selected folder into it.
+/// Blocking, like `create`.
+pub fn create_session(home: &Home, cwd: &Path) -> Result<(PathBuf, Option<String>)> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let cwd = cwd.canonicalize().with_context(|| format!("не открыть {}", cwd.display()))?;
+    let checkout = git_toplevel(&cwd).with_context(|| format!("{} — не git-репозиторий", cwd.display()))?;
+    let project = read_linked(&checkout).map_or_else(|| checkout.clone(), |(main, _)| main);
+    let time = chrono::Utc::now().timestamp_micros();
+    let id = format!("session-{time}-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
+    let path = copy_path(home, &project, &id);
+    let created = create_at(home, &checkout, path, &id, false)?;
+    let root = created.path.canonicalize()?;
+    let folder = join_rel(&created.path, cwd.strip_prefix(&checkout)?);
+    if !folder.is_dir() || !folder.canonicalize()?.starts_with(root) {
+        bail!("рабочая папка {} недоступна внутри отдельной копии", folder.display());
+    }
+    Ok((folder, created.setup_failed))
+}
+
+fn copy_path(home: &Home, project: &Path, id: &str) -> PathBuf {
+    let name = project.file_name().map(|name| name.to_string_lossy()).unwrap_or_else(|| "project".into());
+    home.worktrees().join(name.as_ref()).join(id)
+}
+
+fn create_at(home: &Home, main: &Path, path: PathBuf, task_id: &str, initialize_empty: bool) -> Result<Created> {
+    let config = WorkspaceConfig::load(main)?;
     let branch = branch_name(task_id);
 
     if path.exists() {
-        let same = read_linked(&path).is_some_and(|(m, b)| same_dir(&m, &main) && b.as_deref() == Some(branch.as_str()));
+        let same = read_linked(&path).is_some_and(|(m, b)| same_dir(&m, main) && b.as_deref() == Some(branch.as_str()));
         if !same {
             bail!("папка {} уже есть, и это не копия этой задачи", path.display());
         }
@@ -215,32 +243,32 @@ pub fn create(home: &Home, cwd: &Path, task_id: &str) -> Result<Created> {
     }
 
     let mut notes = Vec::new();
-    if ensure_head(&main)? {
+    if initialize_empty && ensure_head(main)? {
         notes.push("в репозитории не было коммитов — сделал пустой первый".into());
     }
     let source = config.source_ref.clone().unwrap_or_else(|| "HEAD".into());
-    let sha = git(&main, &["rev-parse", "--verify", &format!("{source}^{{commit}}")]).with_context(|| format!("нет {source}"))?;
+    let sha = git(main, &["rev-parse", "--verify", &format!("{source}^{{commit}}")]).with_context(|| format!("нет {source}"))?;
     // A copy removed by hand leaves its registration behind.
-    let _ = git(&main, &["worktree", "prune"]);
+    let _ = git(main, &["worktree", "prune"]);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let target = path.to_string_lossy().into_owned();
-    if git(&main, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok() {
-        git(&main, &["worktree", "add", &target, &branch])?;
+    if git(main, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok() {
+        git(main, &["worktree", "add", &target, &branch])?;
         notes.push(format!("ветка {branch} уже была — взял её"));
     } else {
-        git(&main, &["worktree", "add", "-b", &branch, &target, &sha])?;
+        git(main, &["worktree", "add", "-b", &branch, &target, &sha])?;
         notes.push(format!("ветка {branch} от {source} ({})", &sha[..sha.len().min(8)]));
     }
 
     let patterns: Vec<String> = config.copy.clone().unwrap_or_else(|| DEFAULT_COPY.map(str::to_owned).to_vec());
-    let copied = copy_globs(&main, &path, &patterns, &home.worktrees())?;
+    let copied = copy_globs(main, &path, &patterns, &home.worktrees())?;
     if copied > 0 {
         notes.push(format!("скопировал файлов: {copied}"));
     }
     let clone: Vec<String> = config.clone.clone().unwrap_or_else(|| DEFAULT_CLONE.map(str::to_owned).to_vec());
-    notes.extend(clone_dirs(&main, &path, &clone));
+    notes.extend(clone_dirs(main, &path, &clone));
 
     let mut setup_failed = None;
     if let Some(cmd) = config.setup.as_deref().filter(|c| !c.trim().is_empty()) {
@@ -516,6 +544,40 @@ mod tests {
         assert!(glob(b"**/x.json", b"a/b/x.json"));
         assert!(glob(b"**/x.json", b"x.json"));
         assert!(!glob(b"**/x.json", b"ax.json"));
+    }
+
+    #[test]
+    fn session_worktrees_start_from_the_selected_checkout_and_keep_its_subdirectory() {
+        let f = fixture("session", true);
+        let linked = f.root.join("another-checkout");
+        sh(&f.repo, &["worktree", "add", "-b", "feature", linked.to_str().unwrap()]);
+        let folder = linked.join("apps/web");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("feature.txt"), "feature checkout").unwrap();
+        sh(&linked, &["add", "."]);
+        sh(&linked, &["commit", "-m", "feature"]);
+        let head = sh(&linked, &["rev-parse", "HEAD"]);
+
+        let (first, warning) = create_session(&f.home, &folder).unwrap();
+        let (second, _) = create_session(&f.home, &folder).unwrap();
+        assert!(warning.is_none());
+        assert!(first.starts_with(f.home.worktrees().join("proj")));
+        assert!(first.ends_with("apps/web"));
+        assert_ne!(first, second);
+        assert_ne!(sh(&first, &["branch", "--show-current"]), sh(&second, &["branch", "--show-current"]));
+        assert_eq!(sh(&first, &["rev-parse", "HEAD"]), head);
+        assert_eq!(sh(&second, &["rev-parse", "HEAD"]), head);
+
+        fs::write(first.join("feature.txt"), "only the first worktree").unwrap();
+        assert_eq!(fs::read_to_string(folder.join("feature.txt")).unwrap(), "feature checkout");
+        assert_eq!(fs::read_to_string(second.join("feature.txt")).unwrap(), "feature checkout");
+    }
+
+    #[test]
+    fn session_worktree_does_not_commit_in_an_empty_repository() {
+        let f = fixture("empty-session", false);
+        assert!(create_session(&f.home, &f.repo).is_err());
+        assert!(git(&f.repo, &["rev-parse", "--verify", "HEAD"]).is_err());
     }
 
     #[test]
