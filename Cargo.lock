@@ -7740,11 +7740,12 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stepan_verify_agents"
-version = "0.2.11"
+version = "0.2.12"
 dependencies = [
  "anyhow",
  "async-channel",
  "base64 0.22.1",
+ "libc",
  "serde",
  "serde_json",
  "similar",
@@ -7752,7 +7753,7 @@ dependencies = [
 
 [[package]]
 name = "stepan_verify_app"
-version = "0.2.11"
+version = "0.2.12"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7774,7 +7775,7 @@ dependencies = [
 
 [[package]]
 name = "stepan_verify_core"
-version = "0.2.11"
+version = "0.2.12"
 dependencies = [
  "anyhow",
  "chrono",

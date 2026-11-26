@@ -36,6 +36,16 @@ const MIN_WIDTH: f32 = 960.;
 const MIN_HEIGHT: f32 = 600.;
 
 fn main() {
+    // An agent's host (started by a window, outlives it): runs until the agent exits.
+    let mut raw = std::env::args().skip(1);
+    if raw.next().as_deref() == Some(stepan_verify_agents::host::ENTRY) {
+        let dir = raw.next().unwrap_or_default();
+        if let Err(err) = stepan_verify_agents::host::serve(std::path::Path::new(&dir)) {
+            eprintln!("stepan_verify: agent host: {err:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let home = stepan_verify_core::Home::locate();
 
     // `stepan_verify task …` (the board), `stepan_verify memory …`, `stepan_verify doc …` (comments), `stepan_verify usage`

@@ -1179,14 +1179,22 @@ impl AppView {
 
     pub fn open_new_session_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let loading = self.sessions_loading;
-        let form = cx.new(|cx| NewSessionForm::new(self.project_dirs(), loading, window, cx));
+        let form = cx.new(|cx| NewSessionForm::new(self.home.clone(), self.project_dirs(), loading, window, cx));
         self.pickers.push(form.read(cx).picker.downgrade());
         cx.subscribe_in(&form, window, |this, _, start: &StartSession, window, cx| {
             window.close_dialog(cx);
             this.start_session(start, window, cx);
         })
         .detach();
-        window.open_dialog(cx, move |dialog, _, _| dialog.title("Новая сессия").w(px(620.)).child(form.clone()));
+        window.open_dialog(cx, move |dialog, _, _| {
+            let on_close = form.downgrade();
+            dialog.title("Новая сессия").w(px(620.)).child(form.clone())
+                // The form handles Enter and closes the dialog once the working directory is ready.
+                .on_ok(|_, _, _| false)
+                .on_close(move |_, _, cx| {
+                    on_close.update(cx, |form, _| form.dismiss()).ok();
+                })
+        });
     }
 
     /// Open sessions an autopilot task occupies right now.
@@ -1248,6 +1256,7 @@ impl AppView {
             (Status::Running, _) => (IconName::LoaderCircle, p.blue.solid, s.card.progress.to_lowercase()),
             (Status::Loading, _) => (IconName::Loader, p.faint, "загрузка".into()),
             (Status::Exited, _) => (IconName::CircleX, p.red.solid, "завершён".into()),
+            (Status::Idle, _) if a.interrupted => (IconName::TriangleAlert, p.red.solid, "прервана".into()),
             (Status::Idle, _) if asks => (IconName::Info, p.amber.solid, "вопрос".into()),
             (Status::Idle, _) => (IconName::CircleCheck, p.muted, "ждёт тебя".into()),
         };

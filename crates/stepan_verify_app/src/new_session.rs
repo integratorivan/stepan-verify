@@ -1,15 +1,16 @@
 use std::path::PathBuf;
 
 use gpui_kit::component::{
-    ActiveTheme as _, IconName,
+    ActiveTheme as _, IconName, WindowExt as _,
     input::{InputEvent, Textarea, TextareaState},
+    notification::Notification,
     h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use crate::zoom::px;
 use crate::ui::PressButton;
-use stepan_verify_core::Provider;
+use stepan_verify_core::{Home, Provider, worktree::{self, Isolation}};
 
 use crate::{
     attach::{self, Attachments, AttachmentsEvent},
@@ -17,7 +18,7 @@ use crate::{
     ui::{self, Palette},
 };
 
-/// Emitted when the user confirms the form.
+/// Emitted when the working directory is ready and the session can start.
 pub struct StartSession {
     pub provider: Provider,
     pub cwd: PathBuf,
@@ -28,10 +29,14 @@ pub struct StartSession {
 
 impl EventEmitter<StartSession> for NewSessionForm {}
 
-/// Body of the "Новая сессия" dialog: project, agent, first message.
+/// Body of the "Новая сессия" dialog.
 pub struct NewSessionForm {
     pub picker: Entity<ProjectPicker>,
+    home: Home,
     provider: Provider,
+    isolation: Isolation,
+    preparing: bool,
+    worktree_error: Option<String>,
     prompt: Entity<TextareaState>,
     attachments: Entity<Attachments>,
     _subscriptions: Vec<Subscription>,
@@ -39,7 +44,7 @@ pub struct NewSessionForm {
 
 impl NewSessionForm {
     /// `projects`: candidate working directories, most recent first.
-    pub fn new(projects: Vec<PathBuf>, loading: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(home: Home, projects: Vec<PathBuf>, loading: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let picker = cx.new(|_| ProjectPicker::new(projects, loading));
         let prompt = cx.new(|cx| {
             TextareaState::new(window, cx)
@@ -50,12 +55,15 @@ impl NewSessionForm {
         prompt.update(cx, |p, cx| p.focus(window, cx));
         let attachments = cx.new(|_| Attachments::new("new-session-attachment", true));
         let subscriptions = vec![
-            cx.subscribe(&prompt, |this, _, event, cx| match event {
-                InputEvent::PressEnter { .. } => this.confirm(cx),
+            cx.subscribe_in(&prompt, window, |this, _, event, window, cx| match event {
+                InputEvent::PressEnter { .. } => this.confirm(window, cx),
                 InputEvent::Change => cx.notify(),
                 _ => {}
             }),
-            cx.subscribe(&picker, |_, _, _: &Picked, cx| cx.notify()),
+            cx.subscribe(&picker, |this, _, _: &Picked, cx| {
+                this.worktree_error = None;
+                cx.notify();
+            }),
             // Non-images go into the message as paths, like in the composer.
             cx.subscribe_in(&attachments, window, |this, _, event, window, cx| match event {
                 AttachmentsEvent::NotImages(paths) => this.prompt.update(cx, |p, cx| {
@@ -65,23 +73,66 @@ impl NewSessionForm {
                 AttachmentsEvent::Changed => cx.notify(),
             }),
         ];
-        Self { picker, provider: Provider::Claude, prompt, attachments, _subscriptions: subscriptions }
+        Self {
+            picker, home, provider: Provider::Claude, isolation: Isolation::Here, preparing: false,
+            worktree_error: None, prompt, attachments, _subscriptions: subscriptions,
+        }
     }
 
     fn can_start(&self, cx: &App) -> bool {
-        self.picker.read(cx).selected().is_some()
+        !self.preparing
+            && self.picker.read(cx).selected().is_some()
+            && (self.isolation == Isolation::Here || self.can_create_worktree(cx))
             && !self.prompt.read(cx).value().trim().is_empty()
             && !self.attachments.read(cx).is_capturing()
     }
 
-    fn confirm(&mut self, cx: &mut Context<Self>) {
+    fn can_create_worktree(&self, cx: &App) -> bool {
+        self.picker.read(cx).selected().and_then(|dir| worktree::git_toplevel(dir)).is_some()
+    }
+
+    pub fn dismiss(&mut self) {
+        self.preparing = false;
+    }
+
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.can_start(cx) {
             return;
         }
         let Some(cwd) = self.picker.read(cx).selected().cloned() else { return };
         let prompt = self.prompt.read(cx).value().trim().to_owned();
         let images = self.attachments.read(cx).paths().to_vec();
-        cx.emit(StartSession { provider: self.provider, cwd, prompt, images });
+        let mut start = StartSession { provider: self.provider, cwd, prompt, images };
+        if self.isolation == Isolation::Here {
+            cx.emit(start);
+            return;
+        }
+
+        self.preparing = true;
+        self.worktree_error = None;
+        cx.notify();
+        let home = self.home.clone();
+        let cwd = start.cwd.clone();
+        cx.spawn_in(window, async move |form, cx| {
+            let result = cx.background_spawn(async move { worktree::create_session(&home, &cwd) }).await;
+            form.update_in(cx, |form, window, cx| {
+                if !form.preparing {
+                    return;
+                }
+                form.preparing = false;
+                match result {
+                    Ok((cwd, warning)) => {
+                        start.cwd = cwd;
+                        if let Some(warning) = warning {
+                            window.push_notification(Notification::warning(warning).title("Подготовка копии"), cx);
+                        }
+                        cx.emit(start);
+                    }
+                    Err(err) => form.worktree_error = Some(format!("Не удалось создать worktree: {err:#}")),
+                }
+                cx.notify();
+            }).ok();
+        }).detach();
     }
 }
 
@@ -115,9 +166,23 @@ impl Render for NewSessionForm {
                 }))
         };
         let label = |text: &'static str| ui::eyebrow(text, &p, &theme);
+        let workplace = |id, text, isolation, cx: &mut Context<Self>| {
+            ui::segment(id, text, self.isolation == isolation, &p)
+                .h(px(30.)).px(px(12.)).text_size(px(13.))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if !this.preparing {
+                        this.isolation = isolation;
+                        this.worktree_error = None;
+                        cx.notify();
+                    }
+                }))
+        };
+        let worktree_unavailable = self.isolation == Isolation::Worktree
+            && self.picker.read(cx).selected().is_some() && !self.can_create_worktree(cx);
 
         v_flex()
             .id("new-session-form")
+            .relative()
             .gap_4()
             .key_context(attach::CONTEXT)
             .on_action({
@@ -133,6 +198,17 @@ impl Render for NewSessionForm {
                 move |paths: &ExternalPaths, _, cx| tray.update(cx, |t, cx| t.add(paths.paths(), cx))
             })
             .child(v_flex().gap_2().child(label("Проект")).child(self.picker.clone()))
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(label("Где работать"))
+                    .child(ui::segmented(&p).self_start()
+                        .child(workplace("session-checkout", "Текущий checkout", Isolation::Here, cx))
+                        .child(workplace("session-worktree", "Отдельный worktree", Isolation::Worktree, cx)))
+                    .when(worktree_unavailable, |this| this.child(
+                        div().text_size(px(12.)).text_color(p.muted).child("Для worktree выбери папку Git-репозитория."),
+                    )),
+            )
             .child(
                 v_flex()
                     .gap_2()
@@ -154,12 +230,15 @@ impl Render for NewSessionForm {
                 v_flex()
                     .gap_2()
                     .child(label("Задача"))
-                    .child(Textarea::new(&self.prompt).on_paste({
+                    .child(Textarea::new(&self.prompt).disabled(self.preparing).on_paste({
                         let tray = self.attachments.clone();
                         move |item, _, cx| tray.update(cx, |t, cx| t.paste(item, cx))
                     }))
                     .child(self.attachments.clone()),
             )
+            .when_some(self.worktree_error.clone(), |this, error| {
+                this.child(div().text_size(px(12.)).text_color(theme.danger).child(error))
+            })
             .child(
                 h_flex()
                     .gap_1()
@@ -186,10 +265,11 @@ impl Render for NewSessionForm {
                         PressButton::new("start-session")
                             .primary()
                             .icon(IconName::Play)
-                            .label("Запустить")
+                            .label(if self.preparing { "Подготовка worktree…" } else { "Запустить" })
                             .disabled(!self.can_start(cx))
-                            .on_click(cx.listener(|this, _, _, cx| this.confirm(cx))),
+                            .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx))),
                     ),
             )
+            .when(self.preparing, |this| this.child(div().absolute().inset_0().occlude()))
     }
 }

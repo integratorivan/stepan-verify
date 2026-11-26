@@ -1,11 +1,15 @@
 //! Codex over `codex app-server`: newline-delimited JSON-RPC without the
 //! `jsonrpc` field. Requests from the server (approvals) carry both `id` and
 //! `method` and are answered with `{id, result}`.
+//!
+//! The app-server runs under a [`crate::host`]: a window that opens the thread
+//! again while it still runs connects to the same server.
 
 use std::{
     collections::HashMap,
-    io::{BufRead, BufReader, Write},
-    process::{ChildStdin, Command as Proc, Stdio},
+    io::BufRead,
+    os::unix::net::UnixStream,
+    process::{Command as Proc, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -28,7 +32,7 @@ const MAX_HISTORY_PAGES: usize = 50;
 type Pending = Arc<Mutex<HashMap<u64, mpsc::Sender<Result<Value, String>>>>>;
 
 struct Rpc {
-    stdin: Mutex<ChildStdin>,
+    stdin: Mutex<UnixStream>,
     next_id: AtomicU64,
     pending: Pending,
 }
@@ -38,8 +42,8 @@ impl Rpc {
         let mut line = serde_json::to_string(v)?;
         line.push('\n');
         let mut stdin = self.stdin.lock().unwrap();
-        stdin.write_all(line.as_bytes()).context("codex stdin закрыт")?;
-        stdin.flush()?;
+        std::io::Write::write_all(&mut *stdin, line.as_bytes()).context("codex недоступен")?;
+        std::io::Write::flush(&mut *stdin)?;
         Ok(())
     }
 
@@ -76,13 +80,18 @@ pub(crate) fn run(spec: SessionSpec, rx: mpsc::Receiver<Command>, events: &Emitt
     crate::scrub_env(&mut cmd);
     crate::docs_env(&mut cmd, &spec);
     cmd.envs(spec.env.iter().map(|(k, v)| (k, v)));
-    let mut child = cmd
-        .spawn()
-        .context("не удалось запустить `codex app-server`")?;
-    let stdout = child.stdout.take().unwrap();
+    // Still running under its host: the same server, mid-turn or not.
+    let attached = spec.native_id.as_deref().and_then(|id| crate::host::attach(crate::Provider::Codex, id));
+    let reattached = attached.is_some();
+    let mut conn = match attached {
+        Some(conn) => conn,
+        None => crate::host::launch(crate::Provider::Codex, &cmd).context("не удалось запустить `codex app-server`")?,
+    };
+    let stdout = conn.reader.take().expect("a fresh connection has its reader");
     let rpc = Arc::new(Rpc {
-        stdin: Mutex::new(child.stdin.take().unwrap()),
-        next_id: AtomicU64::new(1),
+        stdin: Mutex::new(conn.writer.try_clone().context("сокет codex")?),
+        // Ids of an earlier window may still be answered on this server: start past them.
+        next_id: AtomicU64::new(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_millis() as u64 * 1000)),
         pending: Arc::default(),
     });
     let turn = Arc::new(Mutex::new(Turn::default()));
@@ -93,7 +102,7 @@ pub(crate) fn run(spec: SessionSpec, rx: mpsc::Receiver<Command>, events: &Emitt
         let events = Emitter(events.0.clone());
         let store = store.clone();
         std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            for line in stdout.lines().map_while(Result::ok) {
                 let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
                 dispatch(v, &rpc, &turn, &store, &events);
             }
@@ -104,9 +113,9 @@ pub(crate) fn run(spec: SessionSpec, rx: mpsc::Receiver<Command>, events: &Emitt
         });
     }
 
-    let result = session(&spec, &rpc, &turn, &store, rx, events);
-    let _ = child.kill();
-    let _ = child.wait();
+    // Leaving lets go of the server (dropping `conn` hangs up); its host ends it once it is idle and alone.
+    let result = session(&spec, &rpc, &turn, &store, rx, events, reattached);
+    drop(conn);
     result
 }
 
@@ -117,6 +126,7 @@ fn session(
     store: &ImageStore,
     rx: mpsc::Receiver<Command>,
     events: &Emitter,
+    reattached: bool,
 ) -> Result<()> {
     rpc.request(
         "initialize",
@@ -127,7 +137,11 @@ fn session(
 
     let thread_id = match &spec.native_id {
         Some(id) => {
-            rpc.request("thread/resume", json!({"threadId": id, "excludeTurns": true, "developerInstructions": spec.instructions}))?;
+            let resumed = rpc.request("thread/resume", json!({"threadId": id, "excludeTurns": true, "developerInstructions": spec.instructions}));
+            // The server we came back to may still hold the thread and say so.
+            if !reattached {
+                resumed?;
+            }
             events.emit(AgentEvent::History(load_history(rpc, id, store)?));
             id.clone()
         }
