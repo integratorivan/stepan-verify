@@ -40,8 +40,8 @@ pub fn agent_mode(cx: &App) -> Mode {
     }
 }
 
-/// The model a report / helper agent of `provider`'s family runs on (Настройки →
-/// «Отчёт „Изменения“»). `None` for Codex means Codex's own default.
+/// The model a helper agent of `provider`'s family runs on (Настройки →
+/// «Служебные агенты»). `None` for Codex means Codex's own default.
 pub fn report_model(provider: stepan_verify_agents::Provider, cx: &App) -> Option<String> {
     let changes = &config(cx).changes;
     match provider {

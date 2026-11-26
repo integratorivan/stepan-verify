@@ -156,20 +156,6 @@ pub fn render(app: &AppView, window: &mut Window, cx: &mut Context<AppView>) -> 
                 }))
         }));
 
-    let media_modes = segmented(
-        &p,
-        stepan_verify_core::config::MediaMode::ALL.map(|m| {
-            let active = config.changes.media == m;
-            segment(SharedString::from(format!("media-mode-{}", m.label())), active, &p)
-                .text_size(px(13.))
-                .font_weight(if active { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
-                .text_color(if active { p.ink } else { p.muted })
-                .child(m.label())
-                .on_click(cx.listener(move |_, _, _, cx| settings::update(cx, move |c| c.changes.media = m)))
-                .into_any_element()
-        }),
-    );
-
     let on_off = |key: &'static str, current: bool, apply: fn(&mut stepan_verify_core::Config, bool), p: &Palette, cx: &mut Context<AppView>| {
         segmented(
             p,
@@ -365,21 +351,15 @@ pub fn render(app: &AppView, window: &mut Window, cx: &mut Context<AppView>) -> 
             ))
             .child(row("Автопилот", "Сколько агентов он может держать в работе одновременно.", limits.into_any_element(), &p))
             .child(row(
-                "Отчёт «Изменения» · Claude",
-                "Отчёт пишет агент той же семьи, что и сессия. Для Claude-сессий — эта модель. Sonnet — баланс скорости и качества.",
+                "Служебные агенты · Claude",
+                "Модель агентов, которые разбирают сессии для «Документов» и сверяют карту флоу. Для Claude-сессий — эта модель. Sonnet — баланс скорости и качества.",
                 models.into_any_element(),
                 &p,
             ))
             .child(row(
-                "Отчёт «Изменения» · Codex",
-                "Для Codex-сессий отчёт собирает Codex. Список моделей — из кэша Codex; «по умолчанию» — модель из ~/.codex/config.toml.",
+                "Служебные агенты · Codex",
+                "Для Codex-сессий служебных агентов запускает Codex. Список моделей — из кэша Codex; «по умолчанию» — модель из ~/.codex/config.toml.",
                 codex_models.into_any_element(),
-                &p,
-            ))
-            .child(row(
-                "Before / after",
-                "После хода агента с правками интерфейса агент той же семьи снимает «Было → Стало» скиллом pr-before-after: скриншоты, пары, GIF. Хранится в ~/.stepan_verify/tmp/sessions. В «Изменениях» всегда есть кнопка «Снять before/after».",
-                media_modes.into_any_element(),
                 &p,
             ))
             .child(row(

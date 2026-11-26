@@ -16,4 +16,4 @@ paths:
   Открыть нужную сессию и написать ей:
     - Запуск приложения: запустить stepan_verify --open <id> -> сессия ищется в списке, найденная открывается на «Экран сессии»; уже открытая вкладка переиспользуется  [AppView::open_session, AppView::run_launch_options, crates/stepan_verify_app/src/app.rs]
     - Экран сессии: с --send <текст> текст уходит агенту в эту сессию -> сообщение появляется в ленте и агент начинает ход  [SessionView::send_text, SessionView::send_message, crates/stepan_verify_app/src/session.rs]
-    - Вкладка «Изменения»: с --changes (вместе с --open) открывается вкладка «Изменения», отчёт строится, если его ещё нет  [SessionView::open_changes, crates/stepan_verify_app/src/session.rs, crates/stepan_verify_app/src/app.rs]
+    - Вкладка «Изменения»: с --changes (вместе с --open) открывается вкладка «Изменения» этой сессии; схема «Было / Стало» рисуется, если её ещё нет  [Launch::changes, SessionView::open_changes, BeforeAfterView::new, crates/stepan_verify_app/src/session.rs, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/before_after/mod.rs]

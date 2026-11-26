@@ -103,8 +103,8 @@ pub struct SessionView {
     turn_started: Option<Instant>,
     /// Re-renders once a second while a turn runs.
     _ticker: Task<()>,
-    /// «Изменения» report, created the first time you open the tab.
-    changes: Option<Entity<crate::changes::ChangesView>>,
+    /// «Изменения»: «Было / Стало», created the first time you open the tab.
+    changes: Option<Entity<crate::before_after::BeforeAfterView>>,
     show_changes: bool,
     /// item id → (first seen, finished) for live items; history has no timing.
     timing: HashMap<String, (Instant, Option<Instant>)>,
@@ -458,9 +458,12 @@ impl SessionView {
                 }
                 cx.emit(SessionEvent::TurnFinished { error: error.clone() });
                 self.error = error;
-                self.changes_progressed(cx);
+                if let Some(view) = self.changes.clone() {
+                    let input = self.changes_input();
+                    view.update(cx, |v, _| v.update_input(input));
+                }
                 if self.native_id.is_some() {
-                    crate::distill::turn_finished(self.changes_input(), docs_project(Some(self.cwd.as_path())), cx);
+                    crate::distill::turn_finished(self.session_log(), docs_project(Some(self.cwd.as_path())), cx);
                 }
                 self.save_snapshot(cx);
             }
@@ -653,10 +656,6 @@ impl SessionView {
         }
         cx.emit(SessionEvent::Busy);
         self.turn_started = Some(Instant::now());
-        // «Было» of the before/after pass: the work tree before the agent's first turn here.
-        if let Some(key) = self.native_id.clone().or_else(|| self.task_id.clone()) {
-            crate::changes::media::turn_started(&key, &self.cwd);
-        }
         self._ticker = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
@@ -1135,7 +1134,7 @@ impl SessionView {
             .into_any_element()
     }
 
-    /// «Диалог | Изменения». The report is built only when you open it.
+    /// «Диалог | Изменения». The diagram is built only when you open the tab.
     fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let p = Palette::of(&theme);
@@ -1166,11 +1165,24 @@ impl SessionView {
             })))
             .child(
                 tab("tab-changes", IconName::Network, "Изменения", (files > 0).then_some(files), self.show_changes)
-                    .tooltip(|window, cx| {
-                        gpui_kit::component::tooltip::Tooltip::new("Отчёт об изменениях: схема зависимостей, UI было/стало, риски").build(window, cx)
-                    })
+                    .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Было → Стало: что поменялось в устройстве кода").build(window, cx))
                     .on_click(cx.listener(|this, _, _, cx| this.open_changes(cx))),
             )
+    }
+
+    /// Whether «Изменения» is the tab in front.
+    pub fn showing_changes(&self) -> bool {
+        self.show_changes
+    }
+
+    /// The diagram needs the transcript: while history loads, the tab shows a placeholder.
+    pub fn open_changes(&mut self, cx: &mut Context<Self>) {
+        self.show_changes = true;
+        if self.changes.is_none() && self.status != Status::Loading {
+            let input = self.changes_input();
+            self.changes = Some(cx.new(|cx| crate::before_after::BeforeAfterView::new(input, cx)));
+        }
+        cx.notify();
     }
 
     /// Files edited in this session, in first-touched order.
@@ -1184,13 +1196,21 @@ impl SessionView {
         files
     }
 
-    pub fn cwd(&self) -> &std::path::Path {
-        &self.cwd
+    fn changes_input(&self) -> crate::before_after::Input {
+        let log = self.session_log();
+        let files = self.changed_files().into_iter().map(str::to_owned).collect();
+        crate::before_after::Input {
+            key: log.key,
+            provider: log.provider,
+            title: log.title,
+            cwd: log.cwd,
+            requests: self.items.iter().filter(|i| i.kind == ItemKind::User && !i.body.trim().is_empty()).map(|i| i.body.clone()).collect(),
+            files,
+        }
     }
 
-    /// Whether «Изменения» is the tab in front.
-    pub fn showing_changes(&self) -> bool {
-        self.show_changes
+    pub fn cwd(&self) -> &std::path::Path {
+        &self.cwd
     }
 
     /// Keep this transcript for the next start (see `workspace`).
@@ -1221,53 +1241,10 @@ impl SessionView {
         .detach();
     }
 
-    /// The report needs the transcript: while history is still loading, the tab
-    /// shows a placeholder and the report starts once history arrives.
-    pub fn open_changes(&mut self, cx: &mut Context<Self>) {
-        self.show_changes = true;
-        if self.changes.is_none() && self.status != Status::Loading {
-            self.make_changes(cx);
-        }
-        cx.notify();
-    }
-
-    /// The «Изменения» view, wired back to this session: its remarks go to the agent.
-    fn make_changes(&mut self, cx: &mut Context<Self>) -> Entity<crate::changes::ChangesView> {
-        let input = self.changes_input();
-        let view = cx.new(|cx| crate::changes::ChangesView::new(input, cx));
-        cx.subscribe(&view, |this, _, event: &crate::changes::ChangesEvent, cx| match event {
-            crate::changes::ChangesEvent::Return(text) => this.send_text(text.clone(), cx),
-            // TODO: a session tied to a board task could complete the task here.
-            crate::changes::ChangesEvent::Accept | crate::changes::ChangesEvent::ApprovePlan(_) | crate::changes::ChangesEvent::OpenSession => {}
-        })
-        .detach();
-        self.changes = Some(view.clone());
-        view
-    }
-
-    /// A turn ended: a watched map gets the new part of the session as a batch,
-    /// and UI edits get a before/after pass (pr-before-after).
-    fn changes_progressed(&mut self, cx: &mut Context<Self>) {
-        if self.native_id.is_some() || self.task_id.is_some() {
-            crate::changes::media::turn_finished(self.changes_input(), cx);
-        }
-        let view = match &self.changes {
-            Some(view) => view.clone(),
-            None => {
-                let key = self.native_id.clone().or_else(|| self.task_id.clone());
-                if !key.is_some_and(|k| crate::changes::follows(&k)) {
-                    return;
-                }
-                self.make_changes(cx)
-            }
-        };
-        let input = self.changes_input();
-        view.update(cx, |v, cx| v.session_progressed(input, cx));
-    }
-
-    fn changes_input(&self) -> crate::changes::ChangesInput {
-        let text = |kind: ItemKind| self.items.iter().filter(move |i| i.kind == kind).map(|i| i.body.clone());
-        crate::changes::ChangesInput {
+    /// The session so far, for the distiller.
+    fn session_log(&self) -> crate::distill::SessionLog {
+        use crate::distill::LogItem;
+        crate::distill::SessionLog {
             provider: agent_provider(self.provider),
             key: self
                 .native_id
@@ -1276,27 +1253,10 @@ impl SessionView {
                 .unwrap_or_else(|| format!("unsaved-{}", std::process::id())),
             title: self.title.to_string(),
             cwd: self.cwd.clone(),
-            requests: text(ItemKind::User).filter(|t| !t.trim().is_empty()).collect(),
-            final_answer: text(ItemKind::Assistant).last().unwrap_or_default(),
-            patches: self.items.iter().flat_map(|i| &i.diffs).map(|d| (d.path.clone(), d.patch.clone())).collect(),
-            commands: self
-                .items
-                .iter()
-                .filter(|i| i.kind == ItemKind::Tool && i.title.starts_with("$ "))
-                .map(|i| i.title.trim_start_matches("$ ").to_owned())
-                .collect(),
-            screenshots: self
-                .items
-                .iter()
-                .flat_map(|i| &i.attachments)
-                .filter(|a| a.kind == AttachmentKind::Image)
-                .map(|a| a.path.clone())
-                .collect(),
             log: self
                 .items
                 .iter()
                 .flat_map(|i| {
-                    use crate::changes::LogItem;
                     let mut out = Vec::new();
                     match i.kind {
                         ItemKind::User if !i.body.trim().is_empty() => out.push(LogItem::Request(i.body.clone())),
@@ -1304,11 +1264,10 @@ impl SessionView {
                         ItemKind::Tool if i.title.starts_with("$ ") => out.push(LogItem::Command(i.title.trim_start_matches("$ ").to_owned())),
                         _ => {}
                     }
-                    out.extend(i.diffs.iter().map(|d| LogItem::Edit { path: d.path.clone(), patch: d.patch.clone() }));
+                    out.extend(i.diffs.iter().map(|d| LogItem::Edit { path: d.path.clone() }));
                     out
                 })
                 .collect(),
-            plan: self.task_id.as_deref().and_then(approved_plan),
         }
     }
 
@@ -1557,12 +1516,19 @@ impl Render for SessionView {
                 this.attach_paths(paths.paths(), window, cx);
             }))
             .child(self.render_header(cx))
-            .child(div().flex_1().min_h_0().map(|this| match (&self.changes, self.status) {
-                (Some(changes), _) if self.show_changes => this.child(changes.clone()),
-                (None, _) if self.show_changes => this.child(crate::loading::transcript(&theme)),
+            .child(div().flex_1().min_h_0().map(|this| {
+                if self.show_changes {
+                    return match &self.changes {
+                        Some(view) => this.child(view.clone()),
+                        None => this.child(crate::loading::transcript(&theme)),
+                    };
+                }
                 // A restored tab shows last time's transcript while the agent re-reads it.
-                (_, Status::Loading) if self.items.is_empty() => this.child(crate::loading::transcript(&theme)),
-                _ => this.child(transcript),
+                if self.status == Status::Loading && self.items.is_empty() {
+                    this.child(crate::loading::transcript(&theme))
+                } else {
+                    this.child(transcript)
+                }
             }))
             .child(
                 h_flex().w_full().flex_shrink_0().px_6().pt(px(8.)).pb(px(14.)).justify_center().child(
@@ -1592,7 +1558,7 @@ impl Render for SessionView {
                             this.child(self.render_interrupted(step, &theme, cx))
                         })
                         .when(!self.queue.is_empty() && !self.show_changes, |this| this.child(self.render_queue(&theme, cx)))
-                        // The report is for reading: no composer over it.
+                        // «Изменения» is for reading: no composer over it.
                         .when(!self.show_changes, |this| this.child(
                             v_flex()
                                 .key_context(attach::CONTEXT)
@@ -1755,14 +1721,6 @@ fn agent_provider(p: Provider) -> stepan_verify_agents::Provider {
         Provider::Claude => stepan_verify_agents::Provider::Claude,
         Provider::Codex => stepan_verify_agents::Provider::Codex,
     }
-}
-
-/// report.json of the plan approved for task `id`, if it has one.
-fn approved_plan(id: &str) -> Option<PathBuf> {
-    let home = stepan_verify_core::Home::locate();
-    let task = stepan_verify_core::Board::new(home.clone()).get(id).ok()?;
-    let n = task.meta.plan_approved.filter(|_| task.meta.plan)?;
-    Some(stepan_verify_core::plans::report_path(&home, id, n)).filter(|p| p.exists())
 }
 
 fn task_prompt(task: &BoardTask) -> String {

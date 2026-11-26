@@ -73,7 +73,7 @@ pub struct Launch {
     cwd: Option<PathBuf>,
     /// Keep the dashboard in front after `--start`.
     stay: bool,
-    /// With `--open`: show the «Изменения» tab (builds the report if missing).
+    /// With `--open`: show the «Изменения» tab (builds the diagram if missing).
     changes: bool,
     page: Option<Page>,
     autopilot: bool,
@@ -789,32 +789,15 @@ impl AppView {
             return self.show(Page::Plan, cx);
         }
         let Some(task) = self.tasks.iter().find(|t| t.id == id).cloned() else { return };
-        let provider = self.task_provider(&task, cx);
-        let input = crate::changes::ChangesInput {
-            key: task.id.clone(),
-            provider: match provider {
-                Provider::Claude => stepan_verify_agents::Provider::Claude,
-                Provider::Codex => stepan_verify_agents::Provider::Codex,
-            },
-            title: task.meta.title.clone(),
-            cwd: worktree::session_cwd(&task).unwrap_or_else(dirs_home),
-            requests: Vec::new(),
-            final_answer: String::new(),
-            patches: Vec::new(),
-            commands: Vec::new(),
-            screenshots: Vec::new(),
-            log: Vec::new(),
-            plan: None,
-        };
         let task_id = task.id.clone();
-        let view = cx.new(|cx| crate::changes::ChangesView::plan(input, task_id.clone(), cx));
+        let cwd = worktree::session_cwd(&task).unwrap_or_else(dirs_home);
+        let view = cx.new(|cx| crate::changes::ChangesView::plan(task_id.clone(), task.meta.title.clone(), cwd, cx));
         cx.subscribe_in(&view, window, move |this, _, event: &crate::changes::ChangesEvent, window, cx| {
             use crate::changes::ChangesEvent;
             match event {
                 ChangesEvent::Return(text) => this.send_plan_remarks(&task_id, text.clone(), window, cx),
                 ChangesEvent::ApprovePlan(n) => this.approve_plan(&task_id, *n, window, cx),
                 ChangesEvent::OpenSession => this.open_task_session(&task_id, window, cx),
-                ChangesEvent::Accept => {}
             }
         })
         .detach();

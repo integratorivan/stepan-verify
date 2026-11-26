@@ -20,7 +20,26 @@ use stepan_verify_agents::{AgentEvent, AgentHandle, Mode, Provider, SessionSpec}
 use stepan_verify_core::config::DistillMode;
 use serde::{Deserialize, Serialize};
 
-use crate::changes::{ChangesInput, LogItem};
+/// One step of the session, in order.
+#[derive(Clone, Debug)]
+pub enum LogItem {
+    Request(String),
+    Answer(String),
+    Command(String),
+    Edit { path: String },
+}
+
+/// What the session did so far, handed to the distiller.
+#[derive(Clone)]
+pub struct SessionLog {
+    /// The native session id.
+    pub key: String,
+    /// The session's agent; the distiller runs on the same family.
+    pub provider: Provider,
+    pub title: String,
+    pub cwd: PathBuf,
+    pub log: Vec<LogItem>,
+}
 
 /// The new part of a session is worth a pass only with this much talk in it.
 const MIN_TEXT: usize = 600;
@@ -124,7 +143,7 @@ fn clip(text: &str, limit: usize) -> String {
 }
 
 /// The new part of the session as markdown for the distiller.
-fn context_md(input: &ChangesInput, project: Option<&str>, start: usize) -> String {
+fn context_md(input: &SessionLog, project: Option<&str>, start: usize) -> String {
     let new = &input.log[start..];
     let mut body = String::new();
     let mut edits: Vec<&str> = Vec::new();
@@ -137,7 +156,7 @@ fn context_md(input: &ChangesInput, project: Option<&str>, start: usize) -> Stri
     };
     for item in new {
         match item {
-            LogItem::Edit { path, .. } => edits.push(path),
+            LogItem::Edit { path } => edits.push(path),
             other => {
                 flush(&mut body, &mut edits);
                 match other {
@@ -198,7 +217,7 @@ fn prompt(run: &Path, docs_dir: &Path, key: &str) -> String {
 // ------------------------------------------------------------------ jobs
 
 struct Pending {
-    input: ChangesInput,
+    input: SessionLog,
     project: Option<String>,
     _timer: Task<()>,
 }
@@ -255,7 +274,7 @@ fn quiet_after(cx: &App) -> Duration {
 }
 
 /// A turn ended: start (or restart) the quiet timer for this session.
-pub fn turn_finished(input: ChangesInput, project: Option<String>, cx: &mut App) {
+pub fn turn_finished(input: SessionLog, project: Option<String>, cx: &mut App) {
     if crate::settings::config(cx).docs.distill == DistillMode::Off || input.key.starts_with("unsaved-") {
         return;
     }
@@ -294,7 +313,7 @@ fn fire(key: &str, cx: &mut App) {
     }
 }
 
-fn launch(input: ChangesInput, project: Option<String>, cx: &mut App) {
+fn launch(input: SessionLog, project: Option<String>, cx: &mut App) {
     if crate::settings::config(cx).docs.distill == DistillMode::Off {
         return;
     }
@@ -403,19 +422,13 @@ fn finish(key: &str, error: Option<String>, cx: &mut App) {
 mod tests {
     use super::*;
 
-    fn input(log: Vec<LogItem>) -> ChangesInput {
-        ChangesInput {
+    fn input(log: Vec<LogItem>) -> SessionLog {
+        SessionLog {
             key: "abc".into(),
             provider: Provider::Claude,
             title: "Поиск".into(),
             cwd: PathBuf::from("/p/outpoll-web"),
-            requests: Vec::new(),
-            final_answer: String::new(),
-            patches: Vec::new(),
-            commands: Vec::new(),
-            screenshots: Vec::new(),
             log,
-            plan: None,
         }
     }
 
@@ -450,8 +463,8 @@ mod tests {
     #[core::prelude::v1::test]
     fn context_lists_new_part_only() {
         let mut log = talk(1);
-        log.push(LogItem::Edit { path: "src/a.rs".into(), patch: String::new() });
-        log.push(LogItem::Edit { path: "src/a.rs".into(), patch: String::new() });
+        log.push(LogItem::Edit { path: "src/a.rs".into() });
+        log.push(LogItem::Edit { path: "src/a.rs".into() });
         log.push(LogItem::Command("cargo `test`".into()));
         log.push(LogItem::Answer("итог".into()));
         let md = context_md(&input(log), Some("outpoll-web"), 1);

@@ -1,0 +1,28 @@
+feature: «Изменения»: схема «Было / Стало»
+area: Изменения («Было / Стало»)
+status: done
+summary: Во вкладке «Изменения» сессии агент рисует две схемы — как код был устроен и как стал; переключаешь «Было / Стало», видишь разницу цветом и по клику на любой блок читаешь, что это и что в нём поменялось
+aliases: [изменения, было стало, before after, до после, схема изменений, разница, pele, mermaid, changes.json, пересобрать, описание блока]
+entries: [crates/stepan_verify_app/src/before_after/mod.rs, crates/stepan_verify_app/src/before_after/render.mjs, crates/stepan_verify_app/src/session.rs]
+starts_at: Экран сессии
+
+paths:
+  Первая сборка:
+    - Экран сессии: нажать вкладку «Изменения» (рядом с «Диалог»; на ней счётчик файлов, которые правила сессия) -> лента сменяется разделом «Изменения», поле ввода скрыто; пока переписка грузится — заглушка, схема начинает строиться, как только история пришла  [SessionView::open_changes, SessionView::changes_input, crates/stepan_verify_app/src/session.rs]
+    - Вкладка «Изменения»: открыта впервые, готовой схемы нет -> агент той же семьи, что и сессия (модель из «Служебные агенты»), читает дифф от ветки по умолчанию и пишет changes.json: две Mermaid-схемы «Было» и «Стало» и описание каждого блока; вместо схемы «Рисую «Было → Стало»» с таймером и текущим шагом («Читаю дифф», «Пишу описание блоков», «Рисую схемы»)  [BeforeAfterView::new, BeforeAfterView::start, prompt, base, humanize, render_running, settings::report_model, crates/stepan_verify_app/src/before_after/mod.rs]
+    - Вкладка «Изменения»: агент закончил -> render.mjs рисует схемы pele в PNG (светлая и тёмная тема, с разницей и без) и layout.json с рамками блоков; сборка лежит в ~/.stepan_verify/state/before_after/<сессия>/<время> и при следующем открытии показывается сразу, без агента  [BeforeAfterView::finish, render, load_latest, crates/stepan_verify_app/src/before_after/mod.rs, crates/stepan_verify_app/src/before_after/render.mjs]
+    - Вкладка «Изменения»: агент не записал changes.json или рендер упал -> «Схема не собралась» с текстом ошибки и кнопкой «Собрать», которая запускает агента заново  [render_empty, BeforeAfterView::start, crates/stepan_verify_app/src/before_after/mod.rs]
+  Смотреть схему:
+    - Вкладка «Изменения»: прочитать шапку -> заголовок изменения и 1–2 предложения summary во всю ширину; под схемой подсказка «клик по блоку — что это и что в нём поменялось»  [render_built, Changes.title, Changes.summary, crates/stepan_verify_app/src/before_after/mod.rs]
+    - Вкладка «Изменения»: переключить «Было / Стало» (по умолчанию «Стало») -> показывается схема этой стороны, вписанная в ширину окна, но не крупнее 125%  [Side, render_built, MAX_SCALE, crates/stepan_verify_app/src/before_after/mod.rs]
+    - Вкладка «Изменения»: снять или поставить флажок «Разница» (по умолчанию включён) -> новое, изменённое и убранное подсвечено цветом и рядом счётчики «+N новое», «~N изменено», «−N убрано»; без флажка — та же схема без подсветки и без счётчиков  [BeforeAfterView::image, Stats, crates/stepan_verify_app/src/before_after/mod.rs, crates/stepan_verify_app/src/before_after/render.mjs]
+    - Вкладка «Изменения»: нажать «Пересобрать» справа от «собрано … назад» -> агент рисует схему заново по текущему состоянию сессии; пока он работает, на месте кнопки крутится его шаг, а старая схема остаётся на экране  [BeforeAfterView::start, BeforeAfterView::update_input, crates/stepan_verify_app/src/before_after/mod.rs, crates/stepan_verify_app/src/session.rs]
+  Описание блока:
+    - Вкладка «Изменения»: навести на блок схемы и кликнуть -> блок обведён, справа открывается «Панель блока»; в узком окне (уже 1300) панель ложится поверх схемы, иначе схема сужается рядом  [BlockBox, BeforeAfterView::selected, crates/stepan_verify_app/src/before_after/mod.rs]
+    - Панель блока: прочитать -> значок «новое / изменено / убрано / не менялось», имя (убранное зачёркнуто), путь к файлу, что это и зачем, «что поменялось», поля с +/−/~, сигнатура «было / стало», ханк кода; если блока нет на этой стороне — «На схеме «Было» этого нет…» или «На схеме «Стало» этого нет…»; без описания — «Агент не описал этот блок — нажми «Пересобрать»»  [render_panel, render_hunk, Block, Field, Signature, crates/stepan_verify_app/src/before_after/mod.rs]
+    - Панель блока: кликнуть путь к файлу -> файл открывается во встроенном превью справа  [preview::open_in_app, crates/stepan_verify_app/src/preview.rs, crates/stepan_verify_app/src/before_after/mod.rs]
+    - Панель блока: нажать крестик или ещё раз кликнуть тот же блок -> панель закрывается  [render_panel, crates/stepan_verify_app/src/before_after/mod.rs]
+
+proofs:
+  - test: crates/stepan_verify_app/src/before_after/mod.rs::changes_and_layout_parse  covers: 3, 10  at: 2026-11-26T12:22:43Z
+  - test: crates/stepan_verify_app/src/before_after/mod.rs::prompt_names_the_files_and_the_script  covers: 2  at: 2026-11-26T12:22:43Z
