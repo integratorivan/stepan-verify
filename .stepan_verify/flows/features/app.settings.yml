@@ -1,6 +1,6 @@
 feature: Настройки приложения
 area: Приложение: настройки, обновления, запуск
-summary: Пользователь задаёт режим агентов, агента по умолчанию, лимит автопилота, модели отчётов, шрифты и правила документов
+summary: Пользователь задаёт режим агентов, агента по умолчанию, лимит автопилота, модели служебных агентов, шрифты и правила документов
 aliases: [настройки, конфиг, config.toml, режим агентов, шрифт, автопилот лимит]
 entries: [crates/stepan_verify_app/src/settings_page.rs, crates/stepan_verify_app/src/settings.rs, Page::Settings]
 
@@ -8,6 +8,7 @@ paths:
   Поменять настройку:
     - Левый сайдбар: Нажать «Настройки» -> Открывается экран настроек  [SettingsPage, Page::Settings, crates/stepan_verify_app/src/settings_page.rs, crates/stepan_verify_app/src/app.rs]
     - Настройки: Выбрать «Режим агентов» (по умолчанию полный доступ) -> Новые процессы агентов стартуют в этом режиме, значение пишется в config.toml  [Config, Mode, crates/stepan_verify_app/src/settings.rs, crates/stepan_verify_core/src/config.rs]
+    - Настройки: выбрать модель в «Служебные агенты · Claude» или «Служебные агенты · Codex» -> на ней для сессий этой семьи работают служебные агенты: схема «Изменения», разбор сессий для «Документов», сверка карты флоу  [settings::report_model, crates/stepan_verify_app/src/settings_page.rs, crates/stepan_verify_app/src/settings.rs, crates/stepan_verify_core/src/config.rs]
     - Настройки: Выбрать шрифт текста или кода -> Интерфейс сразу перерисовывается новым шрифтом  [ui::apply_fonts, crates/stepan_verify_app/src/ui.rs, crates/stepan_verify_app/src/settings_page.rs]
 
 proofs:
