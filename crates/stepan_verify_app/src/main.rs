@@ -1,5 +1,6 @@
 mod app;
 mod attach;
+mod before_after;
 mod changes;
 mod corner;
 mod board;
@@ -143,8 +144,10 @@ fn main() {
             }),
             ..Default::default()
         };
-        open_window(options, cx, |window, cx| cx.new(|cx| app::AppView::new(home, launch, window, cx)))
+        let _window = open_window(options, cx, |window, cx| cx.new(|cx| app::AppView::new(home, launch, window, cx)))
             .expect("failed to open window");
+        #[cfg(feature = "snapshot")]
+        snapshot(_window.0, cx);
         cx.activate(true);
     });
 }
@@ -174,6 +177,29 @@ fn login_path() {
     }
     // SAFETY: before any other thread starts.
     unsafe { std::env::set_var("PATH", parts.join(":")) };
+}
+
+/// Dev builds with `--features snapshot`: STEPAN_VERIFY_SNAPSHOT=<png> writes a
+/// frame of the window there after STEPAN_VERIFY_SNAPSHOT_DELAY seconds (8) and
+/// quits. For checking screens where macOS denies screen capture.
+#[cfg(feature = "snapshot")]
+fn snapshot(window: AnyWindowHandle, cx: &mut App) {
+    let Some(path) = std::env::var_os("STEPAN_VERIFY_SNAPSHOT") else { return };
+    let delay = std::env::var("STEPAN_VERIFY_SNAPSHOT_DELAY").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(std::time::Duration::from_secs(delay)).await;
+        let saved = window.update(cx, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_to_image().map_err(|e| e.to_string()).and_then(|img| img.save(&path).map_err(|e| e.to_string()))
+        });
+        match saved {
+            Ok(Ok(())) => eprintln!("stepan_verify: snapshot saved"),
+            Ok(Err(err)) => eprintln!("stepan_verify: snapshot: {err}"),
+            Err(err) => eprintln!("stepan_verify: snapshot: {err}"),
+        }
+        cx.update(|cx| cx.quit());
+    })
+    .detach();
 }
 
 /// The PATH the login shell builds, or None when it fails or takes too long.

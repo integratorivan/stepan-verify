@@ -7,6 +7,10 @@ version.workspace = true
 name = "stepan_verify"
 path = "src/main.rs"
 
+[features]
+# Dev builds that write a frame of the window to a PNG (STEPAN_VERIFY_SNAPSHOT), for when screen capture is denied.
+snapshot = ["gpui-kit/test-support"]
+
 [dependencies]
 gpui-kit = { workspace = true, features = ["syntect"] }
 # Real browser rendering for HTML previews (WKWebView). Same backend as gpui-kit: no `gpui-fast`.

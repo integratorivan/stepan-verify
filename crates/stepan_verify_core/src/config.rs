@@ -103,45 +103,20 @@ impl From<Provider> for ProviderSetting {
     }
 }
 
-/// The "Изменения" report subagent.
+/// Helper agents (session distiller, flow map sync). The section keeps its
+/// old name so existing config.toml files still load.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChangesConfig {
-    /// Claude model alias for reports on Claude sessions: haiku, sonnet, opus.
+    /// Claude model alias for helpers on Claude sessions: haiku, sonnet, opus.
     pub model: String,
-    /// Codex model slug for reports on Codex sessions; empty = Codex's own default.
+    /// Codex model slug for helpers on Codex sessions; empty = Codex's own default.
     pub codex_model: String,
-    /// Before/after screenshots and videos (pr-before-after) after an agent's turn.
-    pub media: MediaMode,
 }
 
 impl Default for ChangesConfig {
     fn default() -> Self {
-        Self { model: "sonnet".into(), codex_model: String::new(), media: MediaMode::Auto }
-    }
-}
-
-/// When the before/after pass runs.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MediaMode {
-    /// After every turn that touched UI files.
-    #[default]
-    Auto,
-    /// Only by the button in «Изменения».
-    Manual,
-    Off,
-}
-
-impl MediaMode {
-    pub const ALL: [MediaMode; 3] = [MediaMode::Auto, MediaMode::Manual, MediaMode::Off];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            MediaMode::Auto => "после хода",
-            MediaMode::Manual => "по кнопке",
-            MediaMode::Off => "выкл",
-        }
+        Self { model: "sonnet".into(), codex_model: String::new() }
     }
 }
 

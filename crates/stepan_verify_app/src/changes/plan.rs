@@ -12,8 +12,7 @@ use stepan_verify_core::{Home, Phase, Task, TaskStatus, plans};
 
 use super::{
     ChangesEvent, ChangesView, Lens, MAP_RULES, Panel, PlanMode, Report, SCHEMA, VIEW_RULES,
-    map::{self, Graph, NodeStatus},
-    severity_badge,
+    map::{self, Graph},
 };
 use crate::{
     format::ago,
@@ -90,59 +89,6 @@ pub fn remarks_header(title: &str, draft: &Path) -> String {
 
 // ------------------------------------------------------------------ plan vs fact
 
-/// How the implementation map covers the approved plan.
-#[derive(Debug, Default, PartialEq)]
-pub struct Coverage {
-    /// Plan nodes the implementation has (indices into the plan graph).
-    pub done: Vec<usize>,
-    /// Plan nodes not there yet.
-    pub unmet: Vec<usize>,
-    /// Changed nodes the plan did not have (indices into the fact graph).
-    pub extra: Vec<usize>,
-}
-
-/// The nodes a map is about: what changes, not the context around it.
-fn planned(n: &map::MapNode) -> bool {
-    !n.implicit && n.status != NodeStatus::Context && n.test.is_none()
-}
-
-/// `crate::app::Foo::bar(x)` → `bar`: the code name without path and arguments.
-fn short_name(name: &str) -> String {
-    let head = name.split('(').next().unwrap_or(name).trim();
-    map::normalize(head.rsplit("::").next().unwrap_or(head).rsplit('.').next().unwrap_or(head))
-}
-
-fn same_file(a: &str, b: &str) -> bool {
-    let (a, b) = (a.trim().trim_start_matches("./"), b.trim().trim_start_matches("./"));
-    a.is_empty() || b.is_empty() || a == b || a.ends_with(&format!("/{b}")) || b.ends_with(&format!("/{a}"))
-}
-
-/// One plan node and one changed node are the same thing: the same id, or
-/// the same code name in the same file.
-pub fn same_node(plan: &map::MapNode, fact: &map::MapNode) -> bool {
-    if plan.key == fact.key {
-        return true;
-    }
-    let name = short_name(&plan.name);
-    !name.is_empty() && name == short_name(&fact.name) && same_file(&plan.file, &fact.file)
-}
-
-pub fn coverage(plan: &Graph, fact: &Graph) -> Coverage {
-    let mut out = Coverage::default();
-    let mut used: HashSet<usize> = HashSet::new();
-    for (i, p) in plan.nodes.iter().enumerate().filter(|(_, n)| planned(n)) {
-        match fact.nodes.iter().enumerate().find(|(j, f)| !used.contains(j) && planned(f) && same_node(p, f)) {
-            Some((j, _)) => {
-                used.insert(j);
-                out.done.push(i);
-            }
-            None => out.unmet.push(i),
-        }
-    }
-    out.extra = fact.nodes.iter().enumerate().filter(|(j, f)| planned(f) && !used.contains(j)).map(|(j, _)| j).collect();
-    out
-}
-
 /// Nodes of a stage on the plan map: by id, else by name.
 pub fn stage_nodes(g: &Graph, ids: &[String]) -> HashSet<usize> {
     let keys: Vec<String> = ids.iter().map(|k| map::normalize(k)).collect();
@@ -182,7 +128,7 @@ impl ChangesView {
             (_, status, _) => ui::dot_badge(status.label(), neutral).into_any_element(),
         });
         let out = self.out.clone();
-        let title = r.map(|r| r.title.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| self.input.title.clone());
+        let title = r.map(|r| r.title.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| self.title.clone());
         v_flex()
             .gap(px(8.))
             .child(
@@ -213,7 +159,7 @@ impl ChangesView {
 
     /// No readable iteration yet: the agent is writing, or the report is broken.
     pub(super) fn render_plan_pending(&self, err: Option<String>, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let writing = self.plan.as_ref().and_then(|pl| pl.meta.as_ref()).is_some_and(|t| t.meta.status == TaskStatus::InProgress);
+        let writing = self.plan.meta.as_ref().is_some_and(|t| t.meta.status == TaskStatus::InProgress);
         let (icon, text): (AnyElement, String) = match (&err, writing) {
             (Some(e), _) => (Icon::new(IconName::TriangleAlert).small().text_color(p.red.solid).into_any_element(), format!("Итерацию не прочитать: {e}. Напиши агенту в сессии — пусть перепишет report.json и снова вызовет plan-ready.")),
             (None, true) => (
@@ -354,7 +300,7 @@ impl ChangesView {
 
     /// Vertical slices in order; a click lights the stage's nodes on the canvas.
     fn render_stages(&self, g: &Graph, r: &Report, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let active = self.plan.as_ref().and_then(|pl| pl.stage);
+        let active = self.plan.stage;
         let mono = theme.mono_font_family.clone();
         let cards = r.stages.iter().enumerate().map(|(i, s)| {
             let on = active == Some(i);
@@ -371,9 +317,7 @@ impl ChangesView {
                 .cursor_pointer()
                 .map(|d| if on { d.border_color(p.ink).shadow(ui::card_shadow()) } else { d.border_color(p.border).hover(|s| s.border_color(p.border_strong)) })
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    if let Some(plan) = &mut this.plan {
-                        plan.stage = if plan.stage == Some(i) { None } else { Some(i) };
-                    }
+                    this.plan.stage = if this.plan.stage == Some(i) { None } else { Some(i) };
                     this.lens = Lens::Map;
                     cx.notify();
                 }))
@@ -473,53 +417,20 @@ impl ChangesView {
             .into_any_element()
     }
 
-    /// «План: выполнено N из M · вне плана K» on the implementation's map.
-    pub(super) fn render_coverage(&self, plan: &Report, g: &Graph, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let pg = map::build_report(plan);
-        let c = coverage(&pg, g);
-        let total = c.done.len() + c.unmet.len();
-        let row = |label: &'static str, tone: Tone| div().w(px(86.)).flex_shrink_0().pt(px(3.)).text_size(px(12.)).text_color(tone.text).child(label);
-        v_flex()
-            .p(px(12.))
-            .gap(px(8.))
-            .rounded(px(10.))
-            .border_1()
-            .border_color(p.border)
-            .bg(p.surface)
-            .child(
-                h_flex()
-                    .gap(px(8.))
-                    .child(Icon::empty().path("icons/list-checks.svg").small().text_color(if c.unmet.is_empty() { p.green.solid } else { p.amber.solid }))
-                    .child(div().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).text_color(p.ink).child(format!("План: выполнено {} из {total}", c.done.len())))
-                    .child(div().text_size(px(13.)).text_color(if c.extra.is_empty() { p.muted } else { p.amber.text }).child(format!("· вне плана {}", c.extra.len())))
-                    .child(div().flex_1())
-                    .child(ui::mono(plan.title.clone(), theme).truncate().text_color(p.faint)),
-            )
-            .when(!c.unmet.is_empty(), |d| {
-                d.child(
-                    h_flex().gap(px(8.)).items_start().child(row("не сделано", p.amber)).child(
-                        h_flex().flex_1().gap(px(5.)).flex_wrap().children(c.unmet.iter().take(24).map(|&i| {
-                            let n = &pg.nodes[i];
-                            ui::chip(format!("{} · {}", n.title(), super::status_label(n.status, true)), p, theme)
-                        })),
-                    ),
-                )
-            })
-            .when(!c.extra.is_empty(), |d| {
-                d.child(
-                    h_flex().gap(px(8.)).items_start().child(row("вне плана", Tone { solid: p.faint, soft: p.surface2, text: p.muted })).child(
-                        h_flex().flex_1().gap(px(5.)).flex_wrap().children(
-                            c.extra.iter().take(24).map(|&j| self.node_chip(SharedString::from(format!("coverage-extra-{}", g.nodes[j].key)), &g.nodes[j].key, g, p, theme, cx)).collect::<Vec<_>>(),
-                        ),
-                    ),
-                )
-            })
+}
+
+fn severity_badge(sev: &str, p: &Palette) -> Option<(&'static str, Tone)> {
+    match sev {
+        "high" => Some(("ВЫСОКИЙ", p.red)),
+        "mid" | "medium" => Some(("СРЕДНИЙ", p.amber)),
+        "low" => Some(("НИЗКИЙ", Tone { solid: p.faint, soft: p.surface2, text: p.muted })),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Graph, Home, Report, Task, coverage, implement_brief, map, plan_brief, plans, stage_nodes};
+    use super::{Home, Report, Task, implement_brief, map, plan_brief, plans, stage_nodes};
 
     fn report(json: &str) -> Report {
         serde_json::from_str(json).unwrap()
@@ -542,31 +453,6 @@ mod tests {
         assert_eq!(stage_nodes(&g, &["PlanView".into()]).len(), 1, "by name too");
         // A changes report without them still parses.
         assert!(report(r#"{"title": "x"}"#).stages.is_empty());
-    }
-
-    #[core::prelude::v1::test]
-    fn plan_vs_fact_matches_by_id_or_name_and_file() {
-        let plan = map::build_report(&report(
-            r#"{"code": {"added": [{"id": "plan_ready", "name": "Board::plan_ready", "file": "crates/core/src/tasks.rs"}, {"id": "stages", "name": "render_stages"}],
-                         "changed": [{"id": "meta", "name": "TaskMeta", "file": "src/tasks.rs"}],
-                         "context": [{"id": "board", "name": "Board"}]}}"#,
-        ));
-        let fact = map::build_report(&report(
-            r#"{"code": {"added": [{"id": "x1", "name": "plan_ready(id, by, run)", "file": "crates/core/src/tasks.rs"}, {"id": "cli", "name": "plan-ready"}],
-                         "changed": [{"id": "meta", "name": "TaskMeta"}, {"id": "y", "name": "render_stages", "file": "other/elsewhere.rs"}],
-                         "context": [{"id": "z", "name": "Home"}]},
-                "tests": [{"id": "t", "title": "tests", "file": "t.rs", "verifies": ["meta"]}]}"#,
-        ));
-        let c = coverage(&plan, &fact);
-        let names = |g: &Graph, ix: &[usize]| ix.iter().map(|&i| g.nodes[i].name.clone()).collect::<Vec<_>>();
-        assert_eq!(names(&plan, &c.done), ["Board::plan_ready", "render_stages", "TaskMeta"]);
-        assert!(c.unmet.is_empty());
-        assert_eq!(names(&fact, &c.extra), ["plan-ready"], "context and tests are not out of plan");
-
-        // A different file is a different thing.
-        let other = map::build_report(&report(r#"{"code": {"added": [{"id": "q", "name": "plan_ready", "file": "src/cli.rs"}]}}"#));
-        let c = coverage(&plan, &other);
-        assert_eq!((c.done.len(), c.unmet.len(), c.extra.len()), (0, 3, 1));
     }
 
     #[core::prelude::v1::test]

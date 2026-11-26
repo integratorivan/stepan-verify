@@ -89,16 +89,9 @@ pub const FEATURES: &[Feature] = &[
     f("docs.resolve", "Документы", "Закрыть тред", "комментарий решён", "0.2.9", Disk),
     f("docs.versions", "Документы", "Дифф версии", "что поменялось в документе", "0.2.9", Live),
     f("docs.distill", "Документы", "Итоги сессии", "дистиллятор пишет решения и факты", "0.1", Disk),
-    f("changes.open", "Изменения", "Открыть «Изменения»", "отчёт о том, что сделала сессия", "0.1", Live),
-    f("changes.run", "Изменения", "Собрать карту", "прогон ревьюера (ты — полный, сам — батч)", "0.1", Disk),
-    f("changes.follow", "Изменения", "Следить за сессией", "карта обновляется после каждого хода", "0.1", Live),
-    f("changes.arch", "Изменения", "Вкладка «Архитектура»", "клик по вкладке; она же открыта по умолчанию", "0.2.9", Live),
-    f("changes.contracts", "Изменения", "Вкладка «Контракты»", "типы, сигнатуры, зависимости", "0.2.9", Live),
-    f("changes.media", "Изменения", "Вкладка «До / После»", "скриншоты и GIF", "0.2.9", Live),
-    f("changes.map", "Изменения", "Карта-канвас", "старый холст изменений", "0.1", Live),
-    f("changes.views", "Изменения", "«Как устроено»", "деревья, псевдокод, было → стало", "0.2.6", Live),
-    f("changes.reviewed", "Изменения", "«Просмотрено»", "отметка на узле карты", "0.2.9", Disk),
-    f("changes.only_new", "Изменения", "«Только новое»", "скрыть просмотренное", "0.2.9", Live),
+    f("changes.open", "Изменения", "Открыть «Изменения»", "схема «Было → Стало» сессии", "0.1", Live),
+    f("changes.map", "Задачи", "Карта плана", "канвас «станет» в плане задачи", "0.1", Live),
+    f("changes.views", "Задачи", "«Как устроено» в плане", "деревья, данные, макет", "0.2.6", Live),
     f("page.memory", "Память", "Страница «Память»", "что агенты помнят о тебе", "0.2.0", Live),
     f("memory.add", "Память", "Запись в память", "новое правило или факт", "0.2.0", Disk),
     f("memory.edit", "Память", "Правка памяти", "исправить или удалить запись", "0.2.0", Disk),
@@ -272,21 +265,6 @@ pub fn from_disk(home: &Home) -> Vec<Use> {
             _ => continue,
         };
         push(ts(&op["at"]), feature, actor_of(op["by"].as_str().unwrap_or("")));
-    }
-
-    // «Изменения»: runs and «Просмотрено» marks per session.
-    for session in subdirs(&home.state().join("changes")) {
-        for run in subdirs(&session.join("runs")) {
-            if let Some(meta) = read_json(&run.join("meta.json")) {
-                let actor = if meta["kind"] == "batch" { Actor::Agent } else { Actor::Me };
-                push(ts(&meta["at"]), "changes.run", actor);
-            }
-        }
-        if let Some(Value::Object(marks)) = read_json(&session.join("reviewed.json")) {
-            for mark in marks.values() {
-                push(ts(&mark["at"]), "changes.reviewed", Actor::Me);
-            }
-        }
     }
 
     // Session summaries: state/distill/<session>/state.json.
@@ -510,9 +488,6 @@ mod tests {
             r#"{"op":"sent","id":"a","session":"s","at":"2026-11-21T09:01:00Z"}"#, "\n",
         ));
         w(home.memory().join("log.jsonl"), r#"{"at":"2026-11-22T08:00:00Z","by":"авто","op":"add","id":"m","kind":"rule","text":"t"}"#);
-        w(state.join("changes/s1/runs/1/meta.json"), r#"{"at":"2026-11-23T08:00:00Z","kind":"full"}"#);
-        w(state.join("changes/s1/runs/2/meta.json"), r#"{"at":"2026-11-23T09:00:00Z","kind":"batch"}"#);
-        w(state.join("changes/s1/reviewed.json"), r#"{"n1":{"run":1,"fingerprint":"f","at":"2026-11-23T08:30:00Z"},"n2":{"run":1,"fingerprint":"g"}}"#);
         w(state.join("distill/s1/state.json"), r#"{"passes":[{"n":1,"at":"2026-11-24T08:00:00Z"}]}"#);
         w(state.join("skills-usage.json"), r#"{"files":{"/x.jsonl":{"uses":[{"skill":"show-me","method":"Command","at":"2026-11-24T09:00:00Z"},{"skill":"describe-pr","method":"Skill","at":"2026-11-24T10:00:00Z"},{"skill":"model","method":"Command","at":"2026-11-24T10:00:00Z"}]}}}"#);
 
@@ -521,9 +496,6 @@ mod tests {
         assert_eq!(
             got,
             [
-                ("changes.reviewed", Actor::Me),
-                ("changes.run", Actor::Me),
-                ("changes.run", Actor::Agent),
                 ("docs.comment", Actor::Me),
                 ("docs.comment", Actor::Agent),
                 ("docs.distill", Actor::Agent),
