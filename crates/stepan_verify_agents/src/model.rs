@@ -195,6 +195,9 @@ pub enum AgentEvent {
     ApprovalRequested(Approval),
     ApprovalResolved(String),
     TurnCompleted { error: Option<String> },
+    /// The last turn never ended and no process runs it any more (the agent
+    /// died mid-step); `step` is where it stopped.
+    Interrupted { step: String },
     Error(String),
     Exited,
 }

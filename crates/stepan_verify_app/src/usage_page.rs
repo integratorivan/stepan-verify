@@ -19,7 +19,7 @@ use crate::{
 /// No use for this long reads as «не пользуюсь».
 const IDLE_DAYS: i64 = 14;
 /// Releases whose features still count as new.
-const NEW_SINCE: [&str; 3] = ["0.2.8", "0.2.9", "0.2.10"];
+const NEW_SINCE: [&str; 5] = ["0.2.8", "0.2.9", "0.2.10", "0.2.11", "0.2.12"];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Filter {
