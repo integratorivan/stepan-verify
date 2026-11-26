@@ -14,7 +14,7 @@ stepan_verify task — доска задач stepan_verify (~/.stepan_verify/tas
 
   stepan_verify task list [--ready] [--status STATUS] [--json]
   stepan_verify task show [ID]
-  stepan_verify task create TITLE [--body TEXT] [--cwd DIR] [--label k=v]... [--depends ID]... [--attach PATH]... [--inbox] [--isolation worktree|here] [--plan]
+  stepan_verify task create TITLE [--body TEXT] [--cwd DIR] [--label k=v]... [--depends ID]... [--attach PATH]... [--inbox] [--isolation worktree|here] [--claude-model M] [--codex-model M] [--plan]
   stepan_verify task claim [ID | --ready [--label k=v]] [--by NAME] [--lease 1h]
   stepan_verify task renew [ID] [--by NAME] [--lease 1h]
   stepan_verify task log [ID] TEXT [--by NAME]
@@ -34,7 +34,9 @@ struct Args {
 
 impl Args {
     fn parse(raw: &[String]) -> Self {
-        const VALUED: [&str; 10] = ["--status", "--body", "--cwd", "--label", "--depends", "--attach", "--by", "--lease", "--isolation", "--json-unused"];
+        const VALUED: [&str; 12] = [
+            "--status", "--body", "--cwd", "--label", "--depends", "--attach", "--by", "--lease", "--isolation", "--claude-model", "--codex-model", "--json-unused",
+        ];
         let mut positional = Vec::new();
         let mut flags = Vec::new();
         let mut it = raw.iter();
@@ -131,6 +133,8 @@ pub fn run(home: &Home, raw: &[String]) -> Result<String> {
                         .collect(),
                     status: if args.has("--inbox") { TaskStatus::Inbox } else { TaskStatus::Todo },
                     isolation,
+                    claude_model: args.value("--claude-model"),
+                    codex_model: args.value("--codex-model"),
                     plan: args.has("--plan"),
                 },
                 &by,
@@ -323,6 +327,25 @@ mod tests {
         assert!(out.contains("Отдельная копия осталась") && out.contains(&copy.display().to_string()), "{out}");
         assert_eq!(board.get(&id).unwrap().meta.worktree, Some(copy));
         assert!(run(&home, &s(&["create", "x", "--isolation", "maybe"])).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn create_keeps_the_chosen_models() {
+        let root = std::env::temp_dir().join(format!("stepan_verify-cli-model-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = Home { root: root.clone() };
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let out = run(&home, &s(&["create", "Модель", "--claude-model", "opus"])).unwrap();
+        let id = out.split_whitespace().next().unwrap().to_owned();
+        let board = Board::new(home.clone());
+        let task = board.get(&id).unwrap();
+        assert_eq!(task.model(crate::Provider::Claude), Some("opus"));
+        assert_eq!(task.model(crate::Provider::Codex), None);
+        let task = board.set_model(&id, "me", crate::Provider::Codex, Some("gpt-5".into())).unwrap();
+        assert_eq!(task.model(crate::Provider::Codex), Some("gpt-5"));
+        let task = board.set_model(&id, "me", crate::Provider::Claude, None).unwrap();
+        assert_eq!(task.model(crate::Provider::Claude), None);
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -13,6 +13,7 @@ mod live_card;
 mod loading;
 mod media;
 mod memory;
+mod models;
 mod new_session;
 mod new_task;
 mod preview;

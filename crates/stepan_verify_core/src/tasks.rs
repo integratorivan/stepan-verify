@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Home,
+    Home, Provider,
     events::{self, Event},
     worktree::{self, Isolation},
 };
@@ -100,6 +100,12 @@ pub struct TaskMeta {
     /// Its branch, `stepan/<id>`; stays when the copy is removed but the branch kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Model when Claude takes the task; unset = Настройки → «Модель по умолчанию».
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_model: Option<String>,
+    /// Model when Codex takes the task; unset = the default from settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_model: Option<String>,
     /// `key=value` labels, e.g. `kind=bug`, `area=admin`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
@@ -186,6 +192,14 @@ impl Task {
         self.meta.project.clone().or_else(|| self.meta.cwd.as_deref().and_then(worktree::project_name))
     }
 
+    /// The model chosen for `provider` on this task, if any.
+    pub fn model(&self, provider: Provider) -> Option<&str> {
+        match provider {
+            Provider::Claude => self.meta.claude_model.as_deref(),
+            Provider::Codex => self.meta.codex_model.as_deref(),
+        }
+    }
+
     pub fn lease_expired(&self, now: DateTime<Utc>) -> bool {
         self.meta.lease_until.is_some_and(|t| t < now)
     }
@@ -221,6 +235,9 @@ pub struct NewTask {
     pub depends_on: Vec<String>,
     pub status: TaskStatus,
     pub isolation: Option<Isolation>,
+    /// Per-agent model; `None` = the default from settings at run time.
+    pub claude_model: Option<String>,
+    pub codex_model: Option<String>,
     /// Files to attach; `create` copies them next to the task.
     pub attachments: Vec<PathBuf>,
     /// «Сначала план».
@@ -261,6 +278,8 @@ impl Board {
                 status: new.status,
                 cwd: new.cwd,
                 isolation: new.isolation,
+                claude_model: new.claude_model.filter(|m| !m.is_empty()),
+                codex_model: new.codex_model.filter(|m| !m.is_empty()),
                 labels: new.labels,
                 depends_on: new.depends_on,
                 attachments,
@@ -416,6 +435,19 @@ impl Board {
         };
         self.update(id, by, "isolation", text, |task, _| {
             task.meta.isolation = isolation;
+            Ok(())
+        })
+    }
+
+    /// Choose the model `provider` runs this task on (`None` = settings default).
+    pub fn set_model(&self, id: &str, by: &str, provider: Provider, model: Option<String>) -> Result<Task> {
+        let model = model.filter(|m| !m.is_empty());
+        let text = format!("{}: {}", provider.label(), model.as_deref().unwrap_or("по умолчанию"));
+        self.update(id, by, "model", &text, |task, _| {
+            match provider {
+                Provider::Claude => task.meta.claude_model = model,
+                Provider::Codex => task.meta.codex_model = model,
+            }
             Ok(())
         })
     }

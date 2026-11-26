@@ -730,6 +730,7 @@ fn render_detail(app: &AppView, task: &Task, p: &Palette, theme: &Theme, cx: &mu
                     this.child(v_flex().gap(px(6.)).child(label("Папка")).child(ui::mono(cwd.display().to_string(), theme).text_color(p.muted)))
                         .child(render_workplace(app, task, p, theme, cx))
                 })
+                .child(render_models(task, p, theme, cx))
                 .when(!task.meta.attachments.is_empty(), |this| {
                     this.child(
                         v_flex()
@@ -942,9 +943,32 @@ fn render_workplace(app: &AppView, task: &Task, p: &Palette, theme: &Theme, cx: 
         })
 }
 
+/// «Модель»: what Claude and Codex run on when they take the task next.
+fn render_models(task: &Task, p: &Palette, theme: &Theme, cx: &mut Context<AppView>) -> impl IntoElement {
+    let choice = |provider: Provider, cx: &mut Context<AppView>| {
+        let id = task.id.clone();
+        let fallback = crate::models::settings_default(provider, cx).or_else(|| crate::models::cli_default(provider));
+        let view = cx.entity().downgrade();
+        h_flex().gap(px(8.)).child(ui::provider_chip(provider, p, theme)).child(crate::models::picker(
+            SharedString::from(format!("detail-model-{}", provider.label())),
+            provider,
+            task.model(provider).map(str::to_owned),
+            fallback,
+            move |model, window, cx| {
+                view.update(cx, |this, cx| this.set_task_model(&id, provider, model, window, cx)).ok();
+            },
+        ))
+    };
+    v_flex()
+        .gap(px(6.))
+        .child(ui::eyebrow("Модель", p, theme))
+        .child(h_flex().gap(px(16.)).child(choice(Provider::Claude, cx)).child(choice(Provider::Codex, cx)))
+}
+
 fn event_label(kind: &str) -> &'static str {
     match kind {
         "isolation" => "выбрал, где работать",
+        "model" => "выбрал модель",
         "worktree" => "отдельная копия",
         "create" => "создал",
         "claim" => "взял в работу",
