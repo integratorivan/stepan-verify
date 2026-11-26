@@ -22,6 +22,7 @@ pub mod skills;
 pub mod arch;
 pub mod store;
 pub mod tasks;
+pub mod usage;
 pub mod worktree;
 
 pub use home::Home;

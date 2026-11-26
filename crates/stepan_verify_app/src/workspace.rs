@@ -23,6 +23,7 @@ pub fn init(home: &Home, cx: &mut App) {
         .inspect_err(|err| eprintln!("stepan_verify: state db: {err:#}"))
         .ok();
     if let Some(store) = &store {
+        stepan_verify_core::usage::init(store.clone());
         let store = store.clone();
         // Snapshots of sessions closed a month ago are dead weight.
         cx.background_spawn(async move { store.prune_snapshots(30) }).detach();

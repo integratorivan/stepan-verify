@@ -1,7 +1,9 @@
 //! Updates from GitHub Releases (the repository is public).
 //!
-//! The app asks `releases/latest` at start and every few hours. A newer
-//! version shows a card in the sidebar; «Обновить» downloads the zip for this
+//! The app asks `releases/latest` at start, every quarter of an hour and when
+//! its window comes back to the front. A newer version is announced once with a
+//! toast on whatever page is open (and in the macOS notification center when the
+//! app is in the background), and keeps a card in the sidebar; «Обновить» downloads the zip for this
 //! Mac's architecture, swaps the running `Stepan.app` for the new one and
 //! relaunches. A bare `cargo run` binary has no bundle to swap and opens the
 //! release page instead. Network and archive work go through `curl` and
@@ -10,7 +12,7 @@
 use std::{
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -19,8 +21,10 @@ use serde::Deserialize;
 
 pub const REPO: &str = "integratorivan/stepan-verify";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-/// How often a running app looks again.
-const RECHECK: Duration = Duration::from_secs(6 * 3600);
+/// How often a running app looks again: releases come several times a day.
+const RECHECK: Duration = Duration::from_secs(15 * 60);
+/// Back at the window after this long: look again at once.
+const STALE: Duration = Duration::from_secs(5 * 60);
 
 /// Zip name in a release for this Mac: `stepan-macos-arm64.zip` / `stepan-macos-x86_64.zip`.
 pub fn asset_name() -> String {
@@ -50,6 +54,9 @@ pub enum State {
 #[derive(Default)]
 pub struct Updates {
     pub state: State,
+    checked_at: Option<Instant>,
+    /// The version the toast already told you about.
+    announced: Option<semver::Version>,
     _loop: Option<Task<()>>,
 }
 
@@ -60,6 +67,10 @@ pub fn state(cx: &App) -> State {
 }
 
 fn set(state: State, cx: &mut App) {
+    // Debug hook: STEPAN_VERIFY_DEBUG_UPDATES=1 prints every state the updater goes through.
+    if std::env::var_os("STEPAN_VERIFY_DEBUG_UPDATES").is_some() {
+        eprintln!("stepan_verify: update: {state:?}");
+    }
     cx.update_global::<Updates, _>(|u, _| u.state = state);
     cx.refresh_windows();
 }
@@ -71,10 +82,8 @@ pub fn init(cx: &mut App) {
         // Let the window settle before going to the network.
         cx.background_executor().timer(Duration::from_secs(4)).await;
         loop {
-            let enabled = cx.update(|cx| crate::settings::config(cx).updates.check);
-            if enabled {
-                cx.update(check);
-            }
+            // The window coming to the front may have looked a moment ago.
+            cx.update(|cx| check_if_older(Duration::from_secs(60), cx));
             cx.background_executor().timer(RECHECK).await;
         }
     });
@@ -86,6 +95,7 @@ pub fn check(cx: &mut App) {
     if matches!(state(cx), State::Checking | State::Installing(_)) {
         return;
     }
+    cx.update_global::<Updates, _>(|u, _| u.checked_at = Some(Instant::now()));
     set(State::Checking, cx);
     cx.spawn(async move |cx| {
         let result = cx.background_spawn(async { latest() }).await;
@@ -104,6 +114,30 @@ pub fn check(cx: &mut App) {
         });
     })
     .detach();
+}
+
+/// The window is back in front: look again if the last look is old.
+pub fn check_if_stale(cx: &mut App) {
+    check_if_older(STALE, cx);
+}
+
+/// Look now unless the last look is younger than `age` (or checks are off).
+fn check_if_older(age: Duration, cx: &mut App) {
+    let stale = cx.try_global::<Updates>().is_some_and(|u| u.checked_at.is_none_or(|t| t.elapsed() > age));
+    if stale && crate::settings::config(cx).updates.check {
+        check(cx);
+    }
+}
+
+/// A newer release nobody has been told about yet; marks it told.
+pub fn take_announcement(cx: &mut App) -> Option<Release> {
+    let State::Available(release) = state(cx) else { return None };
+    let fresh = cx.try_global::<Updates>().is_some_and(|u| u.announced.as_ref() != Some(&release.version));
+    if !fresh {
+        return None;
+    }
+    cx.update_global::<Updates, _>(|u, _| u.announced = Some(release.version.clone()));
+    Some(release)
 }
 
 fn is_newer(v: &semver::Version) -> bool {
@@ -168,6 +202,7 @@ pub fn running_bundle() -> Option<PathBuf> {
 /// «Обновить»: swap the bundle and relaunch, or open the release page.
 pub fn install(cx: &mut App) {
     let State::Available(release) = state(cx) else { return };
+    stepan_verify_core::usage::hit("app.update");
     let (Some(bundle), Some(zip)) = (running_bundle(), release.zip.clone()) else {
         let _ = Command::new("open").arg(&release.page).spawn();
         return;

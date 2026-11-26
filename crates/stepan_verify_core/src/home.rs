@@ -19,7 +19,7 @@ use anyhow::Result;
 ///   automations/       proactive triggers (schedules, watchers)
 ///   worktrees/<project>/<task-id>/   a task's own git worktree (branch stepan/<task-id>)
 ///   state/             app-owned state (session links, event logs);
-///     stepan.db        open tabs, session index, last transcripts (see `store`)
+///     stepan.db        open tabs, session index, last transcripts, feature usage (see `store`, `usage`)
 /// ```
 #[derive(Clone, Debug)]
 pub struct Home {

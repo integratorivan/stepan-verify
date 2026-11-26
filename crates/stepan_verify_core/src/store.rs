@@ -1,7 +1,8 @@
 //! App-owned state in one SQLite file, `~/.stepan_verify/state/stepan.db`:
 //! what the window had open, an index of agent session files so the session
 //! list is there before any transcript is read, and the last transcript of
-//! each open session so a restored tab shows its conversation at once.
+//! each open session so a restored tab shows its conversation at once, and a
+//! journal of which features you and your agents used (`usage`).
 //!
 //! Only state the app owns lives here. What people and agents edit (tasks,
 //! docs, memory, config.toml) stays plain files.
@@ -20,7 +21,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use crate::{Home, Provider};
 
 /// Bump with a new arm in [`migrate`] when the schema changes.
-const SCHEMA: i64 = 1;
+const SCHEMA: i64 = 2;
 
 #[derive(Clone)]
 pub struct Store {
@@ -163,6 +164,29 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+
+    // ---------------------------------------------------------------- usage
+
+    /// One use of a feature: `at` in unix seconds, `actor` is "me" or "agent".
+    pub fn add_usage(&self, at: i64, feature: &str, actor: &str) -> Result<()> {
+        self.with(|c| c.execute("INSERT INTO usage(at, feature, actor) VALUES(?1, ?2, ?3)", params![at, feature, actor]))?;
+        Ok(())
+    }
+
+    /// Uses since `since` (unix seconds), oldest first: (at, feature, actor).
+    pub fn usage_since(&self, since: i64) -> Vec<(i64, String, String)> {
+        self.with(|c| {
+            let mut stmt = c.prepare("SELECT at, feature, actor FROM usage WHERE at >= ?1 ORDER BY at")?;
+            let rows = stmt.query_map([since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect()
+        })
+        .unwrap_or_default()
+    }
+
+    /// Drop uses older than `days`.
+    pub fn prune_usage(&self, days: i64) -> Result<usize> {
+        self.with(|c| c.execute("DELETE FROM usage WHERE at < ?1", [now() - days * 86_400]))
+    }
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
@@ -177,6 +201,13 @@ fn migrate(conn: &Connection) -> Result<()> {
                  path TEXT PRIMARY KEY, provider TEXT NOT NULL, mtime_ns INTEGER NOT NULL,
                  size INTEGER NOT NULL, offset INTEGER NOT NULL, id TEXT NOT NULL,
                  title TEXT, first_prompt TEXT, cwd TEXT);",
+        )?;
+    }
+    if version < 2 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS usage(
+                 at INTEGER NOT NULL, feature TEXT NOT NULL, actor TEXT NOT NULL);
+             CREATE INDEX IF NOT EXISTS usage_at ON usage(at);",
         )?;
     }
     if version < SCHEMA {

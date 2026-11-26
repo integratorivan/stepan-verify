@@ -39,6 +39,25 @@ pub enum Page {
     Session(usize),
     /// The plan of a plan-first task (`AppView::plan_view`).
     Plan,
+    /// «Чем пользуюсь».
+    Usage,
+}
+
+impl Page {
+    /// The page as a feature of `core::usage`; sessions and the plan count elsewhere.
+    fn usage_id(self) -> Option<&'static str> {
+        Some(match self {
+            Page::Dashboard => "page.dashboard",
+            Page::Tasks => "page.tasks",
+            Page::Flows => "page.flows",
+            Page::Docs => "page.docs",
+            Page::Memory => "page.memory",
+            Page::Skills => "page.skills",
+            Page::Settings => "page.settings",
+            Page::Usage => "page.usage",
+            Page::Session(_) | Page::Plan => return None,
+        })
+    }
 }
 
 /// Command-line launch options:
@@ -104,6 +123,7 @@ impl Launch {
                         Some("memory") => Some(Page::Memory),
                         Some("skills") => Some(Page::Skills),
                         Some("settings") => Some(Page::Settings),
+                        Some("usage") => Some(Page::Usage),
                         _ => Some(Page::Dashboard),
                     }
                 }
@@ -159,6 +179,7 @@ pub struct AppView {
     docs: Entity<DocsView>,
     flows: Entity<crate::flows::FlowsView>,
     skills_view: Entity<crate::skills::SkillsView>,
+    usage_view: Entity<crate::usage_page::UsageView>,
     memory_view: Entity<crate::memory::MemoryView>,
     /// Text and code font pickers on the settings page, made on first visit.
     pub(crate) font_pickers: Option<[Entity<crate::settings_page::FontPicker>; 2]>,
@@ -225,6 +246,7 @@ impl AppView {
         })
         .detach();
         let skills_view = cx.new(|cx| crate::skills::SkillsView::new(home.clone(), window, cx));
+        let usage_view = cx.new(|_| crate::usage_page::UsageView::new(home.clone()));
         let memory_view = cx.new(|cx| crate::memory::MemoryView::new(home.clone(), launch.project.as_deref().and_then(stepan_verify_core::memory::project_of), window, cx));
         cx.subscribe_in(&skills_view, window, |this, _, event: &crate::skills::SkillsEvent, window, cx| match event {
             crate::skills::SkillsEvent::OpenSession(summary) => this.open_session(summary, window, cx),
@@ -265,6 +287,7 @@ impl AppView {
             flows,
             font_pickers: None,
             skills_view,
+            usage_view,
             memory_view,
             open_sessions: Vec::new(),
             plan_view: None,
@@ -297,6 +320,19 @@ impl AppView {
                 }
             }
         });
+        // A new release is news on any page, not only in «Настройки».
+        cx.observe_global_in::<crate::update::Updates>(window, |_, window, cx| {
+            if let Some(release) = crate::update::take_announcement(cx) {
+                announce_update(&release, window, cx);
+            }
+        })
+        .detach();
+        cx.observe_window_activation(window, |_, window, cx| {
+            if window.is_window_active() {
+                crate::update::check_if_stale(cx);
+            }
+        })
+        .detach();
         this
     }
 
@@ -361,6 +397,7 @@ impl AppView {
 
     /// Show a session inside the app, reusing the tab if it is already open.
     pub fn open_session(&mut self, summary: &SessionSummary, window: &mut Window, cx: &mut Context<Self>) {
+        stepan_verify_core::usage::hit("sessions.open");
         let existing = self
             .open_sessions
             .iter()
@@ -376,6 +413,7 @@ impl AppView {
     }
 
     fn start_session(&mut self, start: &StartSession, window: &mut Window, cx: &mut Context<Self>) {
+        stepan_verify_core::usage::hit("sessions.new");
         let (provider, cwd, prompt, images) = (start.provider, start.cwd.clone(), start.prompt.clone(), start.images.clone());
         let view = cx.new(|cx| SessionView::start(provider, cwd, prompt, images, window, cx));
         let ix = self.adopt(view, window, cx);
@@ -454,6 +492,7 @@ impl AppView {
 
     /// Show a file in the panel on the right, reusing the panel if it is open.
     pub(crate) fn open_preview(&mut self, path: PathBuf, root: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        stepan_verify_core::usage::hit("sessions.preview");
         if let Some(preview) = &self.preview {
             preview.update(cx, |p, cx| p.open(path, root, window, cx));
         } else {
@@ -725,6 +764,7 @@ impl AppView {
 
     /// «Открыть план»: the task's plan map, drawn like «Изменения».
     pub fn open_plan(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        stepan_verify_core::usage::hit("tasks.plan_open");
         if self.plan_view.as_ref().is_some_and(|(t, _)| t == id) {
             return self.show(Page::Plan, cx);
         }
@@ -976,6 +1016,11 @@ impl AppView {
     }
 
     pub fn show(&mut self, page: Page, cx: &mut Context<Self>) {
+        if page != self.page {
+            if let Some(id) = page.usage_id() {
+                stepan_verify_core::usage::hit(id);
+            }
+        }
         self.page = page;
         if page != Page::Settings {
             crate::corner::silence(cx);
@@ -984,6 +1029,9 @@ impl AppView {
         self.docs.update(cx, |d, cx| d.set_visible(page == Page::Docs, cx));
         if page == Page::Skills {
             self.skills_view.update(cx, |v, cx| v.refresh_if_stale(cx));
+        }
+        if page == Page::Usage {
+            self.usage_view.update(cx, |v, cx| v.refresh(cx));
         }
         self.persist_workspace(cx);
         cx.notify();
@@ -1000,6 +1048,7 @@ impl AppView {
             Page::Memory => ("memory", None),
             Page::Skills => ("skills", None),
             Page::Settings => ("settings", None),
+            Page::Usage => ("usage", None),
             Page::Session(ix) => ("session", Some(ix)),
             Page::Plan => ("tasks", None),
         };
@@ -1079,6 +1128,7 @@ impl AppView {
             ("memory", _) => Page::Memory,
             ("skills", _) => Page::Skills,
             ("settings", _) => Page::Settings,
+            ("usage", _) => Page::Usage,
             _ => Page::Dashboard,
         };
         // An explicit `--page` / `--doc` wins over last time.
@@ -1369,6 +1419,7 @@ impl AppView {
                     .child(self.nav_item("Документы", IconName::FileText, Page::Docs, (docs > 0).then(|| (docs.to_string(), false)), cx))
                     .child(self.nav_item("Память", Icon::empty().path("icons/brain.svg"), Page::Memory, (memories > 0).then(|| (memories.to_string(), false)), cx))
                     .child(self.nav_item("Скиллы", IconName::BookOpen, Page::Skills, (skills > 0).then(|| (skills.to_string(), false)), cx))
+                    .child(self.nav_item("Чем пользуюсь", Icon::empty().path("icons/chart-column.svg"), Page::Usage, None, cx))
                     .child(self.nav_item("Настройки", IconName::Settings2, Page::Settings, None, cx)),
             )
             // Open sessions
@@ -1458,6 +1509,7 @@ impl Render for AppView {
             Page::Flows => self.flows.clone().into_any_element(),
             Page::Memory => self.memory_view.clone().into_any_element(),
             Page::Skills => self.skills_view.clone().into_any_element(),
+            Page::Usage => self.usage_view.clone().into_any_element(),
             Page::Settings => {
                 crate::settings_page::ensure_pickers(self, window, cx);
                 crate::settings_page::render(self, window, cx).into_any_element()
@@ -1495,6 +1547,27 @@ impl Render for AppView {
 
 fn dirs_home() -> PathBuf {
     std::env::var_os("HOME").map(Into::into).unwrap_or_default()
+}
+
+struct UpdateNote;
+
+/// Toast «Вышел Stepan …» with «Обновить»; also posted to the notification
+/// center, so it reaches you when Stepan is in the background.
+fn announce_update(release: &crate::update::Release, window: &mut Window, cx: &mut App) {
+    use gpui_kit::component::button::ButtonVariants as _;
+    let bundled = crate::update::running_bundle().is_some() && release.zip.is_some();
+    let note = Notification::info(format!("Вышел Stepan {} · у тебя {}", release.version, crate::update::VERSION))
+        .title("Доступно обновление")
+        .id::<UpdateNote>()
+        .in_app_and_system()
+        .action(move |_, _, _| {
+            gpui_kit::component::button::Button::new("update-now")
+                .primary()
+                .small()
+                .label(if bundled { "Обновить" } else { "Скачать" })
+                .on_click(|_, _, cx| crate::update::install(cx))
+        });
+    window.push_notification(note, cx);
 }
 
 /// «Доступна версия …» above the autopilot card, while there is one.
