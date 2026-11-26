@@ -1,7 +1,8 @@
-feature: Продолжить сессию из истории
+feature: Продолжение старой сессии Claude или Codex
 area: Сессии агентов
-summary: Открыть старую сессию Claude или Codex внутри приложения с историей и продолжить диалог
-aliases: [продолжить, открыть сессию, resume]
+summary: Пользователь открывает прошлую сессию внутри приложения с её историей и продолжает диалог
+aliases: [продолжить, открыть сессию, resume, продолжить сессию]
+entries: [crates/stepan_verify_agents/src/claude.rs, crates/stepan_verify_agents/src/codex.rs]
 
 paths:
   Из списка на дашборде:

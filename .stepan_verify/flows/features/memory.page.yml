@@ -1,0 +1,27 @@
+feature: Страница «Память»
+area: Память
+status: done
+summary: Пользователь видит, что агенты помнят о нём и о каждом проекте: поправки, запреты, предпочтения и факты, и может исправить или удалить запись
+aliases: [память, что агенты помнят, запреты агентов, журнал памяти]
+entries: [crates/stepan_verify_app/src/memory.rs, Page::Memory]
+starts_at: Левый сайдбар
+
+paths:
+  Смотреть и искать:
+    - Левый сайдбар: нажать «Память» -> открылась страница «Память»; рядом с пунктом число записей, если они есть  [Page::Memory, nav_item, crates/stepan_verify_app/src/app.rs]
+    - Страница «Память»: выбрать слева «Для всех проектов» или проект -> справа записи по группам «Не делай», «Делай так», «Фактура», у каждой группы счётчик; пусто — подсказка  [MemoryView, render_nav, render_entries, crates/stepan_verify_app/src/memory.rs]
+    - Страница «Память»: ввести слова в поле «Найти в памяти» -> остаются записи, где есть все слова, самые частые сверху  [Memory::search, crates/stepan_verify_core/src/memory.rs]
+    - Страница «Память»: агент записал строку из терминала или сессии -> запись появилась сама в течение примерно 1,5 с, без перезапуска  [MemoryView::new, log_stamp, reload, crates/stepan_verify_app/src/memory.rs]
+  Поправить или забыть:
+    - Страница «Память»: нажать значок карандаша «Поправить» у записи -> текст записи открылся в поле, над ним выбор типа «Не делай / Делай так / Фактура»  [MemoryView::start_edit, crates/stepan_verify_app/src/memory.rs]
+    - Поле правки: поменять текст или тип, нажать Enter или «Сохранить» -> запись обновилась, появилась пометка «поправлено»; «Отмена» закрывает без изменений  [MemoryView::save_edit, memory::edit, crates/stepan_verify_core/src/memory.rs]
+    - Страница «Память»: у записи проекта нажать значок глобуса «Сделать общим для всех проектов» -> запись переехала в «Для всех проектов»  [MemoryView::make_shared, memory::edit, crates/stepan_verify_core/src/memory.rs]
+    - Страница «Память»: нажать значок корзины «Забыть» -> запись исчезла из списка; в журнале остаётся строка «забыл» с текстом  [MemoryView::remove, memory::remove, crates/stepan_verify_core/src/memory.rs]
+  Добавить вручную или открыть журнал:
+    - Страница «Память»: нажать «Запомнить» в шапке -> открылась форма: поле «Одна мысль, повелительно», выбор типа и подпись «в проект …» или «для всех проектов» по выбранному слева; фокус в поле  [MemoryView::render_add, crates/stepan_verify_app/src/memory.rs]
+    - Форма «Запомнить»: ввести текст, нажать Enter или «Запомнить» -> запись сохранена с автором «ты»; пустой текст ничего не делает; дубль в той же области отклоняется, под полем показан текст ошибки  [MemoryView::save_draft, memory::add, crates/stepan_verify_core/src/memory.rs]
+    - Страница «Память»: выбрать слева «Журнал» -> строки последних 200 изменений, новые сверху: время, автор, «запомнил / поправил / забыл», текст, проект или причина; кнопки «Запомнить» здесь нет  [MemoryView::render_log, crates/stepan_verify_app/src/memory.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/memory.rs::search_needs_every_word  covers: 3
+  - test: crates/stepan_verify_core/src/memory.rs::log_folds_into_entries_and_snapshots  covers: 6, 7, 8, 10

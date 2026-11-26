@@ -1,0 +1,18 @@
+feature: Возврат к прежним вкладкам после перезапуска
+area: Приложение: настройки, обновления, запуск
+status: done
+summary: При следующем запуске окно открывается на тех же вкладках и странице, с последним ходом каждой сессии
+aliases: [восстановление вкладок, восстановить окно, вкладки после перезапуска, открыть как было]
+entries: [crates/stepan_verify_app/src/workspace.rs]
+starts_at: Запуск приложения
+
+steps:
+  - Любой экран: открыть или закрыть вкладку сессии, сменить страницу, открыть вкладку «Изменения» или документ на «Полке» -> состояние окна записывается в базу сразу  [AppView::show, AppView::persist_workspace, AppView::workspace, save, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/workspace.rs]
+  - Запуск приложения: открыть приложение -> вкладки сессий открываются заново в прежнем порядке, на той же странице; если сохранённая страница — сессия, которой уже нет, открывается «Дашборд»  [AppView::restore_workspace, load, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/workspace.rs]
+  - Экран сессии: восстановленная вкладка сразу показывает прошлую переписку (последние 400 записей), пока агент перечитывает файл сессии -> вкладка не пустая при запуске  [SessionView::show_snapshot, load_snapshot, save_snapshot, crates/stepan_verify_app/src/session.rs, crates/stepan_verify_app/src/workspace.rs]
+  - Вкладка «Изменения»: если перед закрытием была открыта вкладка «Изменения», она открывается снова -> отчёт строится заново, как только загрузилась переписка  [SessionView::open_changes, crates/stepan_verify_app/src/session.rs, crates/stepan_verify_app/src/app.rs]
+  - Полка: если на «Полке» был открыт документ, он открывается снова -> тот же документ на «Документ на полке»  [DocsView::open_on_load, crates/stepan_verify_app/src/docs.rs, crates/stepan_verify_app/src/app.rs]
+  - Запуск приложения: вкладка Claude-сессии, у которой не осталось файла переписки, пропускается без сообщения -> остальные вкладки открываются как обычно  [AppView::restore_workspace, claude_transcript, crates/stepan_verify_app/src/app.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/store.rs::kv_and_snapshots_round_trip  covers: 1, 3

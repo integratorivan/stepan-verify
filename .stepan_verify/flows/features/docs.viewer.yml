@@ -1,12 +1,22 @@
-feature: Просмотр документа (md и html)
+feature: Чтение документа
 area: Документы («Полка»)
-summary: Нативный рендер markdown и HTML с оглавлением, кнопки «Исходник» и «Открыть папку»
-aliases: [чтение документа, рендер markdown]
+status: done
+summary: Читаешь markdown и HTML с оглавлением, открываешь исходник или папку, а в шапке видно, сколько раз документ менялся
+aliases: [чтение документа, просмотр документа, рендер markdown, оглавление, исходник, открыть папку, документы полки]
+entries: [crates/stepan_verify_app/src/docs.rs]
+starts_at: Полка
 
-paths:
-  Открыть документ:
-    - Полка: Выбрать документ в списке (клавиши Enter / ↓) -> Документ отрисован, виден список разделов  [DocsView, Body, crates/stepan_verify_app/src/docs.rs]
-    - Просмотр документа: Нажать «Исходник» -> Файл открывается в панели превью справа  [PreviewView, crates/stepan_verify_app/src/docs.rs, crates/stepan_verify_app/src/preview.rs]
+steps:
+  - Полка: выбрать документ кликом или клавишами j / k (↓ / ↑) -> открывается «Документ на полке»: шапка с проектом, заголовком, автором, сессией, временем изменения и временем чтения  [DocsView::select, DocsView::render_reader, DocsView::render_doc_header, docs::mark_read, crates/stepan_verify_app/src/docs.rs, crates/stepan_verify_core/src/docs.rs]
+  - Документ на полке: смотреть строку под заголовком «изменён N раз · последняя правка …» -> число правок считается по сохранённым версиям без первой (версия «до изменений»); строка видна, только когда была хотя бы одна правка  [DocsView::render_doc_header, OpenDoc::versions, doc_versions::list, crates/stepan_verify_app/src/docs.rs, crates/stepan_verify_core/src/doc_versions.rs]
+  - Документ на полке (markdown): читать текст блоками по разделам; нажать пункт в «содержании» справа -> экран прокручивается к разделу, пункт оглавления подсвечивается по положению прокрутки  [DocsView::render_reader, DocsView::render_aside, docs::sections, docs::toc, docs::section_body, crates/stepan_verify_app/src/docs.rs, crates/stepan_verify_core/src/docs.rs]
+  - Документ на полке (HTML): документ открывается во встроенном веб-просмотре по file-адресу с его собственной версткой; если веб-просмотр не создался, показывается текстовая версия HTML -> документ виден целиком, оглавления у HTML нет  [DocsView::select, WebView::build, Body::HtmlFallback, DocsView::set_visible, crates/stepan_verify_app/src/docs.rs]
+  - Документ на полке (текст, PDF, картинка): текст показывается моноширинным блоком; PDF, картинка и прочие файлы открываются в панели «Просмотр документа» справа -> файл виден в панели превью  [DocKind, DocsEvent::OpenFile, AppView::open_preview, PreviewView::open, crates/stepan_verify_app/src/docs.rs, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/preview.rs]
+  - Документ на полке: нажать «Исходник» в шапке -> исходный файл (markdown или HTML) открывается в панели «Просмотр документа» справа  [DocsEvent::OpenFile, AppView::open_preview, PreviewView::open, crates/stepan_verify_app/src/docs.rs, crates/stepan_verify_app/src/preview.rs]
+  - Полка: нажать значок папки «Открыть папку» над списком документов -> в панели «Просмотр документа» справа открывается папка документов со списком файлов и подпапок  [DocsEvent::OpenFile, PreviewView::open, Entry, crates/stepan_verify_app/src/docs.rs, crates/stepan_verify_app/src/preview.rs]
 
 proofs:
-  - test: crates/stepan_verify_core/src/docs.rs  covers: 1  at: 2026-11-25T08:41:08Z  title: HTML meta, разделы и оглавление
+  - test: crates/stepan_verify_core/src/docs.rs::scan_state_roundtrip  covers: 1, 2
+  - test: crates/stepan_verify_core/src/doc_versions.rs::captures_changes_only  covers: 2
+  - test: crates/stepan_verify_core/src/docs.rs::sections_and_toc  covers: 3
+  - test: crates/stepan_verify_core/src/docs.rs::html_meta_tags  covers: 4

@@ -1,0 +1,14 @@
+feature: Клип в углу настроек
+area: Приложение: настройки, обновления, запуск
+status: done
+summary: В углу настроек крутится пользовательский клип, который тихо играет музыку, пока на него наведена мышь
+aliases: [музыка в настройках, клип в настройках, музыка при наведении, клип]
+entries: [crates/stepan_verify_app/src/corner.rs]
+starts_at: Настройки
+
+steps:
+  - Настройки: открыть страницу -> в правом нижнем углу появляется круглый клип 200 px; пока он декодируется, видна тёмная подложка  [render, crates/stepan_verify_app/src/corner.rs, crates/stepan_verify_app/src/settings_page.rs]
+  - Настройки: навести мышь на клип -> клип тихо играет песню, курсор становится указателем → музыка слышна, пока курсор над клипом  [play, Player, crates/stepan_verify_app/src/corner.rs]
+  - Настройки: увести мышь с клипа -> песня останавливается, процесс afplay убивается и дожидается → тишина, клип продолжает крутиться  [play, stop_child, crates/stepan_verify_app/src/corner.rs]
+  - Любой экран: перейти с «Настройки» на другую страницу -> если песня ещё играла, она гаснет  [AppView::show, silence, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/corner.rs]
+  - Любой экран: завершить приложение (⌘Q или «Завершить Stepan») -> песня гаснет вместе с приложением, afplay не переживает его  [init, silence, crates/stepan_verify_app/src/corner.rs, crates/stepan_verify_app/src/zoom.rs]

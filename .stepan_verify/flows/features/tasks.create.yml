@@ -1,12 +1,18 @@
 feature: Создание задачи
 area: Задачи (доска)
-summary: Диалог «Новая задача» — название, описание, вложения, проект, метки и куда положить (К работе / Входящие)
-aliases: [новая задача, добавить задачу]
+status: done
+summary: Заводишь задачу в диалоге «Новая задача»: название, описание, картинки и файлы, проект, где работать, порядок работы, метки и куда положить — «К работе» или «Входящие»
+aliases: [новая задача, создать задачу, добавить задачу, новая карточка]
+entries: [crates/stepan_verify_app/src/new_task.rs, crates/stepan_verify_app/src/board.rs]
+starts_at: Доска задач
 
 paths:
-  Через диалог:
-    - Доска задач: Нажать «Новая задача» -> Открывается диалог с полями «Задача», «Описание», «Вложения», «Проект», «Метки», «Куда»  [NewTaskDialog, crates/stepan_verify_app/src/new_task.rs, crates/stepan_verify_app/src/board.rs]
-    - Диалог «Новая задача»: Заполнить, выбрать «К работе — агенты могут брать» или «Во входящие — разберу сам», нажать «Создать» -> Карточка появляется в выбранной колонке, вложения копируются рядом с задачей  [Board::create, copy_attachments, crates/stepan_verify_core/src/tasks.rs, crates/stepan_verify_app/src/new_task.rs]
+  Создать задачу в диалоге:
+    - Доска задач: нажать «Новая задача» -> открывается диалог «Новая задача» с фокусом в поле «Задача»  [AppView::open_new_task_dialog, NewTaskForm::new, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/new_task.rs]
+    - Диалог «Новая задача»: написать название и, если нужно, описание -> кнопка «Создать» становится активной, как только есть название и не идёт снимок экрана или прикрепление файла  [NewTaskForm::can_create, crates/stepan_verify_app/src/new_task.rs]
+    - Диалог «Новая задача»: нажать «Прикрепить» или «Снимок экрана», вставить картинку через Cmd+V в описании или перетащить файлы в окно -> файлы появляются в поле «Вложения»  [attach::attach_button, attach::screenshot_button, Attachments, crates/stepan_verify_app/src/attach.rs, crates/stepan_verify_app/src/new_task.rs]
+    - Диалог «Новая задача»: выбрать проект, «Где работать» (Авто, Отдельная копия, Здесь), «Порядок работы» («Сразу делать» или «Сначала план»), вписать метки через запятую или пробел -> под каждым переключателем меняется подсказка  [ProjectPicker, NewTaskForm::isolation, NewTaskForm::plan, crates/stepan_verify_app/src/project_picker.rs, crates/stepan_verify_app/src/new_task.rs]
+    - Диалог «Новая задача»: выбрать «К работе — агенты могут брать» или «Во входящие — разберу сам», нажать «Создать» (или Enter в названии) -> диалог закрывается, задача появляется в колонке и сразу открывается её панель  [NewTaskForm::confirm, AppView::create_task, Board::create, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_core/src/tasks.rs]
 
 proofs:
-  - test: crates/stepan_verify_core/src/tasks.rs  covers: 2  at: 2026-11-25T08:41:08Z  title: Вложения копируются рядом с задачей
+  - test: crates/stepan_verify_core/src/tasks.rs::attachments_are_copied_next_to_the_task  covers: 3, 5

@@ -1,0 +1,25 @@
+feature: Комментарии к документу агенту
+area: Документы («Полка»)
+status: done
+summary: Комментируешь блок или выделенный текст документа, отправляешь комментарии открытой сессии агента, и он отвечает в треде
+aliases: [комментарии к документу, комментарий к блоку, тред, ревью документа, замечания агенту, Отправить агенту]
+entries: [crates/stepan_verify_app/src/docs.rs, crates/stepan_verify_core/src/doc_comments.rs]
+starts_at: Документ на полке
+
+steps:
+  - Документ на полке: навести на блок текста и нажать «Комментарий к этому блоку» в левом поле -> открывается форма комментария, привязанная к этому блоку, фокус в поле ввода  [DocsView::render_block, DocsView::start_compose, Compose::Block, crates/stepan_verify_app/src/docs.rs]
+  - Документ на полке: выделить фрагмент и нажать «Комментарий» в шапке или клавишу c -> форма с цитатой выделения; без выделения комментарий ко всему документу (у HTML-документа всегда ко всему документу)  [DocsView::comment_selection, doc_comments::locate, Compose::Doc, crates/stepan_verify_app/src/docs.rs, crates/stepan_verify_core/src/doc_comments.rs]
+  - Документ на полке: выбрать тип (замечание, одобряю, убрать это; для нового комментария, не для ответа), написать текст и нажать «Добавить» или Enter -> тред появляется под блоком или в блоке «комментарии к документу», форма закрывается; Shift+Enter — новая строка, Esc — отмена  [DocsView::submit_comment, DocsView::render_composer, doc_comments::add, NewComment::on_block, crates/stepan_verify_app/src/docs.rs, crates/stepan_verify_core/src/doc_comments.rs]
+  - Документ на полке: в треде нажать «Ответить», «Закрыть», «Открыть снова» или значок корзины -> ответ добавляется в тот же тред; закрытый тред сворачивается в одну строку; удаление убирает тред вместе с ответами  [DocsView::set_resolved, DocsView::delete_comment, DocsView::render_thread, doc_comments::reply, doc_comments::set_resolved, doc_comments::delete, crates/stepan_verify_app/src/docs.rs, crates/stepan_verify_core/src/doc_comments.rs]
+  - Документ на полке: в плашке «N замечаний не отправлены — в сессию «…»» нажать «Отправить агенту» (или «Отправить и закрыть», тогда агент получит их уже закрытыми) -> если у документа есть своя сессия, она открывается и получает текст; если открытых сессий проекта нет, запускается новая; иначе появляется меню выбора  [DocsView::render_send_bar, DocsView::send_or_ask, DocsView::send_target, DocsView::send_comments, crates/stepan_verify_app/src/docs.rs]
+  - Экран сессии: агент получает сообщение «Комментарии к документу …» с цитатами, id тредов и командой ответа; отправленные реплики помечаются «↗ отправлен агенту» -> сессия показывает текст как обычное сообщение пользователя  [DocsEvent::SendToSession, DocsEvent::SendToSummary, SessionView::send_text, doc_comments::message, doc_comments::to_xml, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/session.rs, crates/stepan_verify_core/src/doc_comments.rs]
+  - Экран сессии: агент выполняет `stepan_verify doc comments <файл>`, затем отвечает `stepan_verify doc reply <файл> <id> "текст"` и при необходимости закрывает тред через `doc resolve` -> ответ записывается в лог комментариев документа под своим именем (claude или codex)  [doc_comments::run, doc_comments::reply, doc_comments::set_resolved, crates/stepan_verify_app/src/main.rs, crates/stepan_verify_core/src/doc_comments.rs]
+  - Документ на полке: в течение около полутора секунд ответ агента появляется в треде под блоком; перечитывание идёт по отпечатку папки документов и папки комментариев -> тред показывает реплику агента с его именем и временем  [DocsView::_watch, DocsView::reload_comments, render_message, docs::fingerprint, crates/stepan_verify_app/src/docs.rs, crates/stepan_verify_core/src/docs.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/doc_comments.rs::splits_blocks  covers: 1
+  - test: crates/stepan_verify_core/src/doc_comments.rs::anchors_and_reanchors  covers: 1, 2
+  - test: crates/stepan_verify_core/src/doc_comments.rs::store_roundtrip  covers: 3, 4, 5, 8
+  - test: crates/stepan_verify_core/src/doc_comments.rs::xml_for_agents  covers: 6
+  - test: crates/stepan_verify_core/src/doc_comments.rs::cli_roundtrip  covers: 7, 8
+  - test: crates/stepan_verify_core/src/docs.rs::brief_lists_project_knowledge  covers: 7

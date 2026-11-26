@@ -4,3 +4,7 @@ target/
 .omc/
 crates/.omc/
 dist/
+
+# Agent worktrees and an unfinished flow-map build
+.claude/worktrees/
+.stepan_verify/flows.parts/

@@ -1,0 +1,25 @@
+feature: Встроенные скиллы для Claude и Codex
+area: Скиллы («Связи»)
+status: done
+summary: В любой сессии Claude и Codex есть /show-me (визуальный разбор открывается в превью) и /describe-pr (описание PR и CI до зелёного)
+aliases: [show-me, describe-pr, /show-me, /describe-pr, визуализация, описание PR, встроенные скиллы]
+entries: [crates/stepan_verify_app/src/main.rs, crates/stepan_verify_core/src/describepr.rs, crates/stepan_verify_core/src/showme.rs]
+starts_at: Поле ввода сессии
+
+paths:
+  Установка при запуске:
+    - Любой экран: запустить Stepan -> в ~/.claude/skills и ~/.agents/skills появились ссылки на show-me и describe-pr, их копия лежит в ~/.stepan_verify/skills; чужие папки с тем же именем не трогаются  [crates/stepan_verify_app/src/main.rs, crates/stepan_verify_core/src/flowsync.rs]
+  Визуализация /show-me:
+    - Поле ввода сессии: набрать /show-me и тему разбора, отправить -> агент пишет /tmp/show-me/show-me-*.html и отдаёт файл вложением в ленту (Codex то же через команды и правки)  [crates/stepan_verify_core/src/show_me_skill.md, crates/stepan_verify_agents/src/claude.rs, crates/stepan_verify_agents/src/codex.rs]
+    - Лента сессии: HTML-вложение, когда его инструмент завершился, открывается в превью, если смотришь эту сессию -> показан визуальный разбор  [crates/stepan_verify_app/src/session.rs, crates/stepan_verify_app/src/app.rs]
+    - Любой экран (окно не на этой сессии): появилось уведомление «Готова визуализация /show-me» -> превью не меняется, файл ждёт чипом в ленте сессии  [crates/stepan_verify_app/src/app.rs]
+  Описание PR /describe-pr:
+    - Поле ввода сессии: набрать /describe-pr на ветке -> агент находит PR, а если его нет, коммитит, пушит и создаёт через gh pr create  [crates/stepan_verify_core/src/describe_pr_skill.md, crates/stepan_verify_core/src/describepr.rs]
+    - Лента сессии: агент пишет тело PR (зачем, на что смотреть, схема изменений) и применяет его через gh pr edit -> в PR новое описание, в ленте короткий отчёт и ожидание CI  [crates/stepan_verify_core/src/describe_pr_skill.md]
+    - Лента сессии: агент следит за CI через gh pr checks и чинит то, что сломал сам -> при зелёном CI приходит финальное сообщение со ссылкой; при конфликтах или третьей неудачной правке он останавливается и спрашивает  [crates/stepan_verify_core/src/describe_pr_skill.md]
+
+proofs:
+  - test: crates/stepan_verify_core/src/flowsync.rs::skill_links_installed_and_removed_safely  covers: 1
+  - test: crates/stepan_verify_core/src/showme.rs::installs_next_to_a_foreign_show_me_without_touching_it  covers: 1
+  - test: crates/stepan_verify_agents/src/claude.rs::show_me_files_become_attachments  covers: 2
+  - test: crates/stepan_verify_core/src/describepr.rs::skill_is_explicit_only_and_keeps_the_ci_loop  covers: 5, 6, 7

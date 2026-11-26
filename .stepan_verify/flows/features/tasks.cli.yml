@@ -1,13 +1,26 @@
-feature: CLI доски `stepan_verify task …`
+feature: Управление задачами из терминала
 area: Задачи (доска)
-summary: Агенты и скрипты управляют задачами из терминала — list, create, claim, complete, block, status и др.
-aliases: [task cli, консоль задач, stepan_verify task]
+status: done
+summary: Агент или скрипт берёт, создаёт, сдаёт и блокирует задачи командой stepan_verify task — и доска показывает это сразу
+aliases: [stepan_verify task, cli задач, команда task, консольная доска]
+entries: [crates/stepan_verify_core/src/cli.rs, crates/stepan_verify_app/src/main.rs]
+starts_at: Терминал
 
 paths:
-  Цикл агента:
-    - Терминал агента: Выполнить stepan_verify task claim --ready -> Агент получает задачу с арендой  [cli::run, Board::claim, crates/stepan_verify_core/src/cli.rs, crates/stepan_verify_app/src/main.rs]
-    - Терминал агента: Выполнить stepan_verify task complete <summary> -> Задача уходит на ревью человеку  [cli::run, Board::complete, crates/stepan_verify_core/src/cli.rs]
+  Агент берёт задачу, пишет в журнал и сдаёт на ревью:
+    - Терминал агента: `stepan_verify task claim --ready --by claude` -> берётся первая готовая задача (зависимости сделаны, не занята), статус «В работе», аренда на час; печатается «взял: claude» с id  [cli::run, Board::claim_ready, Board::claim, crates/stepan_verify_core/src/cli.rs, crates/stepan_verify_core/src/tasks.rs]
+    - Терминал агента: `stepan_verify task log «текст»` -> запись в журнал задачи, видна в панели «Журнал»  [Board::log, crates/stepan_verify_core/src/tasks.rs]
+    - Терминал агента: `stepan_verify task renew` -> аренда продлевается на час, пока агент работает  [Board::renew, crates/stepan_verify_core/src/tasks.rs]
+    - Терминал агента: `stepan_verify task complete «итог»` -> статус «Ревью», аренда снята, итог на карточке, задача в колонке «Ждёт тебя»  [Board::complete, crates/stepan_verify_core/src/tasks.rs]
+  Агент просит ответа или отдаёт задачу обратно:
+    - Терминал агента: `stepan_verify task block «вопрос»` -> статус «Нужен ответ», вопрос на карточке в «Ждёт тебя», аренда снята  [Board::block, crates/stepan_verify_core/src/tasks.rs]
+    - Терминал агента: `stepan_verify task release` -> задача возвращается в «К работе», аренда снята  [Board::release, crates/stepan_verify_core/src/tasks.rs]
+  Скрипт читает, создаёт и двигает задачи:
+    - Терминал: `stepan_verify task list [--ready] [--status S] [--json]` -> строки задач или JSON с id, статусом, метками, копией и вложениями  [Board::tasks, cli::run, crates/stepan_verify_core/src/cli.rs]
+    - Терминал: `stepan_verify task create «Заголовок» [--body --cwd --label --depends --attach --inbox --isolation --plan]` -> задача в «К работе» (или во «Входящие» с --inbox), сразу видна на доске  [Board::create, NewTask, crates/stepan_verify_core/src/cli.rs, crates/stepan_verify_core/src/tasks.rs]
+    - Терминал: `stepan_verify task show ID` -> текстом: описание, вложения и журнал задачи  [cli::run, Board::events, crates/stepan_verify_core/src/cli.rs]
+    - Терминал: `stepan_verify task status ID done` -> статус меняется вручную, как «Принять» на доске  [Board::set_status, crates/stepan_verify_core/src/cli.rs]
+    - Терминал: `stepan_verify task …` без открытия окна -> команда отдаётся до запуска интерфейса, ошибки печатаются в stderr с кодом 1  [main, cli::run, crates/stepan_verify_app/src/main.rs]
 
 proofs:
-  - test: crates/stepan_verify_core/src/cli.rs  at: 2026-11-25T08:41:08Z  title: Прогон CLI целиком
-  - cli: ./target/debug/stepan_verify task list  covers: 1  at: 2026-11-25T08:41:08Z  title: Справка по командам
+  - test: crates/stepan_verify_core/src/cli.rs::cli_roundtrip  covers: 1, 2, 4, 7, 8

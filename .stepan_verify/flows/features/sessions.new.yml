@@ -1,7 +1,8 @@
-feature: Новая сессия
+feature: Запуск новой сессии Claude или Codex
 area: Сессии агентов
-summary: Запуск Claude Code или Codex на проекте с первой задачей, вложениями и скриншотом
-aliases: [запустить агента, новый агент, новая сессия Claude]
+summary: Пользователь выбирает проект, агента и пишет первую задачу, добавляя вложения или скриншот
+aliases: [запустить агента, новый агент, новая сессия Claude, новая сессия]
+entries: [crates/stepan_verify_app/src/new_session.rs, crates/stepan_verify_app/src/project_picker.rs, crates/stepan_verify_agents/src/claude.rs, crates/stepan_verify_agents/src/codex.rs]
 
 paths:
   Через диалог «Новая сессия»:

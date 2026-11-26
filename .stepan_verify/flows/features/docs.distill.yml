@@ -1,7 +1,8 @@
-feature: Итоги сессии в документы
+feature: Итоги сессии в документах проекта
 area: Документы («Полка»)
-summary: Когда сессия затихла, агент той же семьи записывает решения, факты проекта и вопросы в ~/.stepan_verify/docs
-aliases: [дистиллятор, итоги сессии, post-session distiller]
+summary: Когда сессия затихла, агент записывает решения, факты проекта и открытые вопросы в документы проекта
+aliases: [дистиллятор, итоги сессии, post-session distiller, дистилляция]
+entries: [crates/stepan_verify_app/src/distill.rs, crates/stepan_verify_core/src/docs.rs]
 
 paths:
   Автоматически после сессии:

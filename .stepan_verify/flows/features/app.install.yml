@@ -1,11 +1,12 @@
-feature: Установка и релиз
+feature: Установка приложения
 area: Приложение: настройки, обновления, запуск
-summary: Скачать .dmg с GitHub Releases, первый запуск через «Открыть»; релиз собирает GitHub Actions по тегу
-aliases: [установка, dmg, релиз]
+summary: Пользователь скачивает .dmg с GitHub Releases и открывает приложение через «Открыть» при первом запуске
+aliases: [установка, dmg, релиз, первый запуск]
+entries: [.github/workflows/release.yml]
 
 paths:
   Установить приложение:
-    - Страница релизов GitHub: Скачать .dmg и перетащить Stepan в «Программы» -> Приложение запускается (правый клик → Открыть при первом запуске)  [release.yml, bundle.sh, .github/workflows/release.yml, scripts/bundle.sh, README.md]
+    - Страница релизов GitHub: Скачать .dmg и перетащить Stepan в «Программы» -> Приложение запускается (правый клик → Открыть при первом запуске)  [bundle.sh, release.yml, .github/workflows/release.yml, scripts/bundle.sh, README.md]
 
 proofs:
   - manual: scripts/bundle.sh  at: 2026-11-25T08:41:08Z  title: Локальная сборка dist/Stepan.app

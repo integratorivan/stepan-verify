@@ -1,0 +1,28 @@
+feature: Пересборка и дополнение карты сессии
+area: Изменения («Карта»)
+status: done
+summary: Карту строишь сам при первом открытии, «Пересобрать» делает полный новый прогон, «Дополнить» — только по новым ходам, «Следить» делает это после каждого хода, а «Отменить» останавливает ревьюера
+aliases: [пересобрать, дополнить, батч, следить, обновить карту, отменить, итерации, прогон, собрать карту]
+entries: [crates/stepan_verify_app/src/changes/mod.rs, crates/stepan_verify_app/src/changes/runs.rs]
+starts_at: Вкладка «Изменения»
+
+paths:
+  Первая сборка:
+    - Экран сессии: открыть вкладку «Изменения» в первый раз -> Прогонов ещё нет, поэтому карта строится сама: полный прогон; вместо холста «Ревьюер собирает карту сессии» со шагами, таймером и кнопкой «Отменить»  [ChangesView::new, start, render_running, crates/stepan_verify_app/src/changes/mod.rs, crates/stepan_verify_app/src/session.rs]
+    - Вкладка «Изменения»: прогон упал или отменён -> Вместо карты видно текст ошибки и кнопка «Собрать карту», которая запускает полный прогон  [render_failed, render_header, crates/stepan_verify_app/src/changes/mod.rs]
+  Пересобрать и выбрать модель:
+    - Вкладка «Изменения»: нажать «Пересобрать» -> Запускается полный прогон по всей сессии; выбранная итерация сбрасывается, и вместо карты показывается сборка; кнопка неактивна, пока что-то собирается  [start, launch, RunKind::Full, disabled, crates/stepan_verify_app/src/changes/mod.rs, crates/stepan_verify_app/src/changes/runs.rs]
+    - Вкладка «Изменения»: открыть выпадающий список модели в шапке -> Выбор меняет модель следующего прогона; та же настройка, что в «Настройки» → «Отчёт „Изменения“». Для Claude: haiku ~40 с, sonnet 1–3 мин, opus 3–6 мин  [model_picker, settings::update, changes.model, crates/stepan_verify_app/src/changes/mod.rs, crates/stepan_verify_app/src/settings.rs]
+  Дополнить и Следить:
+    - Вкладка «Изменения»: нажать «Дополнить» (видна, когда есть новые правки) -> Запускается батч: ревьюер дополняет последнюю карту по новым ходам; в «Итерациях» появляется «батч · +N правок»  [Дополнить, launch, RunKind::Batch, write_batch_context, crates/stepan_verify_app/src/changes/mod.rs, crates/stepan_verify_app/src/changes/runs.rs]
+    - Вкладка «Изменения»: включить «Следить за сессией» -> Флаг сохраняется для сессии; если есть новое, батч стартует сразу; подпись «после каждого хода»; пока сборка идёт, следующий батч ставится в очередь  [toggle_follow, runs::set_follow, pending, crates/stepan_verify_app/src/changes/mod.rs, crates/stepan_verify_app/src/changes/runs.rs]
+    - Экран сессии: закончился ход агента -> Если «Следить» включено и есть новое, карта дополняется батчем; если нет, ничего не запускается, и кнопка «Дополнить» появляется, как только в сессии есть новые правки  [changes_progressed, session_progressed, crates/stepan_verify_app/src/session.rs, crates/stepan_verify_app/src/changes/mod.rs]
+  Итерации и остановка:
+    - Вкладка «Изменения»: блок «Итерации» -> Чипы «#N · полный / батч · +N правок · время»; значки «ошибка», «утверждён», «N реш.»; у идущего прогона спиннер; клик выбирает прогон  [render_iterations, crates/stepan_verify_app/src/changes/mod.rs]
+    - Вкладка «Изменения»: нажать «Отменить» в блоке сборки -> Ревьюер прерывается, очередь следующего батча сбрасывается, прогон записывается как «ошибка · Отменено»; карта переключается на этот прогон и показывает кнопку «Собрать карту» (предыдущая карта остаётся в списке итераций)  [cancel, finish, reload, pending, crates/stepan_verify_app/src/changes/mod.rs]
+    - Вкладка «Изменения»: пока батч собирается, а карта уже есть -> Карта остаётся на экране; сверху баннер «Батч #N собирается · модель · последний шаг»  [render_report, crates/stepan_verify_app/src/changes/mod.rs]
+  Папка прогонов:
+    - Вкладка «Изменения»: нажать значок папки в шапке -> Открывается папка отчётов этой сессии: прогоны в runs/, файл флага «Следить», reviewed.json  [changes-folder, open_in_app, out_dir, crates/stepan_verify_app/src/changes/mod.rs, crates/stepan_verify_app/src/changes/runs.rs]
+
+proofs:
+  - test: crates/stepan_verify_app/src/changes/runs.rs::flat_report_moves_into_run_one  covers: 3, 8

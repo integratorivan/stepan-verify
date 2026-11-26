@@ -1,0 +1,19 @@
+feature: Масштаб и меню приложения
+area: Приложение: настройки, обновления, запуск
+status: done
+summary: Пользователь увеличивает, уменьшает или сбрасывает масштаб, скрывает и завершает приложение через меню или ⌘
+aliases: [масштаб, увеличить, уменьшить, zoom, cmd+=, cmd+q, меню Stepan]
+entries: [crates/stepan_verify_app/src/zoom.rs]
+starts_at: Любой экран
+
+paths:
+  Изменить масштаб:
+    - Любой экран: нажать ⌘= (или ⌘+, ⌘⇧=) или выбрать меню «Вид» → «Увеличить» -> масштаб переходит на следующую ступень, открытые окна перерисовываются сразу  [step, set, apply, ZoomIn, crates/stepan_verify_app/src/zoom.rs]
+    - Любой экран: нажать ⌘− или «Вид» → «Уменьшить» -> масштаб переходит на предыдущую ступень; ниже 80 % не опускается  [step, set, apply, ZoomOut, crates/stepan_verify_app/src/zoom.rs]
+    - Любой экран: нажать ⌘0 или «Вид» → «Реальный размер» -> масштаб возвращается к 100 %  [ZoomReset, set, crates/stepan_verify_app/src/zoom.rs]
+    - Любой экран: закрыть приложение и открыть снова -> масштаб тот же, что был выбран  [init, apply, settings::update, crates/stepan_verify_app/src/zoom.rs, crates/stepan_verify_app/src/settings.rs]
+  Скрыть и завершить:
+    - Любой экран: меню «Stepan» → «Скрыть Stepan» или ⌘H -> окно скрывается, приложение остаётся запущенным  [Hide, crates/stepan_verify_app/src/zoom.rs]
+    - Любой экран: меню «Stepan» → «Скрыть остальные» или ⌘⌥H -> скрываются все другие приложения  [HideOthers, crates/stepan_verify_app/src/zoom.rs]
+    - Любой экран: меню «Stepan» → «Службы» -> открывается системное подменю служб macOS  [SystemMenuType::Services, crates/stepan_verify_app/src/zoom.rs]
+    - Любой экран: меню «Stepan» → «Завершить Stepan» или ⌘Q -> приложение закрывается, песня клипа в настройках гаснет  [Quit, crates/stepan_verify_app/src/zoom.rs, crates/stepan_verify_app/src/corner.rs]

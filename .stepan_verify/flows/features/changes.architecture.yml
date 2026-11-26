@@ -1,0 +1,26 @@
+feature: Вкладка «Как устроено»
+area: Изменения («Карта»)
+status: done
+summary: Во вкладке «Как устроено» видно, как теперь работает сделанное — деревья вызовов и компонентов, псевдокод, код «было → стало»; схемы модулей, контракты данных и пары «до / после» лежат рядом с картой
+aliases: [как устроено, show-me, виды, архитектура, граф модулей, контракты, до после, схема структуры]
+entries: [crates/stepan_verify_app/src/changes/mod.rs]
+starts_at: Вкладка «Изменения»
+
+paths:
+  Как устроено:
+    - Вкладка «Изменения»: переключить «Карта | Как устроено» на «Как устроено» -> Холст сменяется карточками видов; у вкладки счётчик = число видов  [Lens::Views, render_lens_tabs, crates/stepan_verify_app/src/changes/mod.rs]
+    - Как устроено: посмотреть карточку вида -> Дерево вызовов, дерево компонентов, дерево файлов, псевдокод или код; в diff-видах строки «+» и «−» окрашены; длинный вид занимает всю строку  [render_views, sketch, render_hunk, crates/stepan_verify_app/src/changes/mod.rs]
+    - Как устроено: нажать «Открыть» у HTML-объяснения -> Открывается explainer.html во встроенном просмотре; если файла нет, кнопка неактивна с надписью «Файла нет»  [render_views, preview::open_in_app, crates/stepan_verify_app/src/changes/mod.rs]
+    - Как устроено: нажать чип узла под видом -> Открывается Панель узла этого узла  [node_chip, Panel::Node, crates/stepan_verify_app/src/changes/mod.rs]
+    - Как устроено, сессия без видов: открыть вкладку -> «В этой итерации видов нет» и подсказка нажать «Пересобрать» или «Дополнить»  [render_views, crates/stepan_verify_app/src/changes/mod.rs]
+  Схемы под вкладками:
+    - Вкладка «Изменения»: прокрутить ниже итогов до блока «Схема» -> Схема потока и схема структуры модулей до / после показываются картинками; клик открывает картинку в приложении; без картинки виден сырой текст Mermaid  [render_diagram, render_report, Report.flow, Report.structure, crates/stepan_verify_app/src/changes/mod.rs]
+    - Вкладка «Изменения»: прокрутить до блока «Интерфейс» -> Пары «Было» / «Стало» по каждому изменению интерфейса со снимками; если снимка нет — «нет снимка»  [render_ui_pair, Report.ui, crates/stepan_verify_app/src/changes/mod.rs]
+  Контракты данных:
+    - Карта: прокрутить под холст до полосы «ДАННЫЕ · ЧТО ПЕРЕДАЁТСЯ» -> Карточки данных между узлами (пропсы, аргументы, payload, события); в режиме «Разница» изменённые данные подсвечены по статусу  [render_dto_lane, crates/stepan_verify_app/src/changes/mod.rs]
+    - Карта: нажать карточку данных -> Панель данных: поля по режиму, кто использует данные и что едет по связям  [Panel::Dto, render_dto_panel, crates/stepan_verify_app/src/changes/mod.rs]
+
+proofs:
+  - test: crates/stepan_verify_app/src/changes/mod.rs::show_me_views_parse  covers: 2, 3
+  - test: crates/stepan_verify_app/src/changes/mod.rs::report_tolerates_old_and_new_shapes  covers: 5
+  - test: crates/stepan_verify_app/src/changes/mod.rs::dark_theme_picks_dark_diagram_when_rendered  covers: 6

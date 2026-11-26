@@ -1,0 +1,26 @@
+feature: Отдельная копия проекта на задачу
+area: Задачи (доска)
+status: done
+summary: Каждая задача может работать в своей git-копии проекта и ветке stepan/<задача>, чтобы два агента не правили одни файлы, а принятую копию можно удалить с проверкой
+aliases: [копия задачи, worktree, отдельная копия, своя ветка, где работать]
+entries: [crates/stepan_verify_core/src/worktree.rs]
+starts_at: Карточка задачи
+
+paths:
+  Выбрать, где работать:
+    - Диалог «Новая задача» или Карточка задачи: в «Где работать» выбрать «Авто», «Отдельная копия» или «Здесь» -> выбор записывается в задачу; «Авто» решается в момент запуска  [NewTaskForm::isolation, AppView::set_task_isolation, Board::set_isolation, render_workplace, crates/stepan_verify_app/src/new_task.rs, crates/stepan_verify_app/src/board.rs, crates/stepan_verify_core/src/tasks.rs]
+    - Карточка задачи (статус «К работе»): нажать «Claude» или «Codex» -> при «Авто» worktree::resolve выбирает копию, если папка проекта — git-репозиторий и её уже ведёт другая задача в работе или взятая, или в ней живёт сессия; иначе агент работает прямо в папке проекта  [AppView::run_task, worktree::resolve, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_core/src/worktree.rs]
+  Копия готовится и становится рабочей папкой агента:
+    - Карточка задачи («В работе», строка «Готовлю отдельную копию…»): ждать фоновой подготовки -> создаётся ветка stepan/<задача> от исходной ветки, копируются файлы по шаблонам (по умолчанию .env, .env.*, .claude/settings.local.json), крупные папки (node_modules) клонируются, копия лежит в ~/.stepan_verify/worktrees/<проект>/<задача>  [AppView::prepare_worktree, worktree::create, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_core/src/worktree.rs]
+    - Карточка задачи: копия готова -> задача записывает путь и ветку, сессия стартует внутри копии (в том же подпути, что и проект), в журнале «отдельная копия» и строка «копия» на карточке; если setup-команда проекта упала — предупреждение и строка в журнале, но сессия всё равно стартует  [AppView::worktree_ready, Board::set_worktree, worktree::session_cwd, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_core/src/worktree.rs]
+    - Карточка задачи («Нужен ответ»): копию не удалось сделать (нет git-репозитория, папка копии занята чужой задачей) -> задача уходит в «Ждёт тебя» с вопросом, агент в папку проекта не идёт; «Здесь» в «Где работать» и «Вернуть» — повторить  [AppView::worktree_ready, Board::block, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_core/src/worktree.rs]
+  Удалить копию после принятия:
+    - Карточка задачи (статус «Ревью», у задачи есть копия): нажать «Принять» -> задача уходит в «Готово», затем окно «Удалить копию?» с тем, что потеряется: без правок и с влитой или пустой веткой — «Удалить копию» (ветка тоже); с коммитами, не влитыми в основную ветку — копия уходит, ветка остаётся; с несохранёнными правками — «Удалить с правками» или «Оставить»  [AppView::set_task_status, AppView::offer_worktree_cleanup, worktree::cleanup_state, AppView::ask_cleanup, AppView::remove_worktree, worktree::remove, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_core/src/worktree.rs]
+    - Карточка задачи: в «Где работать» нажать «Удалить копию» -> то же окно, но без строки «Задача принята»; если копии уже нет на диске — путь на карточке очищается, появляется уведомление «Копии уже нет на диске»  [render_workplace, AppView::offer_worktree_cleanup, crates/stepan_verify_app/src/board.rs, crates/stepan_verify_app/src/app.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/worktree.rs::auto_isolation  covers: 2
+  - test: crates/stepan_verify_core/src/worktree.rs::create_copies_ignored_files_and_adopts_on_rerun  covers: 3
+  - test: crates/stepan_verify_core/src/worktree.rs::setup_failure_is_reported_not_fatal  covers: 4
+  - test: crates/stepan_verify_core/src/worktree.rs::cleanup_states  covers: 6, 7
+  - test: crates/stepan_verify_core/src/worktree.rs::unmerged_branch_is_kept_on_remove  covers: 6

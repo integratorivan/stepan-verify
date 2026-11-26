@@ -1,12 +1,14 @@
 feature: Доска задач
 area: Задачи (доска)
-summary: Колонки «Входящие», «К работе», «В работе», «Ждёт тебя», «Готово» с фильтром по проектам
-aliases: [доска, канбан, задачи, борд]
+status: done
+summary: Видишь все задачи по колонкам «Входящие», «К работе», «В работе», «Ждёт тебя» и «Готово» и сужаешь их до одного проекта
+aliases: [доска, канбан, задачи, борд, колонки задач]
+entries: [crates/stepan_verify_app/src/board.rs, Page::Tasks]
+starts_at: Левый сайдбар
 
 paths:
-  Открыть доску:
-    - Левый сайдбар: Нажать «Задачи» -> Открывается доска с колонками и счётчиком задач  [Page::Tasks, board::render, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/board.rs]
-    - Доска задач: Выбрать чип проекта («Все проекты» или конкретный) -> Видны задачи только этого проекта  [filter_chip, crates/stepan_verify_app/src/board.rs]
-
-proofs:
-  - test: crates/stepan_verify_core/src/tasks.rs  at: 2026-11-25T08:41:08Z  title: Чтение и запись задач (frontmatter)
+  Открыть доску и отфильтровать по проекту:
+    - Левый сайдбар: нажать «Задачи» (справа от пункта — число задач) -> открывается «Доска задач»: заголовок, счётчики «ждут тебя» и «в работе», пять колонок  [Page::Tasks, nav_item, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/board.rs]
+    - Доска задач: выбрать чип проекта («Все проекты» или имя проекта с числом задач) -> видны только задачи этого проекта, счётчики в шапке и в колонках пересчитаны  [filter_chip, board::render, crates/stepan_verify_app/src/board.rs]
+  Разложить задачи по колонкам:
+    - Доска задач: посмотреть колонки -> в «Входящие» статусы «Входящие», в «К работе» — «К работе», в «В работе» — «В работе», в «Ждёт тебя» — «Нужен ответ» и «Ревью», в «Готово» — принятые (последние 12); внутри колонки свежие сверху, пустая колонка пишет «Пусто»  [COLUMNS, render_column, TaskStatus, crates/stepan_verify_app/src/board.rs, crates/stepan_verify_core/src/tasks.rs]

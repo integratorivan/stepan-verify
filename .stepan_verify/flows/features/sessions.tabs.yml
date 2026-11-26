@@ -1,9 +1,15 @@
-feature: Открытые сессии в сайдбаре и закрытие
+feature: Вкладки открытых сессий
 area: Сессии агентов
-summary: Открытые сессии живут в сайдбаре как вкладки; переключение между ними, закрытие останавливает процесс агента
-aliases: [вкладки сессий, сайдбар сессий]
+status: done
+summary: Открытые сессии лежат в сайдбаре как вкладки: переключаешься кликом, закрываешь крестиком — и агент останавливается
+aliases: [вкладки сессий, открытые сессии, сайдбар сессий]
+entries: [crates/stepan_verify_app/src/session.rs, crates/stepan_verify_app/src/app.rs]
+starts_at: Левый сайдбар
 
 paths:
-  Переключиться и закрыть:
-    - Левый сайдбар: Нажать на открытую сессию -> Показывается экран этой сессии  [Page::Session, AppView::show, crates/stepan_verify_app/src/app.rs]
-    - Экран сессии: Нажать «Закрыть сессию» -> Процесс агента останавливается, открывается дашборд  [AppView::close_session, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/session.rs]
+  Переключение:
+    - Левый сайдбар: кликнуть строку сессии в блоке «Открытые сессии» -> открылся Экран сессии этой вкладки, строка подсвечена как активная  [AppView::session_item, AppView::show, crates/stepan_verify_app/src/app.rs]
+  Закрытие:
+    - Левый сайдбар: навести на строку сессии и нажать крестик «Закрыть сессию» (появляется при наведении) -> вкладка пропадает из «Открытые сессии», процесс агента останавливается; если закрыта текущая сессия, открывается Дашборд  [AppView::close_session, AgentHandle::drop, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_agents/src/lib.rs]
+  Возврат после перезапуска:
+    - Любой экран: открыть или закрыть сессию -> список вкладок и открытая страница сохраняются в хранилище → после запуска приложения вкладки открываются заново, с прошлым transcript, пока агент его перечитывает  [AppView::persist_workspace, AppView::restore_workspace, crates/stepan_verify_app/src/workspace.rs]

@@ -1,0 +1,19 @@
+feature: История версий документа
+area: Документы («Полка»)
+status: in_progress
+summary: Видишь, что документ менялся и как выглядит последняя правка по сравнению с предыдущей версией
+aliases: [версии документа, история правок, разница, diff, последняя правка, изменён N раз]
+entries: [crates/stepan_verify_core/src/doc_versions.rs, crates/stepan_verify_app/src/docs.rs]
+starts_at: Документ на полке
+
+steps:
+  - Фон (любой экран): агент переписал файл документа -> при следующем сканировании папки (раз в 1.5 с, пока приложение открыто) сохраняется новая версия, если её текст отличается от последней; первая увиденная версия тоже сохраняется, хранятся последние 30  [docs::scan, doc_versions::capture, doc_versions::capture_at, doc_versions::KEEP, DocsView::rescan, DocsView::_watch, crates/stepan_verify_core/src/docs.rs, crates/stepan_verify_core/src/doc_versions.rs, crates/stepan_verify_app/src/docs.rs]
+  - Документ на полке: в шапке появляется «изменён N раз · последняя правка …» -> при изменении текста открытого документа версии перечитываются, счётчик и дата обновляются  [DocsView::refresh_open, doc_versions::list, OpenDoc::versions, crates/stepan_verify_app/src/docs.rs, crates/stepan_verify_core/src/doc_versions.rs]
+  - Документ на полке: нажать «изменён N раз …» -> под шапкой раскрывается «Последняя правка · дата» с числом добавленных и удалённых строк (+N / −N) и построчной разницей с предыдущей версией  [DocsView::toggle_diff, OpenDoc::compute_diff, DocsView::render_diff, crates/stepan_verify_app/src/docs.rs]
+  - Документ на полке: в разнице строки без изменений сворачиваются в «⋯ N строк без изменений», показывается до 600 строк -> видно только то, что изменилось, и контекст из трёх строк вокруг правки  [doc_versions::line_diff, DocsView::render_diff, crates/stepan_verify_core/src/doc_versions.rs, crates/stepan_verify_app/src/docs.rs]
+  - Документ на полке: нажать «×» в панели разницы или ссылку «изменён N раз» ещё раз -> разница скрывается; при выборе другого документа разница закрывается  [DocsView::toggle_diff, DocsView::select, crates/stepan_verify_app/src/docs.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/docs.rs::scan_state_roundtrip  covers: 1
+  - test: crates/stepan_verify_core/src/doc_versions.rs::captures_changes_only  covers: 1, 2
+  - test: crates/stepan_verify_core/src/doc_versions.rs::diff_lines  covers: 4

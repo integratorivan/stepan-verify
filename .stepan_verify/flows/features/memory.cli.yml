@@ -1,0 +1,23 @@
+feature: Память из терминала
+area: Память
+status: done
+summary: Агенты и скрипты читают и пишут память командой stepan_verify memory
+aliases: [stepan_verify memory, память cli, память из консоли]
+entries: [crates/stepan_verify_core/src/memory.rs, crates/stepan_verify_app/src/main.rs]
+starts_at: Терминал
+
+paths:
+  Записать, найти, поправить:
+    - Терминал: выполнить stepan_verify memory add «текст» с --kind dont, rule или fact (или русскими синонимами) и --global или --project P -> вывод «запомнил: id тип текст (проект)»; без явной области запись идёт в проект из $STEPAN_VERIFY_PROJECT или из корня git текущей папки; дубль в той же области отклоняется ошибкой  [memory::run, memory::add, crates/stepan_verify_core/src/memory.rs, crates/stepan_verify_app/src/main.rs]
+    - Терминал: выполнить stepan_verify memory search слова или memory list, с --all, --global или --json -> строки «id тип текст (проект)»; search ищет по тексту, цитате и причине, все слова должны совпасть; --json отдаёт массив с автором, сессией и датами  [memory::run, Memory::search, Memory::applying, crates/stepan_verify_core/src/memory.rs]
+    - Терминал: выполнить stepan_verify memory edit id «новый текст» или memory rm id --reason «почему» -> вывод «поправил: …» или «забыл: …»; у несуществующего id ошибка «нет записи» и код выхода 1  [memory::edit, memory::remove, crates/stepan_verify_core/src/memory.rs, crates/stepan_verify_app/src/main.rs]
+    - Терминал: выполнить stepan_verify memory log N -> последние N изменений (по умолчанию 20): дата, автор, операция в JSON  [memory::run, crates/stepan_verify_core/src/memory.rs]
+  Читать на старте сессии:
+    - Терминал: выполнить stepan_verify memory brief --project P -> текст, который агент получает на старте: шапка «Память Stepan», разделы «Для всех проектов» и «Проект P» по группам «Не делай / Делай так / Фактура»; длинные списки обрезаются по лимиту, остаток — подсказкой поиска  [Memory::brief, push_capped, crates/stepan_verify_core/src/memory.rs]
+    - Экран сессии: сессия Claude или Codex стартует -> в стартовый текст входит тот же блок памяти, что выдаёт brief, плюс документы полки  [agent_brief, crates/stepan_verify_core/src/docs.rs, crates/stepan_verify_app/src/session.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/memory.rs::log_folds_into_entries_and_snapshots  covers: 1, 3
+  - test: crates/stepan_verify_core/src/memory.rs::edit_scope_roundtrips_through_json  covers: 3
+  - test: crates/stepan_verify_core/src/memory.rs::search_needs_every_word  covers: 2
+  - test: crates/stepan_verify_core/src/memory.rs::brief_groups_by_kind_and_caps  covers: 5

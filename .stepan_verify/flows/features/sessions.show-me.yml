@@ -1,0 +1,23 @@
+feature: Визуальные объяснения от /show-me
+area: Сессии агентов
+status: done
+summary: Пишешь /show-me — агент делает HTML, PNG или SVG-объяснение, и оно открывается в панели предпросмотра рядом с сессией
+aliases: [show-me, визуализация, визуальное объяснение, /show-me]
+entries: [crates/stepan_verify_core/src/showme.rs, crates/stepan_verify_app/src/preview.rs]
+starts_at: Поле ввода сессии
+
+paths:
+  Открыта сессия на экране:
+    - Поле ввода сессии: написать «/show-me» и тему, отправить -> агент начинает ход по инструкции скилла show-me  [install_skill, crates/stepan_verify_core/src/showme.rs, crates/stepan_verify_core/src/flowsync.rs, crates/stepan_verify_app/src/main.rs]
+    - Лента сессии: агент завершил инструмент, который записал show-me-*.html -> HTML сам открывается в панели предпросмотра справа; повторно тот же файл не открывается  [SessionView::reveal_show_me, AppView::adopt, crates/stepan_verify_app/src/session.rs, crates/stepan_verify_app/src/app.rs]
+    - Экран сессии: панель предпросмотра справа показывает HTML веб-виджетом; при перезаписи файла панель перечитывает его по таймеру  [PreviewView::load_web, PreviewView::reload_if_changed, crates/stepan_verify_app/src/preview.rs]
+  Сессия не на экране:
+    - Любой экран (окно не на этой сессии): агент готов с визуализацией -> всплывает уведомление «Готова визуализация /show-me — открой её в ленте сессии», панель не открывается  [AppView::adopt, crates/stepan_verify_app/src/app.rs]
+    - Лента сессии: открыть эту сессию, нажать на файл show-me-*.html в ленте -> файл открывается в панели предпросмотра  [render_attachments, open_path, SessionEvent::OpenFile, crates/stepan_verify_app/src/session.rs]
+  Картинка:
+    - Лента сессии: агент сделал show-me-*.png или .svg -> в ленте появляется миниатюра; клик открывает файл в панели предпросмотра  [show_me_attachments, is_show_me, PreviewView::new, crates/stepan_verify_agents/src/model.rs, crates/stepan_verify_app/src/preview.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/showme.rs::installs_next_to_a_foreign_show_me_without_touching_it  covers: 1
+  - test: crates/stepan_verify_agents/src/claude.rs::show_me_files_become_attachments  covers: 2, 6
+  - test: crates/stepan_verify_app/src/preview.rs::kinds_by_extension  covers: 3, 6

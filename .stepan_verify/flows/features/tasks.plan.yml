@@ -1,0 +1,30 @@
+feature: Задача «Сначала план»
+area: Задачи (доска)
+status: done
+summary: Агент сначала рисует план картой, ты возвращаешь замечания или утверждаешь, и только потом начинается реализация
+aliases: [сначала план, план задачи, утвердить план, карта плана, план-first]
+entries: [crates/stepan_verify_app/src/changes/plan.rs, crates/stepan_verify_core/src/plans.rs, Page::Plan]
+starts_at: Диалог «Новая задача»
+
+paths:
+  Нарисовать план и утвердить:
+    - Диалог «Новая задача»: в «Порядок работы» выбрать «Сначала план» -> задача создаётся с этапом «план» и попадает в «К работе»  [NewTaskForm::plan, Board::create, crates/stepan_verify_app/src/new_task.rs, crates/stepan_verify_core/src/tasks.rs]
+    - Карточка задачи: в блоке «Порядок работы» выбрать «Сначала план» -> для уже созданной задачи, подсказка меняется на «Агент сначала нарисует карту того, к чему приведёт код»  [render_workflow, AppView::set_task_plan, Board::set_plan, crates/stepan_verify_app/src/board.rs, crates/stepan_verify_core/src/tasks.rs]
+    - Карточка задачи: нажать «Claude» или «Codex» -> агент берёт задачу с инструкцией «СНАЧАЛА ПЛАН»: читает код, ничего не меняет, пишет карту в папку плана и запускает `stepan_verify task plan-ready`; задача уходит в «Ждёт тебя» со статусом «План ждёт решения»  [AppView::run_task, SessionView::start_task, changes::plan::plan_brief, plans::draft, cli plan-ready, plans::publish, Board::plan_ready, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/session.rs, crates/stepan_verify_app/src/changes/plan.rs, crates/stepan_verify_core/src/plans.rs]
+    - Карточка задачи (статус «План ждёт решения»): нажать «План» -> открывается «Карта плана» — та же карта, что у изменений сессии, но про то, что будет  [AppView::open_plan, ChangesView::plan, Page::Plan, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/changes/mod.rs]
+    - Карта плана: посмотреть узлы «что появится / изменится / уберётся», этапы по порядку с результатом и проверкой, вопросы агента с его рекомендацией  [render_plan_report, render_stages, render_questions, crates/stepan_verify_app/src/changes/plan.rs]
+    - Карта плана: нажать «Утвердить план» внизу -> задача уходит в «К работе» с этапом «по плану», тут же стартует агент и делает этапы по порядку  [ChangesEvent::ApprovePlan, AppView::approve_plan, Board::approve_plan, changes::plan::implement_brief, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/changes/plan.rs, crates/stepan_verify_core/src/tasks.rs]
+    - Карта (реализация задачи): в шапке «План: выполнено N из M · вне плана K» -> узлы плана сверены с картой изменений по id, имени и файлу  [render_coverage, coverage, crates/stepan_verify_app/src/changes/plan.rs]
+  Вернуть замечания к плану:
+    - Карта плана: нажать «Замечания к плану» -> открывается «Панель «Вернуть»», текст уходит сессии агента, которая писала план (если закрыта — возобновляется)  [Panel::Return, AppView::send_plan_remarks, ChangesEvent::Return, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/changes/plan.rs]
+    - Карточка задачи: агент переписывает план новой итерацией -> появляется итерация «#N», задача снова в «Ждёт тебя» со статусом «План ждёт решения»  [plans::publish, changes::plan::remarks_header, Board::plan_ready, crates/stepan_verify_core/src/plans.rs, crates/stepan_verify_core/src/cli.rs]
+  Утвердить из карточки:
+    - Карточка задачи (статус «План ждёт решения»): нажать «Утвердить» на карточке или «Утвердить план» внизу панели -> утверждается последняя итерация, задача уходит на реализацию как в шаге с «Утвердить план» на карте  [AppView::approve_plan, render_card, render_detail, crates/stepan_verify_app/src/board.rs, crates/stepan_verify_app/src/app.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/tasks.rs::plan_first_workflow_and_journal  covers: 1, 2, 3, 6, 9
+  - test: crates/stepan_verify_core/src/cli.rs::plan_ready_publishes_the_draft  covers: 3
+  - test: crates/stepan_verify_app/src/changes/plan.rs::prompts_point_at_the_plan  covers: 3
+  - test: crates/stepan_verify_app/src/changes/plan.rs::plan_report_parses_stages_and_questions  covers: 5
+  - test: crates/stepan_verify_app/src/changes/plan.rs::plan_vs_fact_matches_by_id_or_name_and_file  covers: 7
+  - test: crates/stepan_verify_core/src/plans.rs::publish_numbers_iterations_and_checks_the_draft  covers: 9

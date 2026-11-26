@@ -1,0 +1,23 @@
+feature: Синхронизация карты флоу с кодом
+area: Флоу (карта пользовательских путей)
+status: done
+summary: Видишь, что карта отстала от кода и какие её места устарели; сверяешь её кнопкой или включаешь авто-сверку
+aliases: [синхронизация флоу, сверка с кодом, карта отстала]
+entries: [crates/stepan_verify_core/src/flowsync.rs, .stepan_verify/flows/.sync.yml]
+starts_at: Флоу
+
+paths:
+  Ручная синхронизация:
+    - Левый сайдбар: увидеть у пункта «Флоу» бейдж -> число коммитов, на которое карта отстала, или «!», если есть только незакоммиченные правки  [lag_badge, crates/stepan_verify_app/src/app.rs]
+    - Флоу: открыть экран -> над картой жёлтая плашка «Карта отстала на N коммитов» и число изменённых файлов карты, первые три имени  [FlowsView::check_lag, flowsync::lag, flowsync::relevant_lag, crates/stepan_verify_app/src/flows.rs, crates/stepan_verify_core/src/flowsync.rs]
+    - Флоу: нажать «Синхронизировать» -> агенты пересказывают только затронутые фичи, опись берётся из git без агента; карта сохраняется с новым synced_commit, плашка пропадает  [FlowsView::sync, FlowsView::sync_ready, FlowMap::touched, deleted_routes, flowsync::head, FlowMap::save, crates/stepan_verify_app/src/flows.rs, crates/stepan_verify_core/src/flows.rs]
+  Автосинхронизация:
+    - Настройки: включить «Синхронизация карты флоу» -> по умолчанию выключено; при выключенной опции остаются только плашка и кнопка  [flows_auto, config.flows.auto_sync, crates/stepan_verify_app/src/settings_page.rs, crates/stepan_verify_core/src/config.rs]
+    - Флоу: список изменённых файлов карты не менялся 2 минуты -> карта синхронизируется сама, без кнопки  [FlowsView::check_lag, lag_seen, FlowsView::sync, crates/stepan_verify_app/src/flows.rs]
+  Устаревшие доказательства:
+    - Флоу: у фичи бейдж «устарело», если все её доказательства старше последней правки файла её шага -> видно, что проверка уже не про этот код  [FlowMap::freshness, freshness_tone, Freshness, crates/stepan_verify_core/src/flows.rs, crates/stepan_verify_app/src/flows.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/flowsync.rs::changed_files_that_matter  covers: 2
+  - test: crates/stepan_verify_core/src/flowsync.rs::git_diff_since_synced_commit  covers: 2, 3
+  - test: crates/stepan_verify_core/src/flows.rs::freshness_and_round_trip  covers: 6

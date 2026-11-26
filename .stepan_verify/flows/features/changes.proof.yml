@@ -1,0 +1,20 @@
+feature: «Что доказывает» для узла карты
+area: Изменения («Карта»)
+status: in_progress
+summary: Выбираешь узел или фичу на карте — видишь, какие тесты его проверяют, чем доказано, что он работает, и что осталось без теста
+aliases: [что доказывает, тесты узла, доказательства на карте, проверяют тесты]
+entries: [crates/stepan_verify_app/src/changes/mod.rs, Вкладка «Изменения»]
+starts_at: Карта
+
+paths:
+  Выбранный узел:
+    - Карта: кликнуть карточку узла -> открылась Панель узла, связи узла подсвечены, пунктирные линии от тестов яркие, остальные приглушены  [render_map, render_panel, crates/stepan_verify_app/src/changes/mod.rs]
+    - Карта: посмотреть карточку узла без теста -> на ней бейдж «без тестов» (изменение ничем не проверено)  [Graph::untested, crates/stepan_verify_app/src/changes/map.rs]
+    - Панель узла: блок «связи» → «вызывают» -> среди вызывающих видны карточки тестов, которые проверяют узел; клик по карточке открывает Панель узла этого теста с путём к файлу  [render_node_panel, node_chip, crates/stepan_verify_app/src/changes/mod.rs]
+  Фича целиком:
+    - Карта: кликнуть заголовок рамки фичи -> открылась панель фичи, связи её узлов подсвечены  [render_map, Panel::Group, crates/stepan_verify_app/src/changes/mod.rs]
+    - Карта: в панели фичи блок «Что доказывает» -> бейдж уровня (сказано / указана строка / запущено / воспроизведено), ссылка на доказательство, связанные проверки и число кадров «Было → стало»; если доказательств нет — красная плашка «Нечем доказать»  [render_group_panel, group_rank, evidence_badge, crates/stepan_verify_app/src/changes/mod.rs]
+    - Карта: в панели фичи блоки «Проверяют тесты» и «Без тестов» -> список карточек тестов (клик открывает их панель), жёлтый блок с узлами, которых не проверяет ни один тест  [render_group_panel, Graph::tests_of, Graph::untested, crates/stepan_verify_app/src/changes/mod.rs]
+
+proofs:
+  - test: crates/stepan_verify_app/src/changes/map.rs::tests::features_group_nodes_and_tests_verify  covers: 1, 2, 6

@@ -1,10 +1,28 @@
-feature: Вкладка «Изменения» — отчёт по сессии
+feature: Отчёт «Изменения» по сессии
 area: Изменения («Карта»)
-summary: Субагент читает сессию и собирает флоу-схему, что добавлено/изменено/удалено, было→стало, риски и что проверить
-aliases: [изменения, отчёт, ревью сессии, вкладка изменений]
+status: done
+summary: Ревьюер читает сессию и диффы и собирает отчёт — что добавлено, изменено и удалено, решения агента, риски, которые можно проверить запуском другим агентом, и файлы
+aliases: [отчёт, ревью, сводка изменений, итог, риски, решения агента, файлы, report, что проверить]
+entries: [crates/stepan_verify_app/src/changes/runs.rs, crates/stepan_verify_app/src/changes/mod.rs]
+starts_at: Вкладка «Изменения»
 
 paths:
-  Собрать отчёт:
-    - Экран сессии: Открыть вкладку «Изменения» и нажать «Собрать карту» -> Запускается сабагент-ревьюер, идёт прогресс «Читает сессию…»  [ChangesView, changes::runs, ChangesInput, crates/stepan_verify_app/src/changes/mod.rs, crates/stepan_verify_app/src/changes/runs.rs, crates/stepan_verify_app/src/session.rs]
-    - Вкладка «Изменения»: Нажать «Отменить» -> Сборка прекращается  [ChangesView::cancel, crates/stepan_verify_app/src/changes/mod.rs]
-    - Вкладка «Изменения»: Нажать «Дополнить» или «Пересобрать» -> Отчёт обновляется по новым ходам сессии (батч-обновление)  [ChangesView, changes::runs, crates/stepan_verify_app/src/changes/mod.rs, crates/stepan_verify_app/src/changes/runs.rs]
+  Что в отчёте:
+    - Вкладка «Изменения»: прочитать итог под вкладками «Карта | Как устроено» -> Краткое описание того, что сделала сессия, в markdown; заголовок отчёта — в шапке экрана  [render_report, TextView::markdown, Report.summary, crates/stepan_verify_app/src/changes/mod.rs]
+    - Вкладка «Изменения»: строка показателей внизу отчёта -> Файлов, строк «+» и «−», функций по статусам (+ добавлено, ~ изменено, − удалено) и число рисков  [metrics, line_stats, crates/stepan_verify_app/src/changes/mod.rs]
+    - Вкладка «Изменения»: блок «Решения агента» -> Главные решения агента с номером и пометкой «полный» или «батч», с ссылками на узлы; в полном прогоне и батче показываются решения с начала сессии до выбранной итерации включительно  [render_decisions, Report.decisions, crates/stepan_verify_app/src/changes/mod.rs]
+  Файлы и риски:
+    - Вкладка «Изменения»: блок «Файлы» -> Список файлов сессии с метками NEW (файл новый) или MOD (изменён), числом «+» и «−» строк и чипами узлов из файла; клик по имени файла открывает его в приложении  [render_files, file_hunks, open_in_app, crates/stepan_verify_app/src/changes/mod.rs]
+    - Вкладка «Изменения»: блок «Риски на карте» -> Карточки рисков по важности с описанием, «Как поправить» и узлом; риск, который опровергла проверка, уходит в «Отброшено» с пояснением «Запуск показал, что проблемы нет»  [render_risks, severity_badge, crates/stepan_verify_app/src/changes/mod.rs]
+    - Риск: нажать «Проверить · Codex» (или «Claude», если сессия Codex) -> Агент другого семейства пробует подтвердить или опровергнуть риск запуском; результат — «подтверждён запуском», «не удалось доказать» или «проверка не прошла», с командой и первыми строками вывода; кнопка меняется на «Ещё раз»  [verify_risk, other_family, on_verify_event, finish_verify, crates/stepan_verify_app/src/changes/mod.rs]
+    - Риск: нажать «Проверить все» или «Остановить» -> «Проверить все» ставит непроверенные риски в очередь, по одному; «Остановить» прерывает проверку и очищает очередь  [render_risks, verify-all, cancel_verify, crates/stepan_verify_app/src/changes/mod.rs]
+  Как собирается:
+    - Экран сессии: запустить сборку -> Ревьюер получает папку: context.md (что просили, последний ответ, файлы, команды, скриншоты), session.patch, git.patch от базы сессии, flows.yaml; пишет report.json по схеме  [write_full_context, prompt_full, crates/stepan_verify_app/src/changes/mod.rs, crates/stepan_verify_app/src/changes/runs.rs]
+    - Вкладка «Изменения»: пока сборка идёт -> Шаги ревьюера переводятся в короткие русские фразы (например, запуск скрипта диаграммы — «Рисую диаграмму»); последний шаг со спиннером  [humanize_step, on_event, render_running, crates/stepan_verify_app/src/changes/mod.rs]
+    - Вкладка «Изменения»: ревьюер закончил -> Если report.json не записан, прогон помечен ошибкой «Ревьюер закончил, но не записал report.json»; если записан, отчёт становится картой и видны все блоки выше  [finish, runs::load_run, crates/stepan_verify_app/src/changes/mod.rs, crates/stepan_verify_app/src/changes/runs.rs]
+
+proofs:
+  - test: crates/stepan_verify_app/src/changes/mod.rs::report_tolerates_old_and_new_shapes  covers: 5
+  - test: crates/stepan_verify_app/src/changes/mod.rs::evidence_flows_and_verify_parse  covers: 6
+  - test: crates/stepan_verify_app/src/changes/mod.rs::steps_are_humanized  covers: 9
+  - test: crates/stepan_verify_app/src/changes/runs.rs::flat_report_moves_into_run_one  covers: 10

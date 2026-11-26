@@ -1,0 +1,17 @@
+feature: Проверка и форматирование карты флоу из терминала
+area: Флоу (карта пользовательских путей)
+status: done
+summary: Запускаешь stepan_verify flows check или fmt и получаешь ошибки карты с файлом и строкой или карту в каноническом виде
+aliases: [flows check, flows fmt]
+entries: [crates/stepan_verify_app/src/main.rs, crates/stepan_verify_core/src/flowdsl.rs]
+
+paths:
+  Проверить карту:
+    - Терминал: запустить stepan_verify flows check -> ошибки и предупреждения с файлом и строкой; код выхода 1, если есть ошибки  [flowdsl::cli, flowdsl::check, flowdsl::compile, crates/stepan_verify_app/src/main.rs, crates/stepan_verify_core/src/flowdsl.rs]
+    - Терминал: запустить check в папке без карты -> сообщение «нет карты флоу», с подсказкой построить её на экране «Флоу»  [flowdsl::check, crates/stepan_verify_core/src/flowdsl.rs]
+  Переписать в каноническом виде:
+    - Терминал: запустить stepan_verify flows fmt -> файлы карты переписаны в каноническом виде; если есть ошибки, ничего не трогает и просит сначала их исправить  [flowdsl::fmt, flowdsl::write, crates/stepan_verify_core/src/flowdsl.rs]
+
+proofs:
+  - test: crates/stepan_verify_core/src/flowdsl.rs::errors_carry_file_and_line  covers: 1
+  - test: crates/stepan_verify_core/src/flowdsl.rs::round_trip_and_untouched_files  covers: 3

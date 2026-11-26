@@ -1,7 +1,8 @@
-feature: Прогресс плана агента («Шаг N из M»)
+feature: План агента с текущим шагом
 area: Сессии агентов
 summary: В сессии виден план агента с отметкой текущего шага
 aliases: [план агента, шаги, чеклист]
+entries: [crates/stepan_verify_app/src/session.rs, crates/stepan_verify_app/src/live_card.rs]
 
 paths:
   Смотреть план в сессии:

@@ -1,0 +1,19 @@
+feature: Запуск приложения с аргументами из терминала
+area: Приложение: настройки, обновления, запуск
+status: done
+summary: Пользователь открывает приложение с новой сессией, нужной сессией или отправляет текст агенту флагами --new, --open, --start и --send
+aliases: [аргументы запуска, --new, --open, --start, --send, --cwd, --changes, запуск из терминала]
+entries: [crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/main.rs]
+starts_at: Запуск приложения
+
+paths:
+  Открыть диалог новой сессии:
+    - Запуск приложения: запустить stepan_verify --new -> после загрузки списка сессий открывается «Диалог «Новая сессия»»  [Launch::from_args, AppView::run_launch_options, AppView::open_new_session_dialog, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/main.rs]
+    - Диалог «Новая сессия»: выбрать проект, агента, написать задачу и нажать «Запустить» (или Enter) -> диалог закрывается, открывается «Экран сессии» с новой вкладкой  [NewSessionForm::confirm, AppView::start_session, crates/stepan_verify_app/src/new_session.rs, crates/stepan_verify_app/src/app.rs]
+  Запустить агента с текстом:
+    - Запуск приложения: запустить stepan_verify --start claude|codex --cwd <папка> --send <текст> -> новая сессия стартует в этой папке с этим текстом как первым сообщением; codex выбирает Codex, любое другое значение или пустое — Claude  [Launch::from_args, AppView::run_launch_options, AppView::start_session, SessionView::start, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/session.rs]
+    - Экран сессии: окно открывается на новой вкладке сессии -> если добавлен --stay, остаётся «Дашборд» и сессия работает в фоне  [AppView::show, crates/stepan_verify_app/src/app.rs]
+  Открыть нужную сессию и написать ей:
+    - Запуск приложения: запустить stepan_verify --open <id> -> сессия ищется в списке, найденная открывается на «Экран сессии»; уже открытая вкладка переиспользуется  [AppView::open_session, AppView::run_launch_options, crates/stepan_verify_app/src/app.rs]
+    - Экран сессии: с --send <текст> текст уходит агенту в эту сессию -> сообщение появляется в ленте и агент начинает ход  [SessionView::send_text, SessionView::send_message, crates/stepan_verify_app/src/session.rs]
+    - Вкладка «Изменения»: с --changes (вместе с --open) открывается вкладка «Изменения», отчёт строится, если его ещё нет  [SessionView::open_changes, crates/stepan_verify_app/src/session.rs, crates/stepan_verify_app/src/app.rs]

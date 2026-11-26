@@ -1,13 +1,23 @@
-feature: Карточка задачи: ревью, ответ, журнал
+feature: Карточка задачи
 area: Задачи (доска)
-summary: Детали задачи — описание, папка, вложения, зависимости, журнал; «Принять», «Вернуть», «Ответить», «Открыть сессию»
-aliases: [детали задачи, ревью задачи, принять задачу]
+status: done
+summary: Открываешь задачу с доски и читаешь описание, журнал, вложения и зависимости, принимаешь или возвращаешь работу, отвечаешь агенту и открываешь его сессию
+aliases: [детали задачи, ревью задачи, принять задачу, карточка задачи, вернуть задачу, журнал задачи]
+entries: [crates/stepan_verify_app/src/board.rs]
+starts_at: Доска, колонка «Ждёт тебя»
 
 paths:
-  Принять или вернуть сданную задачу:
-    - Доска, колонка «Ждёт тебя»: Открыть карточку задачи -> Панель с описанием, зависимостями, вложениями и журналом  [board::task_panel, crates/stepan_verify_app/src/board.rs]
-    - Карточка задачи: Нажать «Принять» (или «Вернуть») -> Задача уходит в «Готово» (или обратно в работу), в журнале запись  [Board::set_status, events::append, crates/stepan_verify_app/src/board.rs, crates/stepan_verify_core/src/events.rs]
-    - Карточка задачи, блок вопроса агента: Написать и нажать «Ответить» -> Ответ уходит в сессию агента  [board::reply, crates/stepan_verify_app/src/board.rs]
+  Прочитать задачу:
+    - Доска задач: нажать на карточку -> справа открывается панель задачи, карточка подсвечена; повторный клик или «×» закрывает  [render_card, AppView::selected_task, crates/stepan_verify_app/src/board.rs]
+    - Карточка задачи: прокрутить панель -> заголовок, статус, проект, агент, итог или вопрос агента, описание (markdown), «Порядок работы», папка и «Где работать», вложения, «Зависит от» с отметкой готовности, журнал последних 40 записей  [render_detail, render_workflow, render_workplace, attach::strip, Board::events, crates/stepan_verify_app/src/board.rs, crates/stepan_verify_core/src/events.rs]
+  Принять или вернуть сданную работу:
+    - Карточка задачи (колонка «Ждёт тебя», статус «Ревью»): нажать «Принять» на карточке или в панели -> задача уходит в «Готово», кнопки исчезают, в журнале запись «сменил статус»  [set_task_status, Board::set_status, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_core/src/tasks.rs]
+    - Карточка задачи (статус «Ревью» или «Нужен ответ»): нажать «Вернуть» -> задача снова в «К работе», claim снят, агент может взять её заново  [set_task_status, TaskStatus::Todo, crates/stepan_verify_app/src/app.rs]
+  Ответить агенту:
+    - Карточка задачи (блок «Вопрос агента», статус «Нужен ответ»): нажать строку «Ответ уйдёт в сессию агента…» или «Ответить» -> открывается сессия этой задачи: открытая, а если её нет — последняя связанная; поля ответа в самой карточке нет  [open_task_session, task_session, resume_task_session, crates/stepan_verify_app/src/app.rs]
+    - Поле ввода сессии: написать ответ и отправить -> агент продолжает, задача возвращается в «В работе» (аренда берётся снова)  [on_task_session_event, Busy, Board::claim, crates/stepan_verify_app/src/app.rs]
+  Открыть сессию задачи:
+    - Карточка задачи: нажать «Сессия» на карточке или «Открыть сессию» внизу панели -> открывается экран сессии задачи; если сессии нет — предупреждение «обнови список сессий»  [open_task_session, crates/stepan_verify_app/src/app.rs, crates/stepan_verify_app/src/board.rs]
 
 proofs:
-  - test: crates/stepan_verify_core/src/tasks.rs  covers: 2  at: 2026-11-25T08:41:08Z  title: Claim, complete, зависимости
+  - test: crates/stepan_verify_core/src/tasks.rs::claim_complete_and_dependencies  covers: 3

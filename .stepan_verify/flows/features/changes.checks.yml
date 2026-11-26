@@ -1,9 +1,26 @@
-feature: Что проверить и замечания агенту
+feature: Проверки ревьюера с замечаниями
 area: Изменения («Карта»)
-summary: Ревьюер оставляет список проверок; узлы можно добавить «в замечания» и отправить агенту или вернуть с замечанием
-aliases: [замечания, вернуть с замечанием, проверки ревьюера]
+status: done
+summary: Ревьюер оставляет список проверок руками; отмечаешь сделанные, узлы помечаешь «в замечания», и всё уходит агенту этой сессии одним текстом
+aliases: [проверь руками, проверки, замечания, в замечания, вернуть с замечанием, чек-лист, ревью]
+entries: [crates/stepan_verify_app/src/changes/mod.rs]
+starts_at: Вкладка «Изменения»
 
 paths:
-  Вернуть агенту замечания:
-    - Панель узла: Нажать «в замечания» -> Узел попадает в список замечаний  [Panel::Return, remarks, crates/stepan_verify_app/src/changes/mod.rs]
-    - Панель «Вернуть»: Нажать «Отправить агенту» или «Вернуть с замечанием» -> Текст замечаний уходит агенту в сессию  [ChangesView::send_remarks, crates/stepan_verify_app/src/changes/mod.rs]
+  Проверить руками:
+    - Вкладка «Изменения»: нажать «Проверить руками N/M» в нижней панели -> Открывается панель «Проверь руками» со списком проверок; у каждой заголовок, пояснение «как проверить» и значок «агент: …» с уровнем доказательства (только сказано / указана строка / запущено / воспроизведено)  [render_bar, render_checks_panel, Panel::Checks, crates/stepan_verify_app/src/changes/mod.rs]
+    - Проверь руками: нажать на проверку -> Галочка становится зелёной, заголовок зачёркнут, счётчик в нижней панели растёт; повторный клик снимает отметку  [render_checks_panel, checked, crates/stepan_verify_app/src/changes/mod.rs]
+    - Проверь руками, ревьюер без проверок: открыть панель -> «Ревьюер не оставил проверок»  [render_checks_panel, crates/stepan_verify_app/src/changes/mod.rs]
+  Отметить узел в замечания:
+    - Карта: нажать узел -> Открывается Панель узла  [Panel::Node, crates/stepan_verify_app/src/changes/mod.rs]
+    - Панель узла: нажать «в замечания» -> Кнопка становится «в замечаниях» с галочкой; узел попадает в список замечаний  [node-remark, remarks, crates/stepan_verify_app/src/changes/mod.rs]
+    - Панель узла: отметить проверку из блока «проверить руками» -> Та же отметка, что и в панели «Проверь руками»: галочка стоит у проверки этого узла в обоих местах  [render_node_panel, checked, crates/stepan_verify_app/src/changes/mod.rs]
+    - Панель узла: нажать «в замечаниях» ещё раз -> Узел убирается из списка замечаний  [node-remark, remarks, crates/stepan_verify_app/src/changes/mod.rs]
+  Вернуть с замечанием:
+    - Вкладка «Изменения»: нажать «Вернуть с замечанием» -> Открывается Панель «Вернуть»: чипы выбранных узлов, поле «Что поправить — своими словами» и предпросмотр итогового текста  [render_return_panel, Panel::Return, remark_text, crates/stepan_verify_app/src/changes/mod.rs]
+    - Панель «Вернуть»: нажать «Отправить агенту» -> Текст уходит агенту этой сессии (send_text), панель закрывается, замечания очищаются; текст содержит «Ревью изменений «…» — верни на доработку», узлы с файлами, свой текст и, только если хотя бы одна проверка отмечена, блок «Ещё не проверено руками»  [ChangesEvent::Return, remark_text, send_text, crates/stepan_verify_app/src/changes/mod.rs, crates/stepan_verify_app/src/session.rs]
+    - Панель «Вернуть» без узлов: видно «Узлов пока нет»; кнопка «Отправить агенту» не проверяет, есть ли узлы или текст  [render_return_panel, crates/stepan_verify_app/src/changes/mod.rs]
+
+proofs:
+  - test: crates/stepan_verify_app/src/changes/mod.rs::report_tolerates_old_and_new_shapes  covers: 1
+  - test: crates/stepan_verify_app/src/changes/mod.rs::evidence_flows_and_verify_parse  covers: 1

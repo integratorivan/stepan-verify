@@ -1,0 +1,16 @@
+feature: Описание PR и доведение CI через /describe-pr
+area: Сессии агентов
+status: done
+summary: Пишешь /describe-pr — агент создаёт или обновляет PR с коротким описанием для ревьюера, следит за CI и чинит то, что сломал сам
+aliases: [describe-pr, описание PR, PR и CI, /describe-pr]
+entries: [crates/stepan_verify_core/src/describepr.rs]
+starts_at: Поле ввода сессии
+
+steps:
+  - Поле ввода сессии: отправить «/describe-pr» -> агент находит PR текущей ветки; если его нет, коммитит работу этой задачи, пушит ветку и создаёт PR через gh  [install_skill, crates/stepan_verify_core/src/describepr.rs, crates/stepan_verify_core/src/flowsync.rs]
+  - Лента сессии: агент пишет тело PR из трёх разделов («Why the change», «Special things to note», «Change outline») и сохраняет его через gh pr edit -> в ленте отчёт: ссылка на PR, что делает, список файлов, что ждём CI  [describe_pr_skill.md, crates/stepan_verify_core/src/describe_pr_skill.md]
+  - Лента сессии: агент ждёт проверки CI (gh pr checks --watch --fail-fast); при падении читает логи, чинит то, что сломал его PR, пушит и смотрит снова -> после трёх неудачных попыток или при конфликтах слияния останавливается и спрашивает  [describe_pr_skill.md, crates/stepan_verify_core/src/describe_pr_skill.md]
+  - Лента сессии: все проверки зелёные -> одно финальное сообщение со ссылкой на PR  [describe_pr_skill.md, crates/stepan_verify_core/src/describe_pr_skill.md]
+
+proofs:
+  - test: crates/stepan_verify_core/src/describepr.rs::skill_is_explicit_only_and_keeps_the_ci_loop  covers: 1, 3
