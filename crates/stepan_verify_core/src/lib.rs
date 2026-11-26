@@ -16,6 +16,7 @@ pub mod memory;
 pub mod sessions;
 pub mod showme;
 pub mod skills;
+pub mod arch;
 pub mod store;
 pub mod tasks;
 pub mod worktree;
