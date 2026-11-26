@@ -257,8 +257,8 @@ impl ChangesView {
             .when(!r.stages.is_empty(), |d| d.child(self.render_stages(g, r, p, theme, cx)))
             .child(self.render_lens_tabs(r, p, theme, cx))
             .child(match self.lens {
-                Lens::Map => self.render_map_section(g, r, &fresh, canvas_h, p, theme, cx).into_any_element(),
                 Lens::Views => self.render_views(g, r, &dir, p, theme, cx),
+                _ => self.render_map_section(g, r, &fresh, canvas_h, p, theme, cx).into_any_element(),
             })
             .when(!r.summary.is_empty(), |d| {
                 d.child(
