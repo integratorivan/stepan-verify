@@ -120,10 +120,11 @@ pub(crate) fn run(spec: SessionSpec, file: &Path, rx: mpsc::Receiver<Command>, e
             }
         }
     }
-    events.emit(AgentEvent::History(history));
     if running {
+        // Publish the turn before History can make the session look idle.
         events.emit(AgentEvent::TurnStarted);
     }
+    events.emit(AgentEvent::History(history));
 
     loop {
         match rx.recv_timeout(POLL) {
@@ -301,6 +302,11 @@ mod tests {
         while !matches!(seen.last(), Some(AgentEvent::TurnStarted)) {
             seen.push(next(&rx));
         }
+
+        // Opening during the turn must never briefly expose an idle session.
+        let (_reopened, rx) = crate::open_following(spec(), path.clone());
+        assert!(matches!(next(&rx), AgentEvent::TurnStarted));
+        assert!(matches!(next(&rx), AgentEvent::History(_)));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
