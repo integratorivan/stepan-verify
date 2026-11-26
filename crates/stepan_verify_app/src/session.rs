@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use gpui_kit::component::{
@@ -16,7 +16,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use crate::zoom::px;
 use crate::ui::PressButton;
-use stepan_verify_agents::{AgentEvent, AgentHandle, Approval, Attachment, AttachmentKind, FileDiff, Item, ItemKind, ItemStatus, SessionSpec};
+use stepan_verify_agents::{AgentEvent, AgentHandle, Approval, Attachment, AttachmentKind, FileDiff, Item, ItemKind, ItemStatus, Outgoing, SessionSpec};
 use stepan_verify_core::{Provider, SessionSummary, Task as BoardTask};
 
 use crate::attach::{self, Attachments, AttachmentsEvent, image_cache};
@@ -77,8 +77,8 @@ pub struct SessionView {
     /// Replaying the transcript file of a session that runs elsewhere (a
     /// terminal); the first message sent from here takes it over.
     pub following: bool,
-    /// Last time the other process wrote to the transcript.
-    external_at: Option<SystemTime>,
+    /// Messages waiting until the followed turn ends and we can resume the session.
+    follow_queue: Vec<Outgoing>,
     cwd: PathBuf,
     handle: AgentHandle,
     items: Vec<Item>,
@@ -127,9 +127,7 @@ impl SessionView {
             Provider::Claude => true,
             Provider::Codex => written.is_some_and(|t| t.elapsed().unwrap_or_default() < Duration::from_secs(30 * 60)),
         };
-        let mut this = Self::new(summary.provider, summary.title.clone(), summary.project(), spec, follow.then(|| summary.file.clone()), window, cx);
-        this.external_at = written;
-        this
+        Self::new(summary.provider, summary.title.clone(), summary.project(), spec, follow.then(|| summary.file.clone()), window, cx)
     }
 
     /// Start a fresh session in `cwd` and send `prompt` (with `images`) as the first message.
@@ -261,7 +259,7 @@ impl SessionView {
             task_id: None,
             status: Status::Loading,
             following,
-            external_at: None,
+            follow_queue: Vec::new(),
             cwd,
             handle,
             items: Vec::new(),
@@ -311,18 +309,6 @@ impl SessionView {
         }
     }
 
-    /// The other process is mid-turn: messages from here would race it.
-    pub fn busy_elsewhere(&self) -> bool {
-        self.following && self.status == Status::Running
-    }
-
-    /// Show the «runs in a terminal» notice: following and written lately.
-    fn live_elsewhere(&self) -> bool {
-        self.following
-            && (self.status == Status::Running
-                || self.external_at.is_some_and(|t| t.elapsed().unwrap_or_default() < Duration::from_secs(10 * 60)))
-    }
-
     pub fn activity(&self) -> Activity {
         let line = match self.status {
             Status::Running => self
@@ -353,6 +339,7 @@ impl SessionView {
             self.apply(event, &mut dirty, &mut reset, cx);
         }
         self.sync_rows(reset, &dirty, cx);
+        self.flush_follow_queue(cx);
         cx.notify();
     }
 
@@ -398,9 +385,6 @@ impl SessionView {
                 self.error = None;
             }
             AgentEvent::Upsert(item) => {
-                if self.following {
-                    self.external_at = Some(SystemTime::now());
-                }
                 // Step timing for the dashboard card: first seen → first not running.
                 let now = Instant::now();
                 let timing = self.timing.entry(item.id.clone()).or_insert((now, None));
@@ -507,30 +491,44 @@ impl SessionView {
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).value().trim().to_owned();
-        if (text.is_empty() && self.attachments.read(cx).is_empty()) || self.status == Status::Exited || self.busy_elsewhere() {
+        if (text.is_empty() && self.attachments.read(cx).is_empty()) || self.status == Status::Exited {
             return;
         }
         self.composer.update(cx, |c, cx| c.set_value("", window, cx));
         let images = self.attachments.update(cx, |a, cx| a.take(cx));
         stepan_verify_core::usage::hit("sessions.send");
-        self.send_message(stepan_verify_agents::Outgoing { text, images }, cx);
+        self.send_message(Outgoing { text, images }, cx);
     }
 
     /// Queue a message; the agent picks it up after history has loaded.
     pub fn send_text(&mut self, text: String, cx: &mut Context<Self>) {
-        self.send_message(stepan_verify_agents::Outgoing { text, images: Vec::new() }, cx);
+        self.send_message(Outgoing { text, images: Vec::new() }, cx);
     }
 
-    fn send_message(&mut self, message: stepan_verify_agents::Outgoing, cx: &mut Context<Self>) {
-        if self.busy_elsewhere() {
+    fn send_message(&mut self, message: Outgoing, cx: &mut Context<Self>) {
+        if self.status == Status::Exited {
             return;
         }
-        // From here on the session runs in stepan_verify.
+        if self.following && self.status != Status::Idle {
+            self.follow_queue.push(message);
+            cx.notify();
+            return;
+        }
         self.following = false;
         self.handle.send_message(message);
         self.begin_turn(cx);
         self.scroller.update(cx, |s, cx| s.scroll_to_end(cx));
         cx.notify();
+    }
+
+    fn flush_follow_queue(&mut self, cx: &mut Context<Self>) {
+        if self.status != Status::Idle || self.follow_queue.is_empty() {
+            return;
+        }
+        let queued = std::mem::take(&mut self.follow_queue);
+        let text = queued.iter().map(|m| m.text.as_str()).filter(|text| !text.is_empty()).collect::<Vec<_>>().join("\n\n");
+        let images = queued.into_iter().flat_map(|m| m.images).collect();
+        self.send_message(Outgoing { text, images }, cx);
     }
 
     /// Images go to the attachment strip; anything else into the text as a
@@ -581,26 +579,6 @@ impl SessionView {
     }
 
     // ------------------------------------------------------------- rendering
-
-    /// Notice above the composer while the session runs in another process.
-    fn render_elsewhere(&self, theme: &Theme) -> impl IntoElement {
-        let p = Palette::of(theme);
-        let (text, note) = if self.status == Status::Running {
-            ("Агент работает в терминале", "шаги появляются здесь сами · ответить можно после конца хода")
-        } else {
-            ("Сессия запущена в терминале", "сообщение отсюда продолжит её в Stepan · в терминале её лучше закрыть")
-        };
-        h_flex()
-            .gap_2()
-            .items_center()
-            .px(px(10.))
-            .py(px(6.))
-            .rounded(px(6.))
-            .bg(p.blue.soft)
-            .child(ui::dot(p.blue.solid))
-            .child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).text_color(p.blue.text).child(text))
-            .child(ui::mono(note, theme).text_color(p.muted).truncate())
-    }
 
     fn render_row(&self, r: usize, weak: &WeakEntity<Self>, cx: &App) -> AnyElement {
         let row = match self.rows.get(r).copied() {
@@ -1411,7 +1389,6 @@ impl Render for SessionView {
                             this.child(crate::loading::working("session-working", self.activity().line, elapsed, &theme))
                         })
                         .child(self.render_approvals(cx))
-                        .when(self.live_elsewhere() && !self.show_changes, |this| this.child(self.render_elsewhere(&theme)))
                         // The report is for reading: no composer over it.
                         .when(!self.show_changes, |this| this.child(
                             v_flex()
@@ -1445,41 +1422,23 @@ impl Render for SessionView {
                                         ))
                                         .child(attach::screenshot_button("screenshot", &self.attachments, cx))
                                         .child(div().flex_1())
-                                        .child(
-                                            ui::mono(
-                                                if self.busy_elsewhere() {
-                                                    "ход идёт в терминале"
-                                                } else if running {
-                                                    "агент работает"
-                                                } else {
-                                                    "⏎ отправить"
-                                                },
-                                                &theme,
-                                            )
-                                            .text_color(p.faint)
-                                            .mr_2(),
-                                        )
-                                        .child(if self.busy_elsewhere() {
-                                            PressButton::new("send")
-                                                .small()
-                                                .primary()
-                                                .icon(IconName::ArrowUp)
-                                                .label("Отправить")
-                                                .disabled(true)
-                                                .tooltip("Дождитесь конца хода: агент сейчас работает в терминале")
-                                        } else if running {
+                                        .when(!self.follow_queue.is_empty(), |this| {
+                                            this.child(ui::mono(format!("В очереди · {}", self.follow_queue.len()), &theme).text_color(p.muted).mr_2())
+                                        })
+                                        .child(if running && !self.following {
                                             PressButton::new("stop")
                                                 .small()
                                                 .outline()
                                                 .icon(IconName::Square)
                                                 .label("Стоп")
-                                                .on_click(cx.listener(|this, _, _, _| this.handle.interrupt()))
+                                                .on_click(cx.listener(|this, _, _, _| this.interrupt()))
                                         } else {
                                             PressButton::new("send")
                                                 .small()
                                                 .primary()
                                                 .icon(IconName::ArrowUp)
                                                 .label("Отправить")
+                                                .disabled(self.status == Status::Exited)
                                                 .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
                                         }),
                                 ),

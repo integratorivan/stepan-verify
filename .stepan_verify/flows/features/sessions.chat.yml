@@ -6,10 +6,13 @@ entries: [crates/stepan_verify_app/src/session.rs]
 
 paths:
   Написать агенту и остановить:
-    - Экран сессии, вкладка чата: Написать сообщение и нажать Enter или «Отправить» -> Сообщение попадает в ленту, агент стримит ответ («Думает…»)  [SessionView::send, AgentEvent, crates/stepan_verify_app/src/session.rs, crates/stepan_verify_agents/src/model.rs]
-    - Лента сессии: Смотреть на ход агента -> Подряд идущие инструменты сворачиваются в группу, правки показаны встроенным диффом +/−  [fold_runs, unified_diff, crates/stepan_verify_app/src/session.rs, crates/stepan_verify_agents/src/claude.rs]
-    - Экран сессии: Нажать «Стоп» -> Текущий ход прерывается  [SessionView::interrupt, crates/stepan_verify_app/src/session.rs]
+    - Экран сессии, вкладка чата: Написать сообщение и нажать Enter или «Отправить» -> Сообщение попадает в ленту, агент стримит ответ («Думает…»)  [SessionView::submit, AgentEvent, crates/stepan_verify_app/src/session.rs, crates/stepan_verify_agents/src/model.rs]
+    - Лента сессии: Смотреть на ход агента -> Видны текущий шаг и таймер; подряд идущие инструменты сворачиваются в группу, правки показаны встроенным диффом +/−  [SessionView::activity, build_rows, unified_diff, crates/stepan_verify_app/src/session.rs, crates/stepan_verify_agents/src/claude.rs]
+    - Экран сессии: Нажать доступную кнопку «Стоп» -> Текущий ход прерывается  [SessionView::interrupt, crates/stepan_verify_app/src/session.rs]
+    - Экран сессии, вкладка чата: Отправить сообщение во время наблюдения за идущим ходом -> У поля ввода виден счётчик очереди. После завершения хода сообщения и вложения отправляются в ту же сессию  [SessionView::submit, SessionView::flush_follow_queue, crates/stepan_verify_app/src/session.rs, crates/stepan_verify_agents/src/follow.rs]
 
 proofs:
   - test: crates/stepan_verify_app/src/session.rs  covers: 2  at: 2026-11-25T08:41:08Z  title: Группировка инструментов и склейка правок в ленте
   - test: crates/stepan_verify_agents/src/claude.rs  covers: 2  at: 2026-11-25T08:41:08Z  title: Правка превращается в unified diff (Claude)
+  - test: crates/stepan_verify_agents/src/follow.rs::follows_appended_turn  covers: 2  at: 2026-11-26T09:26:00Z  title: Живая лента и статус при открытии идущего хода
+  - manual: crates/stepan_verify_app/src/session.rs  covers: 4  at: 2026-11-26T09:29:00Z  title: Запуск с --open и --send на тестовых сессиях Claude и Codex, доставка после завершения хода в ту же сессию
