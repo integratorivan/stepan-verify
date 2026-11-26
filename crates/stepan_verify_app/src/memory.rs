@@ -422,7 +422,7 @@ impl MemoryView {
                     .child(div().flex_none().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(tone).child(verb))
                     .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).text_color(p.fg).child(text.get(r.op.id()).copied().unwrap_or(r.op.id()).to_owned()))
                     .when_some(project, |d, pr| d.child(ui::chip(pr, p, theme)))
-                    .when_some(reason, |d, why| d.child(div().text_size(px(12.)).text_color(p.muted).child(why)))
+                    .when_some(reason, |d, why| d.child(div().min_w_0().max_w(px(240.)).truncate().text_size(px(12.)).text_color(p.muted).child(why)))
             }))
             .into_any_element()
     }
@@ -444,6 +444,7 @@ impl Render for MemoryView {
             .child(
                 v_flex()
                     .flex_1()
+                    .min_w_0()
                     .gap(px(6.))
                     .child(ui::eyebrow(format!("журнал для агентов · {total} записей"), &p, &theme))
                     .child(ui::page_title("Память", &p))

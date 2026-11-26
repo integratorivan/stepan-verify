@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use chrono::Utc;
 use gpui_kit::component::{
     ActiveTheme, Icon, IconName, Sizable as _, Theme,
+    scroll::ScrollableElement as _,
     spinner::Spinner,
     switch::Switch,
     text::TextView,
@@ -79,6 +80,7 @@ pub fn render(app: &AppView, window: &mut Window, cx: &mut Context<AppView>) -> 
     // Project filter lives with the board element, not in the app model.
     let filter = window.use_keyed_state("board-project-filter", cx, |_, _| None::<String>);
     let current = filter.read(cx).clone();
+    let columns_scroll = window.use_keyed_state("board-columns-scroll", cx, |_, _| ScrollHandle::new()).read(cx).clone();
 
     let mut projects: BTreeMap<String, usize> = BTreeMap::new();
     for t in &app.tasks {
@@ -217,15 +219,25 @@ pub fn render(app: &AppView, window: &mut Window, cx: &mut Context<AppView>) -> 
                         ),
                 )
                 .child(h_flex().px(px(32.)).pb(px(14.)).gap(px(6.)).flex_wrap().children(chips))
+                // Narrower than five columns: the board scrolls sideways instead of cutting «Готово» off.
                 .child(
-                    h_flex()
+                    div()
                         .flex_1()
                         .min_h_0()
-                        .px(px(32.))
-                        .pb(px(24.))
-                        .gap(px(10.))
-                        .items_start()
-                        .children(COLUMNS.iter().map(|col| render_column(app, col, &visible, &p, &theme, cx))),
+                        .relative()
+                        .child(
+                            h_flex()
+                                .id("board-columns")
+                                .size_full()
+                                .overflow_x_scroll()
+                                .track_scroll(&columns_scroll)
+                                .px(px(32.))
+                                .pb(px(24.))
+                                .gap(px(10.))
+                                .items_start()
+                                .children(COLUMNS.iter().map(|col| render_column(app, col, &visible, &p, &theme, cx))),
+                        )
+                        .horizontal_scrollbar(&columns_scroll),
                 ),
         )
         .when_some(selected, |this, task| {
@@ -388,7 +400,7 @@ fn render_card(app: &AppView, task: &Task, done: bool, p: &Palette, theme: &Them
                 .child(task.meta.title.clone()),
         )
         .when(!done, |this| {
-            this.when_some(body, |this, b| this.child(div().text_size(px(12.)).line_height(px(17.)).text_color(p.muted).line_clamp(2).child(b)))
+            this.when_some(body, |this, b| this.child(div().text_size(px(12.)).line_height(px(17.)).text_color(p.muted).line_clamp(2).text_ellipsis().child(b)))
         });
 
     // Project, agent, labels; attachments and age on the right.
@@ -454,10 +466,10 @@ fn render_card(app: &AppView, task: &Task, done: bool, p: &Palette, theme: &Them
         }
         TaskStatus::Blocked => card
             .child(h_flex().child(ui::badge("Агенту нужен ответ", p.amber)))
-            .when_some(task.meta.summary.clone(), |this, s| this.child(div().text_size(px(12.)).text_color(p.muted).line_clamp(3).child(s))),
+            .when_some(task.meta.summary.clone(), |this, s| this.child(div().text_size(px(12.)).text_color(p.muted).line_clamp(3).text_ellipsis().child(s))),
         TaskStatus::Review => card
             .child(h_flex().child(if planning { ui::badge("План ждёт решения", p.blue) } else { ui::badge("Сдал на ревью", p.green) }))
-            .when_some(task.meta.summary.clone(), |this, s| this.child(div().text_size(px(12.)).text_color(p.muted).line_clamp(3).child(s))),
+            .when_some(task.meta.summary.clone(), |this, s| this.child(div().text_size(px(12.)).text_color(p.muted).line_clamp(3).text_ellipsis().child(s))),
         _ => card,
     };
 
@@ -515,7 +527,7 @@ fn render_card(app: &AppView, task: &Task, done: bool, p: &Palette, theme: &Them
     card.when(!actions.is_empty() && !done, |this| this.child(h_flex().flex_wrap().gap(px(5.)).children(actions)))
 }
 
-/// "◔ взял claude · ещё 12 мин": who holds the task and how long the lease lasts.
+/// "◔ взял claude · 12 мин": who holds the task and how long the lease has left.
 fn lease_line(who: &str, minutes: Option<i64>, running: bool, p: &Palette, theme: &Theme) -> impl IntoElement {
     let fraction = minutes.map_or(1., |m| (m as f32 / LEASE_MINUTES).clamp(0.08, 1.));
     h_flex()
@@ -533,9 +545,15 @@ fn lease_line(who: &str, minutes: Option<i64>, running: bool, p: &Palette, theme
         } else {
             lease_ring(fraction, p).into_any_element()
         })
-        .child(h_flex().gap(px(4.)).child("взял").child(div().font_weight(FontWeight::SEMIBOLD).text_color(p.fg).child(who.to_owned())))
-        .child(div().flex_1())
-        .when_some(minutes, |this, m| this.child(ui::mono(format!("ещё {m} мин"), theme).text_size(px(10.5))))
+        .child(
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(px(4.))
+                .child("взял")
+                .child(div().min_w_0().truncate().font_weight(FontWeight::SEMIBOLD).text_color(p.fg).child(who.to_owned())),
+        )
+        .when_some(minutes, |this, m| this.child(ui::mono(format!("{m} мин"), theme).flex_shrink_0().whitespace_nowrap().text_size(px(10.5))))
 }
 
 /// The agent waits for its separate copy (git worktree, files, setup).
@@ -745,7 +763,7 @@ fn render_detail(app: &AppView, task: &Task, p: &Palette, theme: &Theme, cx: &mu
                             .gap(px(6.))
                             .text_size(px(13.))
                             .child(Icon::new(if done { IconName::CircleCheck } else { IconName::Loader }).xsmall().text_color(if done { p.green.solid } else { p.faint }))
-                            .child(div().text_color(if done { p.muted } else { p.fg }).child(title))
+                            .child(div().min_w_0().text_color(if done { p.muted } else { p.fg }).child(title))
                     })))
                 })
                 .child(
@@ -764,10 +782,12 @@ fn render_detail(app: &AppView, task: &Task, p: &Palette, theme: &Theme, cx: &mu
                                         .text_color(p.faint),
                                 )
                                 .child(div().mt(px(3.)).size(px(9.)).flex_shrink_0().rounded_full().border_1().border_color(p.border_strong).bg(p.surface))
+                                // Who and what on the first line; the text below wraps to the drawer width.
                                 .child(
-                                    div()
+                                    v_flex()
                                         .flex_1()
                                         .min_w_0()
+                                        .gap(px(2.))
                                         .text_size(px(12.5))
                                         .line_height(px(17.))
                                         .text_color(p.fg)
@@ -776,9 +796,9 @@ fn render_detail(app: &AppView, task: &Task, p: &Palette, theme: &Theme, cx: &mu
                                                 .gap(px(4.))
                                                 .flex_wrap()
                                                 .child(div().font_weight(FontWeight::BOLD).text_color(p.ink).child(e.actor.clone()))
-                                                .child(event_label(&e.kind))
-                                                .when(!e.text.is_empty(), |this| this.child(div().text_color(p.fg).child(format!("· {}", e.text)))),
-                                        ),
+                                                .child(event_label(&e.kind)),
+                                        )
+                                        .when(!e.text.is_empty(), |this| this.child(div().w_full().text_color(p.fg).child(e.text.clone()))),
                                 )
                         })),
                 )
@@ -906,7 +926,7 @@ fn render_workplace(app: &AppView, task: &Task, p: &Palette, theme: &Theme, cx: 
                         .child(option("detail-isolation-worktree", "Отдельная копия", Some(Isolation::Worktree), cx))
                         .child(option("detail-isolation-here", "Здесь", Some(Isolation::Here), cx)),
                 )
-                .child(div().min_w_0().truncate().text_size(px(12.)).text_color(p.faint).child(hint)),
+                .child(div().flex_1().min_w_0().text_size(px(12.)).line_height(px(16.)).text_color(p.faint).child(hint)),
         )
         .when(preparing, |this| this.child(preparing_line(p)))
         .when_some(task.meta.worktree.clone(), |this, path| {
@@ -921,8 +941,7 @@ fn render_workplace(app: &AppView, task: &Task, p: &Palette, theme: &Theme, cx: 
                     .child(
                         h_flex()
                             .gap(px(8.))
-                            .child(ui::branch_chip(task.meta.branch.clone().unwrap_or_else(|| "копия".into()), p, theme))
-                            .child(div().flex_1())
+                            .child(h_flex().flex_1().min_w_0().child(ui::branch_chip(task.meta.branch.clone().unwrap_or_else(|| "копия".into()), p, theme)))
                             .child(
                                 PressButton::new("detail-remove-copy")
                                     .xsmall()

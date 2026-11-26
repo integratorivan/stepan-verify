@@ -46,9 +46,12 @@ pub fn ensure_pickers(app: &mut AppView, window: &mut Window, cx: &mut Context<A
     app.font_pickers = Some([text, mono]);
 }
 
-pub fn render(app: &AppView, _: &mut Window, cx: &mut Context<AppView>) -> impl IntoElement {
+pub fn render(app: &AppView, window: &mut Window, cx: &mut Context<AppView>) -> impl IntoElement {
     let theme = cx.theme().clone();
     let p = Palette::of(&theme);
+    // Too narrow for title | control side by side (small window or zoomed in): stack them.
+    let narrow = crate::zoom::units(window.viewport_size().width) < NARROW_BELOW;
+    let row = |title: &'static str, hint: &'static str, control: AnyElement, p: &Palette| row(title, hint, control, narrow, p);
     let config = settings::config(cx).clone();
     let home = tilde(&app.home.root);
 
@@ -106,6 +109,8 @@ pub fn render(app: &AppView, _: &mut Window, cx: &mut Context<AppView>) -> impl 
         ))
         .child(
             div()
+                .flex_1()
+                .min_w_0()
                 .max_w(px(320.))
                 .text_size(px(12.5))
                 .text_color(p.muted)
@@ -240,7 +245,8 @@ pub fn render(app: &AppView, _: &mut Window, cx: &mut Context<AppView>) -> impl 
     let font_row = |picker: Option<&Entity<FontPicker>>, id: &'static str, sample: &'static str, family: SharedString, chosen: &str, mono: bool| {
         v_flex()
             .gap(px(10.))
-            .w(px(420.))
+            .w_full()
+            .max_w(px(420.))
             .child(
                 h_flex()
                     .gap(px(8.))
@@ -321,7 +327,7 @@ pub fn render(app: &AppView, _: &mut Window, cx: &mut Context<AppView>) -> impl 
             h_flex()
                 .gap(px(8.))
                 .child(ui::mono(format!("Stepan {}", crate::update::VERSION), &theme).text_size(px(12.)).text_color(p.fg))
-                .child(div().text_size(px(12.5)).text_color(p.muted).child(update_line)),
+                .child(div().min_w_0().text_size(px(12.5)).text_color(p.muted).child(update_line)),
         );
 
     let corner = crate::corner::render(app, &p, cx);
@@ -347,65 +353,65 @@ pub fn render(app: &AppView, _: &mut Window, cx: &mut Context<AppView>) -> impl 
             .child(row(
                 "Режим агентов",
                 "Сколько агенты могут делать без твоего подтверждения. Применяется к новым процессам агентов; в открытой сессии — после её переоткрытия.",
-                modes,
+                modes.into_any_element(),
                 &p,
             ))
-            .child(row("Агент по умолчанию", "Кого запускает автопилот для задач без метки agent=codex.", providers, &p))
+            .child(row("Агент по умолчанию", "Кого запускает автопилот для задач без метки agent=codex.", providers.into_any_element(), &p))
             .child(row(
                 "Модель по умолчанию",
                 "На ней агенты берут задачи и стартуют новые сессии, если в задаче не выбрана своя. «По умолчанию» — модель из настроек самого Claude Code или Codex.",
-                agent_models,
+                agent_models.into_any_element(),
                 &p,
             ))
-            .child(row("Автопилот", "Сколько агентов он может держать в работе одновременно.", limits, &p))
+            .child(row("Автопилот", "Сколько агентов он может держать в работе одновременно.", limits.into_any_element(), &p))
             .child(row(
                 "Отчёт «Изменения» · Claude",
                 "Отчёт пишет агент той же семьи, что и сессия. Для Claude-сессий — эта модель. Sonnet — баланс скорости и качества.",
-                models,
+                models.into_any_element(),
                 &p,
             ))
             .child(row(
                 "Отчёт «Изменения» · Codex",
                 "Для Codex-сессий отчёт собирает Codex. Список моделей — из кэша Codex; «по умолчанию» — модель из ~/.codex/config.toml.",
-                codex_models,
+                codex_models.into_any_element(),
                 &p,
             ))
             .child(row(
                 "Before / after",
                 "После хода агента с правками интерфейса агент той же семьи снимает «Было → Стало» скиллом pr-before-after: скриншоты, пары, GIF. Хранится в ~/.stepan_verify/tmp/sessions. В «Изменениях» всегда есть кнопка «Снять before/after».",
-                media_modes,
+                media_modes.into_any_element(),
                 &p,
             ))
             .child(row(
                 "Скилл карты флоу",
                 "Скилл stepan-verify-flows для всех агентов Claude и Codex: читать карту флоу проекта и обновлять её в конце задачи, если поменялось поведение для пользователя. Ссылки в ~/.claude/skills и ~/.agents/skills; чужие папки с тем же именем не трогаются.",
-                flows_skill,
+                flows_skill.into_any_element(),
                 &p,
             ))
             .child(row(
                 "Синхронизация карты флоу",
                 "Сама подтягивать карту к коду, когда файлы фич изменились и правки затихли на 2 минуты. Выключено — только плашка «Карта отстала» и кнопка «Синхронизировать» (агенты стоят денег).",
-                flows_auto,
+                flows_auto.into_any_element(),
                 &p,
             ))
-            .child(row("Шрифт текста", "Интерфейс, документы, сообщения. Instrument Sans встроен в Stepan и есть всегда; остальные — из шрифтов этого Mac.", text_fonts, &p))
-            .child(row("Шрифт кода", "Код, диффы, пути, команды, метки. Моноширинный — иначе колонки поедут.", mono_fonts, &p))
+            .child(row("Шрифт текста", "Интерфейс, документы, сообщения. Instrument Sans встроен в Stepan и есть всегда; остальные — из шрифтов этого Mac.", text_fonts.into_any_element(), &p))
+            .child(row("Шрифт кода", "Код, диффы, пути, команды, метки. Моноширинный — иначе колонки поедут.", mono_fonts.into_any_element(), &p))
             .child(row(
                 "Обновления",
                 "Новые версии приходят из GitHub Releases (репозиторий публичный). Установленное приложение обновляется само и перезапускается; запущенное из cargo — открывает страницу релиза.",
-                updates,
+                updates.into_any_element(),
                 &p,
             ))
             .child(row(
                 "Документы · правила агентам",
                 "Каждая сессия из Stepan получает память (твои поправки, запреты, как устроен проект), правила полки (разборы, решения, вопросы тебе) и то, что полка уже знает о проекте: решения в силе, открытые вопросы.",
-                brief,
+                brief.into_any_element(),
                 &p,
             ))
             .child(row(
                 "Документы · итоги сессий",
                 "Когда сессия затихла, агент той же семьи (модель — как у «Изменений») читает новое в ней: твои поправки и фактуру проекта записывает в память, решения и открытые вопросы — на полку. Чаще всего записывать нечего — тогда он ничего не пишет.",
-                distill,
+                distill.into_any_element(),
                 &p,
             ))
             .child(
@@ -429,25 +435,29 @@ fn tilde(path: &std::path::Path) -> String {
     }
 }
 
-/// A settings row: title and hint on the left, the control on the right.
-fn row(title: &'static str, hint: &'static str, control: impl IntoElement, p: &Palette) -> impl IntoElement {
-    h_flex()
+/// Window width (interface units) below which a row puts the control under its title.
+const NARROW_BELOW: f32 = 1180.;
+
+/// A settings row: title and hint on the left, the control on the right;
+/// `narrow` puts the control under the title instead.
+fn row(title: &'static str, hint: &'static str, control: AnyElement, narrow: bool, p: &Palette) -> impl IntoElement {
+    div()
+        .flex()
+        .map(|d| if narrow { d.flex_col().gap(px(14.)) } else { d.flex_row().gap(px(28.)) })
         .mt(px(22.))
         .pt(px(22.))
         .pb(px(2.))
         .border_t_1()
         .border_color(p.border)
         .items_start()
-        .gap(px(28.))
         .child(
             v_flex()
-                .w(px(280.))
-                .flex_shrink_0()
+                .map(|d| if narrow { d.w_full() } else { d.w(px(280.)).flex_shrink_0() })
                 .gap(px(8.))
                 .child(div().text_size(px(15.)).font_weight(FontWeight::BOLD).text_color(p.ink).child(title))
                 .child(div().text_size(px(13.)).line_height(px(20.)).text_color(p.muted).child(hint)),
         )
-        .child(h_flex().flex_1().min_w_0().items_start().child(control))
+        .child(h_flex().flex_1().min_w_0().w_full().items_start().child(control))
 }
 
 /// What each mode lets the agent do on its own: (what, allowed).
@@ -489,7 +499,7 @@ fn mode_card(mode: AgentMode, active: bool, p: &Palette, theme: &Theme) -> State
             h_flex()
                 .gap(px(8.))
                 .child(radio(active, p))
-                .child(div().text_size(px(14.)).font_weight(FontWeight::BOLD).text_color(p.ink).child(mode.label())),
+                .child(div().min_w_0().text_size(px(14.)).font_weight(FontWeight::BOLD).text_color(p.ink).child(mode.label())),
         )
         .child(div().text_size(px(12.5)).line_height(px(19.)).text_color(p.muted).child(mode.description()))
         .child(v_flex().gap(px(3.)).children(permissions(mode).map(|(what, ok)| {
