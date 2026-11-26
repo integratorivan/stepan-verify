@@ -101,12 +101,18 @@ pub(crate) fn run(spec: SessionSpec, file: &Path, rx: mpsc::Receiver<Command>, e
         lines.push(&line);
     }
     let written = || std::fs::metadata(file).and_then(|m| m.modified()).ok();
-    if written().is_some_and(|t| t.elapsed().unwrap_or_default() > QUIET) {
+    let quiet = written().is_some_and(|t| t.elapsed().unwrap_or_default() > QUIET);
+    // Mid-turn, and nothing has written the file for long: the process died under the agent.
+    let cut = quiet && lines.running();
+    if quiet {
         lines.settle();
     }
     let mut running = lines.running();
     let mut history = lines.items();
-    if !running {
+    if cut {
+        let step = cut_off(&mut history);
+        events.emit(AgentEvent::Interrupted { step });
+    } else if !running {
         // Tools whose result never landed (interrupted turn) are not running anymore.
         for item in &mut history {
             if item.status == ItemStatus::Running {
@@ -129,6 +135,12 @@ pub(crate) fn run(spec: SessionSpec, file: &Path, rx: mpsc::Receiver<Command>, e
                 if running && written().is_some_and(|t| t.elapsed().unwrap_or_default() > QUIET) {
                     lines.settle();
                     running = false;
+                    let mut items = lines.items();
+                    let step = cut_off(&mut items);
+                    for item in items.into_iter().filter(|i| i.status == ItemStatus::Failed) {
+                        events.emit(AgentEvent::Upsert(item));
+                    }
+                    events.emit(AgentEvent::Interrupted { step });
                     events.emit(AgentEvent::TurnCompleted { error: None });
                 }
                 for line in tail.read().unwrap_or_default() {
@@ -144,6 +156,17 @@ pub(crate) fn run(spec: SessionSpec, file: &Path, rx: mpsc::Receiver<Command>, e
             }
         }
     }
+}
+
+/// Steps still running in a turn nobody finishes did not finish: mark them so
+/// and name the last one.
+fn cut_off(items: &mut [Item]) -> String {
+    let mut step = String::new();
+    for item in items.iter_mut().filter(|i| i.status == ItemStatus::Running) {
+        item.status = ItemStatus::Failed;
+        step = crate::claude::truncate(&item.title, 120);
+    }
+    step
 }
 
 /// Hand the session to the regular agent: it reloads history and resumes.
@@ -192,6 +215,33 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         panic!("no event");
+    }
+
+    #[test]
+    fn a_quiet_file_that_ends_mid_step_is_an_interrupted_turn() {
+        let dir = std::env::temp_dir().join(format!("stepan_verify-cut-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u1","message":{"role":"user","content":"запиши тест"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cat > a.test.tsx"}}],"stop_reason":"tool_use"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        // Nothing wrote it for longer than QUIET: whoever ran it is gone.
+        let old = std::time::SystemTime::now() - QUIET - Duration::from_secs(60);
+        std::fs::File::options().append(true).open(&path).unwrap().set_modified(old).unwrap();
+
+        let (_handle, rx) = crate::open_following(spec(), path.clone());
+        let AgentEvent::Interrupted { step } = next(&rx) else { panic!("interrupted first") };
+        assert!(step.contains("cat > a.test.tsx"), "{step}");
+        let AgentEvent::History(items) = next(&rx) else { panic!("then history") };
+        let tool = items.iter().find(|i| i.kind == ItemKind::Tool).unwrap();
+        assert_eq!(tool.status, ItemStatus::Failed, "no tick on a step that never finished");
+        assert!(rx.try_recv().is_err(), "and not shown as working");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1265,6 +1265,7 @@ impl AppView {
             (Status::Running, _) => (IconName::LoaderCircle, p.blue.solid, s.card.progress.to_lowercase()),
             (Status::Loading, _) => (IconName::Loader, p.faint, "загрузка".into()),
             (Status::Exited, _) => (IconName::CircleX, p.red.solid, "завершён".into()),
+            (Status::Idle, _) if a.interrupted => (IconName::TriangleAlert, p.red.solid, "прервана".into()),
             (Status::Idle, _) if asks => (IconName::Info, p.amber.solid, "вопрос".into()),
             (Status::Idle, _) => (IconName::CircleCheck, p.muted, "ждёт тебя".into()),
         };

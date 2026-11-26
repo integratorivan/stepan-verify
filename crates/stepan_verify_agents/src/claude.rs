@@ -7,14 +7,22 @@
 //!
 //! History (the session .jsonl) and the live stream share one [`Mapper`], so a
 //! message looks the same whether it was loaded or streamed.
+//!
+//! The process runs under a [`crate::host`], not as our child: it keeps working
+//! when the window goes, and a window that opens the session again connects to
+//! it instead of starting another one.
 
 use std::{
     collections::HashMap,
     fs::File,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader},
     path::Path,
-    process::{Child, ChildStdin, Command as Proc, Stdio},
-    sync::{Arc, Mutex, mpsc},
+    process::{Command as Proc, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
 };
 
 use anyhow::{Context, Result};
@@ -37,28 +45,50 @@ struct Shared {
 }
 
 struct Live {
-    child: Child,
-    stdin: ChildStdin,
+    conn: crate::host::Conn,
+    /// The host still answers: cleared when its output ends.
+    alive: Arc<AtomicBool>,
 }
 
 pub(crate) fn run(spec: SessionSpec, rx: mpsc::Receiver<Command>, events: &Emitter) -> Result<()> {
     let store = ImageStore { dir: spec.image_cache.clone() };
-    let history = match &spec.transcript {
+    let (mut history, unfinished) = match &spec.transcript {
         Some(path) => read_history(path, &store)?,
-        None => Vec::new(),
+        None => (Vec::new(), Vec::new()),
     };
-    events.emit(AgentEvent::History(history));
     let shared = Arc::new(Mutex::new(Shared { session_id: spec.native_id.clone(), pending: HashMap::new() }));
-    let mut live: Option<Live> = None;
-    let mut sent = 0usize;
     let events = Emitter(events.0.clone());
+    // Still running under its host (the window was closed or updated): take it up again.
+    let mut live: Option<Live> = spec
+        .native_id
+        .as_deref()
+        .and_then(|id| crate::host::attach(crate::Provider::Claude, id))
+        .map(|conn| follow_output(conn, &shared, &store, &events));
+    // The file ends mid-turn and nothing runs it: the process died under the agent.
+    if live.is_none() && spec.transcript.as_deref().is_some_and(ended_mid_turn) {
+        // Steps that never got their result did not finish: no tick on them.
+        for item in history.iter_mut().filter(|i| unfinished.contains(&i.id)) {
+            item.status = ItemStatus::Failed;
+        }
+        let step = history
+            .iter()
+            .rev()
+            .find(|i| unfinished.contains(&i.id))
+            .or_else(|| history.iter().rev().find(|i| i.kind == ItemKind::Tool))
+            .map(|i| truncate(&i.title, 120))
+            .unwrap_or_default();
+        events.emit(AgentEvent::Interrupted { step });
+    }
+    events.emit(AgentEvent::History(history));
+    if live.as_ref().is_some_and(|l| l.conn.busy) {
+        events.emit(AgentEvent::TurnStarted);
+    }
+    let mut sent = 0usize;
 
     while let Ok(cmd) = rx.recv() {
         // A crashed or finished CLI is respawned on the next message.
-        if let Some(l) = &mut live {
-            if l.child.try_wait().ok().flatten().is_some() {
-                live = None;
-            }
+        if live.as_ref().is_some_and(|l| !l.alive.load(Ordering::Relaxed)) {
+            live = None;
         }
         match cmd {
             Command::Send(message) => {
@@ -71,15 +101,14 @@ pub(crate) fn run(spec: SessionSpec, rx: mpsc::Receiver<Command>, events: &Emitt
                     Item::message(format!("local-user-{sent}"), ItemKind::User, message.text.clone()).with_attachments(attachments),
                 ));
                 events.emit(AgentEvent::TurnStarted);
-                write_line(
-                    &mut live.as_mut().unwrap().stdin,
-                    &json!({"type":"user","message":{"role":"user","content":content},"parent_tool_use_id":null}),
-                )?;
+                live.as_mut()
+                    .unwrap()
+                    .conn
+                    .write_value(&json!({"type":"user","message":{"role":"user","content":content},"parent_tool_use_id":null}))?;
             }
             Command::Interrupt => {
                 if let Some(l) = &mut live {
-                    write_line(
-                        &mut l.stdin,
+                    l.conn.write_value(
                         &json!({"type":"control_request","request_id":format!("stepan_verify-int-{sent}"),"request":{"subtype":"interrupt"}}),
                     )?;
                 }
@@ -92,21 +121,24 @@ pub(crate) fn run(spec: SessionSpec, rx: mpsc::Receiver<Command>, events: &Emitt
                     } else {
                         json!({"behavior":"deny","message":"Пользователь отклонил это действие."})
                     };
-                    write_line(
-                        &mut l.stdin,
-                        &json!({"type":"control_response","response":{"subtype":"success","request_id":id,"response":response}}),
-                    )?;
+                    l.conn.write_value(&json!({"type":"control_response","response":{"subtype":"success","request_id":id,"response":response}}))?;
                     events.emit(AgentEvent::ApprovalResolved(id));
                 }
             }
+            // The window lets go; the agent finishes on its own under the host.
             Command::Shutdown => break,
         }
     }
-    if let Some(mut l) = live {
-        let _ = l.child.kill();
-        let _ = l.child.wait();
-    }
     Ok(())
+}
+
+/// The last turn in the file never ended: no result, no interruption mark.
+fn ended_mid_turn(path: &Path) -> bool {
+    let mut feed = Feed::new(ImageStore::default());
+    for line in crate::peek::tail_lines(path, crate::peek::TAIL_BYTES) {
+        feed.push(&line);
+    }
+    feed.turn
 }
 
 fn spawn(spec: &SessionSpec, shared: &Arc<Mutex<Shared>>, store: &ImageStore, events: &Emitter) -> Result<Live> {
@@ -142,29 +174,26 @@ fn spawn(spec: &SessionSpec, shared: &Arc<Mutex<Shared>>, store: &ImageStore, ev
     if let Some(id) = &shared.lock().unwrap().session_id {
         cmd.args(["--resume", id]);
     }
-    let mut child = cmd.spawn().context("не удалось запустить `claude`")?;
-    let stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let shared = shared.clone();
+    let conn = crate::host::launch(crate::Provider::Claude, &cmd).context("не удалось запустить `claude`")?;
+    Ok(follow_output(conn, shared, store, events))
+}
+
+/// Read the agent's output (through its host) on a thread of its own.
+fn follow_output(mut conn: crate::host::Conn, shared: &Arc<Mutex<Shared>>, store: &ImageStore, events: &Emitter) -> Live {
+    let reader = conn.reader.take().expect("a fresh connection has its reader");
+    let alive = Arc::new(AtomicBool::new(true));
+    let (shared, store, flag) = (shared.clone(), store.clone(), alive.clone());
     let events = Emitter(events.0.clone());
-    let store = store.clone();
     std::thread::spawn(move || {
         let mut stream = StreamState { mapper: Mapper::new(store), ..Default::default() };
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        for line in reader.lines().map_while(Result::ok) {
             if let Ok(v) = serde_json::from_str::<Value>(&line) {
                 stream.handle(&v, &shared, &events);
             }
         }
+        flag.store(false, Ordering::Relaxed);
     });
-    Ok(Live { child, stdin })
-}
-
-fn write_line(stdin: &mut ChildStdin, v: &Value) -> Result<()> {
-    let mut line = serde_json::to_string(v)?;
-    line.push('\n');
-    stdin.write_all(line.as_bytes()).context("claude stdin закрыт")?;
-    stdin.flush()?;
-    Ok(())
+    Live { conn, alive }
 }
 
 /// Message content for stream-json input: plain text, or text + base64 images.
@@ -473,17 +502,19 @@ impl StreamState {
     }
 }
 
-/// Rebuild the visible transcript from a Claude session file.
-pub(crate) fn read_history(path: &Path, store: &ImageStore) -> Result<Vec<Item>> {
+/// Rebuild the visible transcript from a Claude session file, and the ids of
+/// the tools whose result never landed (they are shown as finished).
+pub(crate) fn read_history(path: &Path, store: &ImageStore) -> Result<(Vec<Item>, Vec<String>)> {
     let reader = BufReader::new(File::open(path).with_context(|| format!("{}", path.display()))?);
     let mut items = items_from_lines(reader.lines().map_while(Result::ok), store);
-    // Tools whose result never landed (interrupted turn) are not running anymore.
+    let mut unfinished = Vec::new();
     for item in &mut items {
         if item.status == ItemStatus::Running {
             item.status = ItemStatus::Done;
+            unfinished.push(item.id.clone());
         }
     }
-    Ok(items)
+    Ok((items, unfinished))
 }
 
 /// The end of a live session file, for a dashboard card: tools without a
@@ -809,6 +840,29 @@ mod tests {
     fn temp_store() -> (ImageStore, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("stepan_verify-test-{}", std::process::id()));
         (ImageStore { dir: Some(dir.clone()) }, dir)
+    }
+
+    #[test]
+    fn a_turn_cut_off_mid_step_is_seen_as_interrupted() {
+        let dir = std::env::temp_dir().join(format!("stepan-cut-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prompt = r#"{"type":"user","uuid":"u1","message":{"role":"user","content":"запиши тест"}}"#;
+        let call = r#"{"type":"assistant","uuid":"a1","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cat > a.test.tsx"}}]}}"#;
+        let done = r#"{"type":"assistant","uuid":"a2","message":{"id":"m2","stop_reason":"end_turn","content":[{"type":"text","text":"готово"}]}}"#;
+        let result = r#"{"type":"user","uuid":"u2","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#;
+
+        let cut = dir.join("cut.jsonl");
+        std::fs::write(&cut, [prompt, call].join("\n")).unwrap();
+        let (items, unfinished) = read_history(&cut, &ImageStore::default()).unwrap();
+        assert!(ended_mid_turn(&cut));
+        assert_eq!(unfinished, ["t1"]);
+        assert!(items.iter().all(|i| i.status != ItemStatus::Running), "nothing spins in a dead session");
+
+        let whole = dir.join("whole.jsonl");
+        std::fs::write(&whole, [prompt, call, result, done].join("\n")).unwrap();
+        let (_, unfinished) = read_history(&whole, &ImageStore::default()).unwrap();
+        assert!(!ended_mid_turn(&whole) && unfinished.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // 1×1 transparent PNG.

@@ -7352,6 +7352,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "base64 0.22.1",
+ "libc",
  "serde",
  "serde_json",
  "similar",
