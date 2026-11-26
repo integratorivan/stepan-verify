@@ -78,6 +78,8 @@ pub struct SkillsView {
     search: Entity<InputState>,
     expanded: HashSet<String>,
     selected: usize,
+    /// Window width at the last render (interface units): narrow windows drop table columns.
+    width: f32,
     focus: FocusHandle,
     _scan: Task<()>,
     _search_sub: Subscription,
@@ -103,6 +105,7 @@ impl SkillsView {
             search,
             expanded: HashSet::new(),
             selected: 0,
+            width: f32::MAX,
             focus: cx.focus_handle(),
             _scan: Task::ready(()),
             _search_sub,
@@ -264,7 +267,8 @@ fn sessions_word(n: usize) -> &'static str {
 // ------------------------------------------------------------------ render
 
 impl Render for SkillsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.width = crate::zoom::units(window.viewport_size().width);
         let theme = cx.theme().clone();
         let p = Palette::of(&theme);
         let report = self.report.clone();
@@ -291,6 +295,7 @@ impl Render for SkillsView {
             .child(
                 v_flex()
                     .flex_1()
+                    .min_w_0()
                     .gap(px(6.))
                     .child(ui::eyebrow(range_line(), &p, &theme))
                     .child(ui::page_title("Скиллы", &p))
@@ -370,7 +375,9 @@ impl Render for SkillsView {
                 }))
         };
         let toolbar = h_flex()
-            .gap(px(10.))
+            .flex_wrap()
+            .gap_x(px(10.))
+            .gap_y(px(8.))
             .mb(px(12.))
             .child(
                 h_flex()
@@ -426,8 +433,19 @@ const COL_CHECK: f32 = 64.;
 const COL_USES: f32 = 150.;
 const COL_LAST: f32 = 300.;
 const COL_RESULT: f32 = 92.;
+/// Window widths (interface units) below which «последний вызов» and then «сессий» are left out.
+const HIDE_LAST_BELOW: f32 = 1320.;
+const HIDE_RESULT_BELOW: f32 = 1040.;
 
 impl SkillsView {
+    fn show_last(&self) -> bool {
+        self.width >= HIDE_LAST_BELOW
+    }
+
+    fn show_result(&self) -> bool {
+        self.width >= HIDE_RESULT_BELOW
+    }
+
     fn render_table(&self, report: &Arc<Report>, names: &[String], p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let head = |text: &'static str, w: Option<f32>| {
             ui::eyebrow(text, p, theme).text_color(p.faint).map(|d| match w {
@@ -456,10 +474,10 @@ impl SkillsView {
                     .child(head("скилл", None))
                     .child(head("claude", Some(COL_CHECK)))
                     .child(head("codex", Some(COL_CHECK)))
-                    .child(head("stepan_verify", Some(48.)))
+                    .child(head("stepan", Some(48.)))
                     .child(head("вызовы · 14 дн", Some(COL_USES)))
-                    .child(head("последний вызов", Some(COL_LAST)))
-                    .child(head("сессий · 30 дн", Some(COL_RESULT))),
+                    .when(self.show_last(), |d| d.child(head("последний вызов", Some(COL_LAST))))
+                    .when(self.show_result(), |d| d.child(head("сессий · 30 дн", Some(COL_RESULT)))),
             )
             .children(rows)
             .when(empty, |d| {
@@ -528,7 +546,7 @@ impl SkillsView {
                     .child(sparkline(&row.days, p))
                     .child(div().font_family(mono.clone()).text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(if row.total14() > 0 { p.ink } else { p.faint }).child(row.total14().to_string())),
             )
-            .child(
+            .when(self.show_last(), |d| d.child(
                 h_flex()
                     .w(px(COL_LAST))
                     .flex_shrink_0()
@@ -549,8 +567,8 @@ impl SkillsView {
                             .child(div().flex_shrink_0().font_family(mono.clone()).text_size(px(11.)).text_color(p.faint).child(ago(u.at))),
                         None => d.child(div().text_size(px(12.5)).text_color(p.faint).child("—")),
                     }),
-            )
-            .child(
+            ))
+            .when(self.show_result(), |d| d.child(
                 div()
                     .w(px(COL_RESULT))
                     .flex_shrink_0()
@@ -558,7 +576,7 @@ impl SkillsView {
                     .text_size(px(11.5))
                     .text_color(p.muted)
                     .child(if row.sessions > 0 { format!("{} {}", row.sessions, sessions_word(row.sessions)) } else { "—".into() }),
-            );
+            ));
 
         v_flex().child(line).when(open, |d| d.child(self.render_details(row, report, p, theme, cx)))
     }
@@ -610,9 +628,10 @@ impl SkillsView {
 
         let skill_md = s.skill_md();
         let folder = s.folder();
+        // Without the «последний вызов» column there is no room for two columns here either.
+        let stacked = !self.show_last();
         let side = v_flex()
-            .w(px(380.))
-            .flex_shrink_0()
+            .map(|d| if stacked { d.w_full() } else { d.w(px(380.)).flex_shrink_0() })
             .gap(px(8.))
             .child(ui::eyebrow("где лежит", p, theme))
             .when(s.locations.is_empty(), |d| d.child(div().text_size(px(12.5)).text_color(p.muted).child("Скилл плагина: вызывается Claude, своей папки в skills нет")))
@@ -623,7 +642,7 @@ impl SkillsView {
                     _ => String::new(),
                 };
                 v_flex()
-                    .child(div().font_family(mono.clone()).text_size(px(11.5)).text_color(p.fg).child(format!("{}{}", tilde(&l.path), target)))
+                    .child(div().min_w_0().font_family(mono.clone()).text_size(px(11.5)).text_color(p.fg).child(format!("{}{}", tilde(&l.path), target)))
                     .child(div().text_size(px(11.)).text_color(p.faint).child(l.root.label()))
             }))
             .when(!s.description.is_empty(), |d| {
@@ -657,9 +676,10 @@ impl SkillsView {
                     }),
             );
 
-        h_flex()
+        div()
+            .flex()
+            .map(|d| if stacked { d.flex_col().gap(px(16.)) } else { d.flex_row().gap(px(28.)) })
             .items_start()
-            .gap(px(28.))
             .px(px(40.))
             .pt(px(10.))
             .pb(px(16.))

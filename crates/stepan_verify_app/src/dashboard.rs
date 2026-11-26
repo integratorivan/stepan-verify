@@ -851,7 +851,7 @@ fn session_row(i: usize, s: &SessionSummary, archived: bool, p: &Palette, theme:
         })
         .child(div().w(px(56.)).flex_shrink_0().child(ui::provider_chip(s.provider, p, theme).whitespace_nowrap()))
         .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).text_color(p.fg).child(s.title.clone()))
-        .when_some(branch, |this, b| this.child(ui::branch_chip(b, p, theme)))
+        .when_some(branch, |this, b| this.child(ui::branch_chip(b, p, theme).max_w(px(180.))))
         .child(div().flex_shrink_0().font_family(theme.mono_font_family.clone()).text_size(px(11.5)).text_color(p.faint).child(ago(s.updated_at)))
         // Archive (or restore): shows on hover so the list stays calm.
         .child(

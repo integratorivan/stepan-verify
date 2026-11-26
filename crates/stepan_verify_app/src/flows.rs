@@ -1999,7 +1999,9 @@ impl FlowsView {
                             .when_some(stats, |d, (areas, features, paths, missing, stale)| {
                                 d.child(
                                     h_flex()
-                                        .gap(px(14.))
+                                        .flex_wrap()
+                                        .gap_x(px(14.))
+                                        .gap_y(px(4.))
                                         .text_size(px(13.))
                                         .text_color(p.muted)
                                         .child(format!("{areas} обл. · {features} фич · {paths} путей"))
@@ -2009,7 +2011,7 @@ impl FlowsView {
                                 )
                             }),
                     )
-                    .when(has_map, |d| d.child(div().w(px(260.)).child(Input::new(&self.search).small())))
+                    .when(has_map, |d| d.child(div().w(px(260.)).flex_shrink_0().child(Input::new(&self.search).small())))
                     .when(pending > 0, |d| {
                         d.child(
                             PressButton::new("flows-proposals")
@@ -2160,7 +2162,8 @@ impl FlowsView {
                 .size_full()
                 .items_center()
                 .pt(px(60.))
-                .child(div().w(px(760.)).child(self.render_pipeline(p, theme, cx)))
+                .px(px(24.))
+                .child(div().w_full().max_w(px(760.)).child(self.render_pipeline(p, theme, cx)))
                 .into_any_element();
         }
         let Some(map) = self.map.clone() else {

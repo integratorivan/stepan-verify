@@ -28,6 +28,10 @@ mod zoom;
 
 use gpui_kit::*;
 
+/// Narrower than this the sidebar plus a page stop fitting; the pages are checked down to it.
+const MIN_WIDTH: f32 = 960.;
+const MIN_HEIGHT: f32 = 600.;
+
 fn main() {
     let home = stepan_verify_core::Home::locate();
 
@@ -97,8 +101,14 @@ fn main() {
         corner::init(cx);
         update::init(cx);
         attach::init(cx);
+        // Screenshots and layout checks: STEPAN_VERIFY_WINDOW=1100x700.
+        let (w, h) = std::env::var("STEPAN_VERIFY_WINDOW")
+            .ok()
+            .and_then(|v| v.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))))
+            .unwrap_or((1280., 820.));
         let options = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(None, size(px(1280.), px(820.)), cx)),
+            window_bounds: Some(WindowBounds::centered(None, size(px(w), px(h)), cx)),
+            window_min_size: Some(size(px(MIN_WIDTH), px(MIN_HEIGHT))),
             // Traffic lights sit inside the sidebar, as in the prototype.
             titlebar: Some(TitlebarOptions {
                 title: Some("Stepan".into()),

@@ -63,6 +63,8 @@ pub struct Launch {
     /// `--build-flows`: start the flow-map agent for that project right away.
     build_flows: bool,
     sync_flows: bool,
+    /// `--task <id>`: open «Задачи» with this task's card.
+    task: Option<String>,
 }
 
 impl Launch {
@@ -90,6 +92,10 @@ impl Launch {
                 "--doc" => {
                     launch.doc = args.next();
                     launch.page = Some(Page::Docs);
+                }
+                "--task" => {
+                    launch.task = args.next();
+                    launch.page = Some(Page::Tasks);
                 }
                 "--page" => {
                     launch.page = match args.next().as_deref() {
@@ -267,6 +273,7 @@ impl AppView {
             this.docs.update(cx, |d, _| d.open_on_load(rel));
         }
         this.autopilot = this.launch.autopilot;
+        this.selected_task = this.launch.task.take();
         // Last scan's list right away; the scan below only brings it up to date.
         if let Some(store) = crate::workspace::store(cx) {
             this.sessions = stepan_verify_core::sessions::cached(&store, SESSION_AGE);
@@ -1234,34 +1241,32 @@ impl AppView {
                     .label("Новая сессия")
                     .on_click(cx.listener(|this, _, window, cx| this.open_new_session_dialog(window, cx))),
             )
-            // Pages
-            .child(
-                v_flex()
-                    .gap(px(2.))
-                    .child(Self::nav_label("Рабочее", None, &p, &theme))
-                    .child(self.nav_item("Дашборд", IconName::LayoutDashboard, Page::Dashboard, None, cx))
-                    .child(self.nav_item("Задачи", IconName::Inbox, Page::Tasks, tasks_count, cx))
-                    .child(self.nav_item("Флоу", Icon::empty().path("icons/route.svg"), Page::Flows, self.flows.read(cx).lag_badge().map(|n| (n, true)), cx))
-                    .child(self.nav_item("Документы", IconName::FileText, Page::Docs, (docs > 0).then(|| (docs.to_string(), false)), cx))
-                    .child(self.nav_item("Память", Icon::empty().path("icons/brain.svg"), Page::Memory, (memories > 0).then(|| (memories.to_string(), false)), cx))
-                    .child(self.nav_item("Скиллы", IconName::BookOpen, Page::Skills, (skills > 0).then(|| (skills.to_string(), false)), cx))
-                    .child(self.nav_item("Настройки", IconName::Settings2, Page::Settings, None, cx)),
-            )
-            // Open sessions
-            .when(live_count > 0, |this| {
+            // Pages and open sessions scroll together: on a short window the
+            // cards at the bottom must not cover the list.
+            .child({
                 let items: Vec<AnyElement> = live.into_iter().map(|s| self.session_item(s, cx).into_any_element()).collect();
-                this.child(
-                    v_flex()
-                        .id("open-sessions")
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .gap(px(2.))
-                        .child(Self::nav_label("Открытые сессии", Some(live_count), &p, &theme))
-                        .children(items),
-                )
+                v_flex()
+                    .id("sidebar-nav")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .gap(px(14.))
+                    .child(
+                        v_flex()
+                            .gap(px(2.))
+                            .child(Self::nav_label("Рабочее", None, &p, &theme))
+                            .child(self.nav_item("Дашборд", IconName::LayoutDashboard, Page::Dashboard, None, cx))
+                            .child(self.nav_item("Задачи", IconName::Inbox, Page::Tasks, tasks_count, cx))
+                            .child(self.nav_item("Флоу", Icon::empty().path("icons/route.svg"), Page::Flows, self.flows.read(cx).lag_badge().map(|n| (n, true)), cx))
+                            .child(self.nav_item("Документы", IconName::FileText, Page::Docs, (docs > 0).then(|| (docs.to_string(), false)), cx))
+                            .child(self.nav_item("Память", Icon::empty().path("icons/brain.svg"), Page::Memory, (memories > 0).then(|| (memories.to_string(), false)), cx))
+                            .child(self.nav_item("Скиллы", IconName::BookOpen, Page::Skills, (skills > 0).then(|| (skills.to_string(), false)), cx))
+                            .child(self.nav_item("Настройки", IconName::Settings2, Page::Settings, None, cx)),
+                    )
+                    .when(live_count > 0, |this| {
+                        this.child(v_flex().id("open-sessions").gap(px(2.)).child(Self::nav_label("Открытые сессии", Some(live_count), &p, &theme)).children(items))
+                    })
             })
-            .when(live_count == 0, |this| this.child(div().flex_1()))
             .children(update_card(&p, &theme, cx))
             // Footer: autopilot and theme
             .child(

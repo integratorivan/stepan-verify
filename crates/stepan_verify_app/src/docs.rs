@@ -47,6 +47,9 @@ pub enum DocsEvent {
     ShowTasks,
 }
 
+/// Window width (interface units) below which the shelf narrows and the aside hides.
+const NARROW_BELOW: f32 = 1200.;
+
 impl EventEmitter<DocsEvent> for DocsView {}
 
 enum Body {
@@ -443,6 +446,8 @@ impl Render for DocsView {
                 let _ = web.read(cx).set_visible(show);
             }
         }
+        // Small window or zoomed in: a narrower shelf and no aside, so the text keeps its room.
+        let narrow = crate::zoom::units(window.viewport_size().width) < NARROW_BELOW;
         h_flex()
             .id("docs")
             .key_context("Docs")
@@ -450,19 +455,19 @@ impl Render for DocsView {
             .on_key_down(cx.listener(Self::on_key))
             .size_full()
             .items_start()
-            .child(self.render_shelf(&p, &theme, window, cx))
-            .child(self.render_reader(&p, &theme, cx))
+            .child(self.render_shelf(&p, &theme, narrow, cx))
+            .child(self.render_reader(&p, &theme, narrow, cx))
     }
 }
 
 impl DocsView {
-    fn render_shelf(&mut self, p: &Palette, theme: &Theme, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_shelf(&mut self, p: &Palette, theme: &Theme, narrow: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let unread = self.docs.iter().filter(|d| !d.read).count();
         let groups = self.groups(cx);
         let mono = theme.mono_font_family.clone();
         let docs_dir = self.home.docs();
         v_flex()
-            .w(px(340.))
+            .w(px(if narrow { 280. } else { 340. }))
             .flex_shrink_0()
             .h_full()
             .border_r_1()
@@ -680,7 +685,7 @@ impl DocsView {
             )
     }
 
-    fn render_reader(&mut self, p: &Palette, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn render_reader(&mut self, p: &Palette, theme: &Theme, narrow: bool, cx: &mut Context<Self>) -> AnyElement {
         if !self.loaded {
             return reader_skeleton(p).into_any_element();
         }
@@ -795,7 +800,7 @@ impl DocsView {
             .h_full()
             .items_start()
             .child(center)
-            .child(self.render_aside(&doc, p, theme, cx))
+            .when(!narrow, |row| row.child(self.render_aside(&doc, p, theme, cx)))
             .into_any_element()
     }
 
@@ -817,9 +822,10 @@ impl DocsView {
                     .text_size(px(11.5))
                     .text_color(p.faint)
                     .when_some(doc.project.clone(), |d, project| {
-                        d.child(project_mark(&project, theme)).child(div().text_color(p.muted).child(project)).child("/")
+                        d.child(project_mark(&project, theme)).child(div().flex_shrink_0().text_color(p.muted).child(project)).child(div().flex_shrink_0().child("/"))
                     })
-                    .child(format!("docs/{}", doc.rel)),
+                    // A long path keeps its end (the file name) and loses the middle folders.
+                    .child(div().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis_start().child(format!("docs/{}", doc.rel))),
             )
             .child(div().text_size(px(26.)).line_height(px(32.)).font_weight(FontWeight::SEMIBOLD).text_color(p.ink).child(doc.title.clone()))
             .child(
@@ -1209,9 +1215,10 @@ impl DocsView {
         let readme = self.home.docs().join("README.md");
         let mono = theme.mono_font_family.clone();
         let sample = "---\ntitle: Разбор /events/search\nproject: outpoll-web\nauthor: codex\nsession: <id сессии>\n---\n# …";
-        v_flex().flex_1().h_full().items_center().justify_center().child(
+        v_flex().flex_1().min_w_0().h_full().px(px(24.)).items_center().justify_center().child(
             ui::card(p)
-                .w(px(520.))
+                .w_full()
+                .max_w(px(520.))
                 .p(px(24.))
                 .gap(px(12.))
                 .child(div().text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).text_color(p.ink).child("Полка пока пустая"))

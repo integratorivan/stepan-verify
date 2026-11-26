@@ -302,10 +302,13 @@ pub fn provider_chip(provider: Provider, p: &Palette, theme: &Theme) -> Div {
         .child(provider.label().to_lowercase())
 }
 
-/// Neutral mono chip for tool names, paths, labels.
+/// Neutral mono chip for tool names, paths, labels. Never wider than its
+/// row: a long label ends in «…».
 pub fn chip(text: impl Into<SharedString>, p: &Palette, theme: &Theme) -> Div {
     div()
         .flex_shrink_0()
+        .max_w_full()
+        .truncate()
         .px(px(5.))
         .rounded(px(4.))
         .border_1()
@@ -320,7 +323,9 @@ pub fn chip(text: impl Into<SharedString>, p: &Palette, theme: &Theme) -> Div {
 /// A chip with a branch mark: a task's own copy, a session in a worktree.
 pub fn branch_chip(text: impl Into<SharedString>, p: &Palette, theme: &Theme) -> Div {
     h_flex()
-        .flex_shrink_0()
+        .flex_shrink(1.)
+        .max_w_full()
+        .min_w_0()
         .gap(px(3.))
         .px(px(5.))
         .rounded(px(4.))
@@ -330,8 +335,8 @@ pub fn branch_chip(text: impl Into<SharedString>, p: &Palette, theme: &Theme) ->
         .font_family(theme.mono_font_family.clone())
         .text_size(px(11.))
         .text_color(p.muted)
-        .child(gpui_kit::component::Icon::empty().path("icons/git-branch.svg").size(px(11.)))
-        .child(text.into())
+        .child(gpui_kit::component::Icon::empty().path("icons/git-branch.svg").size(px(11.)).flex_shrink_0())
+        .child(div().min_w_0().truncate().child(text.into()))
 }
 
 /// The sunken track of a segmented choice; children are `segment`s.
