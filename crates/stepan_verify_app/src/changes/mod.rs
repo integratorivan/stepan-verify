@@ -308,6 +308,18 @@ enum Lens {
     Views,
 }
 
+impl Lens {
+    fn usage_id(self) -> &'static str {
+        match self {
+            Lens::Arch => "changes.arch",
+            Lens::Contracts => "changes.contracts",
+            Lens::Media => "changes.media",
+            Lens::Map => "changes.map",
+            Lens::Views => "changes.views",
+        }
+    }
+}
+
 /// One show-me view of how the change works.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
@@ -696,6 +708,7 @@ impl ChangesView {
             eprintln!("stepan_verify: changes: migrate {}: {err}", out.display());
         }
         let mut this = Self::blank(input, out, None, cx);
+        stepan_verify_core::usage::hit("changes.open");
         media::observe(cx);
         this.reload(None);
         // Debug hook: STEPAN_VERIFY_CHANGES_LENS=arch|contracts|media|map|views opens that tab.
@@ -892,6 +905,9 @@ impl ChangesView {
 
     fn toggle_follow(&mut self, on: bool, cx: &mut Context<Self>) {
         self.follow = on;
+        if on {
+            stepan_verify_core::usage::hit("changes.follow");
+        }
         runs::set_follow(&self.out, on);
         if on && self.running.is_none() && !self.runs.is_empty() && self.has_news() {
             self.launch(RunKind::Batch, cx);
@@ -2699,6 +2715,9 @@ impl ChangesView {
                                     .gap(px(6.))
                                     .child(Switch::new("map-only-new").checked(self.only_new).on_click(cx.listener(|this, on: &bool, _, cx| {
                                         this.only_new = *on;
+                                        if *on {
+                                            stepan_verify_core::usage::hit("changes.only_new");
+                                        }
                                         cx.notify();
                                     })))
                                     .child(div().text_size(px(12.5)).font_weight(FontWeight::MEDIUM).text_color(if self.only_new { p.ink } else { p.muted }).child("Только новое")),
@@ -3850,6 +3869,7 @@ impl ChangesView {
                 .map(|d| if active { d.bg(p.surface).text_color(p.ink).shadow(ui::card_shadow()) } else { d.text_color(p.muted).hover(|s| s.text_color(p.ink)) })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.lens = lens;
+                    stepan_verify_core::usage::hit(lens.usage_id());
                     cx.notify();
                 }))
                 .child(Icon::new(icon).small())
@@ -3868,6 +3888,7 @@ impl ChangesView {
                 .hover(|s| s.text_color(p.ink))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.lens = lens;
+                    stepan_verify_core::usage::hit(lens.usage_id());
                     cx.notify();
                 }))
                 .child(label)

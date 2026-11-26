@@ -77,6 +77,7 @@ pub fn init(cx: &mut App) {
 }
 
 fn step(dir: i32, cx: &mut App) {
+    stepan_verify_core::usage::hit("app.zoom");
     let now = factor();
     let next = if dir > 0 {
         STEPS.iter().copied().find(|s| *s > now + 0.001).unwrap_or(STEPS[STEPS.len() - 1])

@@ -680,6 +680,9 @@ impl DocsView {
 
     fn toggle_diff(&mut self, cx: &mut Context<Self>) {
         self.show_diff = !self.show_diff;
+        if self.show_diff {
+            stepan_verify_core::usage::hit("docs.versions");
+        }
         if let Some(open) = self.open.as_mut().filter(|o| o.diff.is_none()) {
             open.compute_diff();
         }

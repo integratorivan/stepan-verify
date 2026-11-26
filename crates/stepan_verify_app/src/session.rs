@@ -512,6 +512,7 @@ impl SessionView {
         }
         self.composer.update(cx, |c, cx| c.set_value("", window, cx));
         let images = self.attachments.update(cx, |a, cx| a.take(cx));
+        stepan_verify_core::usage::hit("sessions.send");
         self.send_message(stepan_verify_agents::Outgoing { text, images }, cx);
     }
 
