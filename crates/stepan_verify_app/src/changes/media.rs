@@ -163,7 +163,8 @@ pub fn turn_started(key: &str, cwd: &Path) {
     }
 }
 
-fn session_base(key: &str) -> Option<String> {
+/// The work tree when the session's first turn started (see `turn_started`).
+pub(super) fn session_base(key: &str) -> Option<String> {
     fs::read_to_string(media_dir(key).join("base")).ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
 }
 

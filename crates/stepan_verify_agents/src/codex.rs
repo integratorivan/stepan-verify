@@ -145,7 +145,7 @@ fn session(
         Mode::Ask => (json!("untrusted"), json!({"type": "readOnly", "networkAccess": false})),
         Mode::AutoEdits => (
             json!("on-request"),
-            json!({"type": "workspaceWrite", "writableRoots": crate::board_home(spec).into_iter().chain([crate::docs_dir()]).collect::<Vec<_>>(), "networkAccess": false,
+            json!({"type": "workspaceWrite", "writableRoots": crate::board_home(spec).into_iter().chain([crate::docs_dir(), crate::doc_comments_dir()]).collect::<Vec<_>>(), "networkAccess": false,
                    "excludeTmpdirEnvVar": false, "excludeSlashTmp": false}),
         ),
         Mode::FullAccess => (json!("never"), json!({"type": "dangerFullAccess"})),

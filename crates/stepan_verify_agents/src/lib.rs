@@ -151,6 +151,14 @@ pub(crate) fn docs_dir() -> PathBuf {
     stepan_verify_home().join("docs")
 }
 
+/// Where `stepan_verify doc reply|resolve` writes (the same layout as
+/// `stepan_verify_core::doc_comments`): writable for sandboxed agents.
+pub(crate) fn doc_comments_dir() -> PathBuf {
+    let dir = stepan_verify_home().join("state").join("doc-comments");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 /// `STEPAN_VERIFY_DOCS` for the agent process unless the spec sets its own, and
 /// `STEPAN_VERIFY_FLOWS` — the project's user-flow map, the shared product
 /// vocabulary — when the project has one.
