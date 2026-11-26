@@ -37,6 +37,8 @@ pub struct NewTaskForm {
     /// Model per agent; None = Настройки → «Модель по умолчанию» at run time.
     claude_model: Option<String>,
     codex_model: Option<String>,
+    /// «Сначала план»: the agent draws the target state for approval before coding.
+    plan: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -59,7 +61,7 @@ impl NewTaskForm {
             cx.subscribe(&picker, |_, _, _: &Picked, cx| cx.notify()),
             cx.subscribe(&attachments, |_, _, _: &AttachmentsEvent, cx| cx.notify()),
         ];
-        Self { picker, title, body, labels, attachments, ready: true, isolation: None, claude_model: None, codex_model: None, _subscriptions: subscriptions }
+        Self { picker, title, body, labels, attachments, ready: true, isolation: None, claude_model: None, codex_model: None, plan: false, _subscriptions: subscriptions }
     }
 
     fn can_create(&self, cx: &App) -> bool {
@@ -90,6 +92,7 @@ impl NewTaskForm {
             claude_model: self.claude_model.clone(),
             codex_model: self.codex_model.clone(),
             attachments: self.attachments.read(cx).paths().to_vec(),
+            plan: self.plan,
         }));
     }
 }
@@ -142,6 +145,17 @@ impl Render for NewTaskForm {
                 this.isolation = isolation;
                 cx.notify();
             }))
+        };
+        let plan_button = |id: &'static str, label: &'static str, plan: bool, cx: &mut Context<Self>| {
+            segment(id, label, self.plan == plan).on_click(cx.listener(move |this, _, _, cx| {
+                this.plan = plan;
+                cx.notify();
+            }))
+        };
+        let plan_hint = if self.plan {
+            "Агент нарисует карту того, к чему приведёт код; ты утвердишь — потом делает"
+        } else {
+            "Агент сразу берётся за код"
         };
         let isolation_hint = match self.isolation {
             None => "Отдельная копия, если в проекте уже работает другой агент",
@@ -216,6 +230,19 @@ impl Render for NewTaskForm {
                                 .child(isolation_button("isolation-here", "Здесь", Some(Isolation::Here), cx)),
                         )
                         .child(div().min_w_0().truncate().text_size(px(12.)).text_color(p.faint).child(isolation_hint)),
+                ),
+            )
+            .child(
+                v_flex().gap_2().child(field("Порядок работы")).child(
+                    h_flex()
+                        .gap_3()
+                        .child(
+                            ui::segmented(&p)
+                                .flex_shrink_0()
+                                .child(plan_button("workflow-direct", "Сразу делать", false, cx))
+                                .child(plan_button("workflow-plan", "Сначала план", true, cx)),
+                        )
+                        .child(div().min_w_0().truncate().text_size(px(12.)).text_color(p.faint).child(plan_hint)),
                 ),
             )
             .child(

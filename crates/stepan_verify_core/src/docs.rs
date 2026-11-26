@@ -2,8 +2,10 @@
 //! agents and by you. Metadata comes from YAML frontmatter (markdown) or
 //! `<meta name="stepan_verify:…">` tags (HTML); anything missing is guessed from the
 //! path. App-owned state: `state/docs-read.json` (what you have read),
-//! `state/docs-pins.json` (pinned) and `state/docs-given.jsonl` (which
-//! document was handed to which agent).
+//! `state/docs-pins.json` (pinned), `state/docs-given.jsonl` (which
+//! document was handed to which agent), `state/doc-comments/` (your comments,
+//! see [`crate::doc_comments`]) and `state/doc-versions/` (earlier versions,
+//! stored by [`scan`], see [`crate::doc_versions`]).
 //!
 //! ```markdown
 //! ---
@@ -223,6 +225,8 @@ pub struct Doc {
     pub words: usize,
     pub read: bool,
     pub given: usize,
+    /// Open comment threads (`doc_comments`).
+    pub comments: usize,
 }
 
 impl Doc {
@@ -541,10 +545,12 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     }
 }
 
-/// Cheap fingerprint of the folder (files, sizes, mtimes) to notice changes.
+/// Cheap fingerprint of the folder (files, sizes, mtimes) and of the
+/// comments on its documents, to notice changes.
 pub fn fingerprint(home: &Home) -> u64 {
     let mut files = Vec::new();
     walk(&home.docs(), &mut files, 0);
+    walk(&crate::doc_comments::root(home), &mut files, 0);
     files.iter().fold(files.len() as u64, |acc, p| {
         let m = fs::metadata(p).ok();
         let t = m.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_millis() as u64);
@@ -575,6 +581,9 @@ pub fn scan(home: &Home) -> Vec<Doc> {
             let modified: DateTime<Utc> = meta.modified().ok()?.into();
             let kind = DocKind::of(&path);
             let text = if kind.readable() && meta.len() < 4 * 1024 * 1024 { fs::read_to_string(&path).ok() } else { None };
+            if let Some(t) = &text {
+                crate::doc_versions::capture(home, &rel, t.as_bytes());
+            }
             let (front, body) = match (&text, kind) {
                 (Some(t), DocKind::Markdown | DocKind::Text) => {
                     let (f, b) = split_front(t);
@@ -597,6 +606,7 @@ pub fn scan(home: &Home) -> Vec<Doc> {
                 read: read.get(&rel).is_some_and(|&t| t >= modified.timestamp()),
                 pinned: front.pinned || pins.contains(&rel),
                 given: given.get(&rel).copied().unwrap_or(0),
+                comments: crate::doc_comments::open_count(home, &rel),
                 path,
                 rel,
                 kind,
@@ -672,6 +682,8 @@ summary: Одна строка о сути
 ```
 
 Пиши по-русски, коротко, с конкретикой: цифры, пути, команды, ссылки на файлы. Если новое решение отменяет старое — поставь старому `status: superseded`, а в новом укажи `supersedes: <файл>`. Создавай папки, если их нет.
+
+Пользователь оставляет комментарии к документам полки — к цитате или ко всему документу. Прочитать: `stepan_verify doc comments <файл>`, ответить в треде: `stepan_verify doc reply <файл> <id> "текст"`. Закрывай тред (`stepan_verify doc resolve <файл> <id>`), только если пользователь попросил или комментарии пришли с пометкой, что они закрыты; не закрывай только потому, что ответил или поправил документ.
 "#;
 
 /// The text an agent session starts with: the rules plus what the shelf
@@ -729,6 +741,14 @@ fn brief_from(docs: &[Doc], root: &Path, project: Option<&str>, author: &str, se
         }
         out.push('\n');
     }
+    let commented: Vec<&&Doc> = mine.iter().filter(|d| d.comments > 0).collect();
+    if !commented.is_empty() {
+        out.push_str("### Документы с открытыми комментариями пользователя\n\nПрочитай: `stepan_verify doc comments <файл>`.\n\n");
+        for d in commented {
+            out.push_str(&format!("- {} — {} {} — `{}`\n", d.title, d.comments, threads_word(d.comments), d.path.display()));
+        }
+        out.push('\n');
+    }
     let others: Vec<&&Doc> =
         mine.iter().filter(|d| matches!(d.doc_type, DocType::Research | DocType::Handoff) && d.open_question().is_none()).take(10).collect();
     if !others.is_empty() {
@@ -739,6 +759,15 @@ fn brief_from(docs: &[Doc], root: &Path, project: Option<&str>, author: &str, se
         out.push('\n');
     }
     out
+}
+
+/// "1 тред", "3 треда", "5 тредов".
+fn threads_word(n: usize) -> &'static str {
+    match (n % 10, n % 100) {
+        (1, r) if r != 11 => "тред",
+        (2..=4, r) if !(12..=14).contains(&r) => "треда",
+        _ => "тредов",
+    }
 }
 
 // ------------------------------------------------------------------ groups
@@ -839,6 +868,7 @@ mod tests {
             words: 0,
             read: false,
             given: 0,
+            comments: 0,
         }
     }
 
@@ -932,6 +962,9 @@ mod tests {
         fs::write(home.docs().join("map.html"), "<title>Карта</title><body>слово</body>").unwrap();
         let docs = scan(&home);
         assert_eq!(docs.len(), 2, "folder README is not a shelf document");
+        assert_eq!(crate::doc_versions::list(&home, "outpoll-web/p95.md").len(), 1, "the first version is stored");
+        scan(&home);
+        assert_eq!(crate::doc_versions::list(&home, "outpoll-web/p95.md").len(), 1, "unchanged: no new version");
         let p95 = docs.iter().find(|d| d.rel == "outpoll-web/p95.md").unwrap();
         assert_eq!(p95.title, "Разбор p95");
         assert_eq!(p95.project.as_deref(), Some("outpoll-web"));
@@ -1000,6 +1033,7 @@ mod tests {
         fs::write(dir.join("decisions/b.md"), "---\ntitle: Старое решение\nstatus: superseded\n---\n").unwrap();
         fs::write(dir.join("research/q.md"), "---\ntitle: Поиск\nquestion: Убрать fuzzy?\n---\n").unwrap();
         fs::write(home.docs().join("other.md"), "# Чужое").unwrap();
+        crate::doc_comments::add(&home, "stepan_verify/research/q.md", crate::doc_comments::NewComment { text: "Уточни".into(), author: "ты".into(), ..Default::default() }).unwrap();
 
         let brief = agent_brief(&home, Some("stepan_verify"), "claude", Some("abc"));
         assert!(brief.contains("session: abc") && brief.contains("author: claude"));
@@ -1010,6 +1044,7 @@ mod tests {
         assert!(!brief.contains("Старое решение"), "superseded decisions are left out");
         assert!(brief.contains("Убрать fuzzy?"));
         assert!(!brief.contains("Чужое"));
+        assert!(brief.contains("stepan_verify doc reply") && brief.contains("Поиск — 1 тред"), "commented documents are listed");
 
         let empty = agent_brief(&home, Some("new-project"), "codex", None);
         assert!(empty.contains("Пока ничего") && empty.contains("$CODEX_THREAD_ID"));

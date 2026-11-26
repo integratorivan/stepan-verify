@@ -415,6 +415,7 @@ mod tests {
             commands: Vec::new(),
             screenshots: Vec::new(),
             log,
+            plan: None,
         }
     }
 

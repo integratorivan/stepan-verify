@@ -37,6 +37,8 @@ pub enum Page {
     Skills,
     Settings,
     Session(usize),
+    /// The plan of a plan-first task (`AppView::plan_view`).
+    Plan,
 }
 
 /// Command-line launch options:
@@ -64,6 +66,8 @@ pub struct Launch {
     project: Option<PathBuf>,
     /// `--build-flows`: start the flow-map agent for that project right away.
     build_flows: bool,
+    /// `--plan <task-id>`: open that task's plan.
+    plan: Option<String>,
     sync_flows: bool,
 }
 
@@ -85,6 +89,7 @@ impl Launch {
                 "--cwd" => launch.cwd = args.next().map(PathBuf::from),
                 "--stay" => launch.stay = true,
                 "--changes" => launch.changes = true,
+                "--plan" => launch.plan = args.next(),
                 "--autopilot" => launch.autopilot = true,
                 "--preview" => launch.preview = args.next().map(|p| std::fs::canonicalize(&p).unwrap_or_else(|_| p.into())),
                 "--build-flows" => launch.build_flows = true,
@@ -162,6 +167,8 @@ pub struct AppView {
     pub(crate) font_pickers: Option<[Entity<crate::settings_page::FontPicker>; 2]>,
     /// Sessions opened in this window, in opening order.
     pub(crate) open_sessions: Vec<Entity<SessionView>>,
+    /// The plan on screen: (task id, its map).
+    plan_view: Option<(String, Entity<crate::changes::ChangesView>)>,
     /// Project pickers in open dialogs, refreshed when the scan finishes.
     pickers: Vec<WeakEntity<ProjectPicker>>,
     launch: Launch,
@@ -202,6 +209,13 @@ impl AppView {
                     if let Some(view) = this.open_sessions.get(*ix).cloned() {
                         view.update(cx, |v, cx| v.send_text(text.clone(), cx));
                         this.show(Page::Session(*ix), cx);
+                    }
+                }
+                DocsEvent::SendToSummary { summary, text } => {
+                    this.open_session(summary, window, cx);
+                    let view = this.open_sessions.iter().find(|s| s.read(cx).native_id.as_deref() == Some(summary.id.as_str())).cloned();
+                    if let Some(view) = view {
+                        view.update(cx, |v, cx| v.send_text(text.clone(), cx));
                     }
                 }
                 DocsEvent::NewSession { provider, cwd, prompt } => {
@@ -256,6 +270,7 @@ impl AppView {
             skills_view,
             memory_view,
             open_sessions: Vec::new(),
+            plan_view: None,
             pickers: Vec::new(),
             launch,
             preview: None,
@@ -344,6 +359,9 @@ impl AppView {
         }
         if let Some(path) = self.launch.preview.take() {
             self.open_preview(path, None, window, cx);
+        }
+        if let Some(id) = self.launch.plan.take() {
+            self.open_plan(&id, window, cx);
         }
     }
 
@@ -681,23 +699,122 @@ impl AppView {
         if let Some((ix, _)) = self.task_session(id, cx) {
             return self.show(Page::Session(ix), cx);
         }
-        let linked = self.tasks.iter().find(|t| t.id == id).and_then(|t| t.meta.sessions.last().cloned());
-        let summary = linked
-            .and_then(|s| s.split_once(':').map(|(_, native)| native.to_owned()))
-            .and_then(|native| self.sessions.iter().find(|s| s.id == native).cloned());
-        match summary {
-            Some(mut summary) => {
-                // A worktree task resumes in its copy, wherever the index thought it ran.
-                if let Some(cwd) = self.tasks.iter().find(|t| t.id == id).filter(|t| t.meta.worktree.is_some()).and_then(worktree::session_cwd) {
-                    summary.cwd = Some(cwd);
-                }
-                self.open_session(&summary, window, cx);
-                if let Some(view) = self.open_sessions.last() {
-                    view.update(cx, |v, _| v.task_id = Some(id.to_owned()));
-                }
-            }
+        match self.resume_task_session(id, window, cx) {
+            Some(ix) => self.show(Page::Session(ix), cx),
             None => window.push_notification(Notification::warning("Сессия этой задачи не найдена — обнови список сессий"), cx),
         }
+    }
+
+    /// Open the task's last linked session in the background; its index in `open_sessions`.
+    fn resume_task_session(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) -> Option<usize> {
+        let linked = self.tasks.iter().find(|t| t.id == id).and_then(|t| t.meta.sessions.last().cloned());
+        let mut summary = linked
+            .and_then(|s| s.split_once(':').map(|(_, native)| native.to_owned()))
+            .and_then(|native| self.sessions.iter().find(|s| s.id == native).cloned())?;
+        // A worktree task resumes in its copy, wherever the index thought it ran.
+        if let Some(cwd) = self.tasks.iter().find(|t| t.id == id).filter(|t| t.meta.worktree.is_some()).and_then(worktree::session_cwd) {
+            summary.cwd = Some(cwd);
+        }
+        let existing = self.open_sessions.iter().position(|s| s.read(cx).native_id.as_deref() == Some(summary.id.as_str()));
+        let ix = match existing {
+            Some(ix) => ix,
+            None => {
+                let view = cx.new(|cx| SessionView::resume(&summary, window, cx));
+                self.adopt(view, window, cx)
+            }
+        };
+        self.open_sessions[ix].update(cx, |v, _| v.task_id = Some(id.to_owned()));
+        Some(ix)
+    }
+
+    // ------------------------------------------------------------- plans
+
+    pub fn set_task_plan(&mut self, id: &str, plan: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(err) = self.board.set_plan(id, "me", plan) {
+            Self::toast_error(window, err, cx);
+        }
+        self.reload_tasks(cx);
+    }
+
+    /// «Открыть план»: the task's plan map, drawn like «Изменения».
+    pub fn open_plan(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.plan_view.as_ref().is_some_and(|(t, _)| t == id) {
+            return self.show(Page::Plan, cx);
+        }
+        let Some(task) = self.tasks.iter().find(|t| t.id == id).cloned() else { return };
+        let provider = self.task_provider(&task, cx);
+        let input = crate::changes::ChangesInput {
+            key: task.id.clone(),
+            provider: match provider {
+                Provider::Claude => stepan_verify_agents::Provider::Claude,
+                Provider::Codex => stepan_verify_agents::Provider::Codex,
+            },
+            title: task.meta.title.clone(),
+            cwd: worktree::session_cwd(&task).unwrap_or_else(dirs_home),
+            requests: Vec::new(),
+            final_answer: String::new(),
+            patches: Vec::new(),
+            commands: Vec::new(),
+            screenshots: Vec::new(),
+            log: Vec::new(),
+            plan: None,
+        };
+        let task_id = task.id.clone();
+        let view = cx.new(|cx| crate::changes::ChangesView::plan(input, task_id.clone(), cx));
+        cx.subscribe_in(&view, window, move |this, _, event: &crate::changes::ChangesEvent, window, cx| {
+            use crate::changes::ChangesEvent;
+            match event {
+                ChangesEvent::Return(text) => this.send_plan_remarks(&task_id, text.clone(), window, cx),
+                ChangesEvent::ApprovePlan(n) => this.approve_plan(&task_id, *n, window, cx),
+                ChangesEvent::OpenSession => this.open_task_session(&task_id, window, cx),
+                ChangesEvent::Accept => {}
+            }
+        })
+        .detach();
+        self.plan_view = Some((task.id, view));
+        self.show(Page::Plan, cx);
+    }
+
+    /// The agent that works on a task: its open session, its last one, else the default.
+    fn task_provider(&self, task: &BoardTask, cx: &App) -> Provider {
+        let last = match task.meta.sessions.last().and_then(|s| s.split_once(':')).map(|(who, _)| who) {
+            Some("codex") => Some(Provider::Codex),
+            Some("claude") => Some(Provider::Claude),
+            _ => None,
+        };
+        self.task_session(&task.id, cx)
+            .map(|(_, v)| v.read(cx).provider)
+            .or(last)
+            .unwrap_or_else(|| crate::settings::config(cx).agents.default_provider.into())
+    }
+
+    /// Remarks on the plan go to the agent that writes it (resumed if closed);
+    /// it rewrites the plan as a new iteration.
+    fn send_plan_remarks(&mut self, id: &str, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        let ix = match self.task_session(id, cx) {
+            Some((ix, _)) => Some(ix),
+            None => self.resume_task_session(id, window, cx),
+        };
+        match ix {
+            Some(ix) => {
+                self.open_sessions[ix].update(cx, |v, cx| v.send_text(text, cx));
+                window.push_notification(Notification::info("Замечания ушли агенту — он перепишет план новой итерацией"), cx);
+            }
+            None => window.push_notification(Notification::warning("Сессия, где писался план, не найдена — обнови список сессий и отправь ещё раз"), cx),
+        }
+        self.reload_tasks(cx);
+    }
+
+    /// «Утвердить план»: the task moves to implementation and an agent starts on it.
+    pub fn approve_plan(&mut self, id: &str, run: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let task = match self.board.approve_plan(id, "me", run) {
+            Ok(task) => task,
+            Err(err) => return Self::toast_error(window, err, cx),
+        };
+        let provider = self.task_provider(&task, cx);
+        window.push_notification(Notification::success(format!("План утверждён (итерация #{run}) — {} делает его по этапам", provider.label())).title(task.meta.title.clone()), cx);
+        self.reload_tasks(cx);
+        self.run_task(id, provider, window, cx);
     }
 
     /// Keep the board in step with what the agent does in the session.
@@ -707,6 +824,11 @@ impl AppView {
             let Some(id) = v.task_id.clone() else { return };
             (id, v.provider.label().to_lowercase(), v.activity())
         };
+        // A plan-first task has a planning and an implementation session; only
+        // the newest open one moves the board.
+        if self.task_session(&task_id, cx).is_some_and(|(_, newest)| newest != view) {
+            return;
+        }
         let Some(task) = self.tasks.iter().find(|t| t.id == task_id) else { return };
         let result = match event {
             // You continued the conversation: the agent is on it again.
@@ -892,6 +1014,7 @@ impl AppView {
             Page::Skills => ("skills", None),
             Page::Settings => ("settings", None),
             Page::Session(ix) => ("session", Some(ix)),
+            Page::Plan => ("tasks", None),
         };
         let mut open = Vec::new();
         let mut session_at = None;
@@ -1041,7 +1164,8 @@ impl AppView {
     fn nav_item(&self, label: &'static str, icon: impl Into<Icon>, page: Page, count: Option<(String, bool)>, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let p = Palette::of(&theme);
-        let active = self.page == page;
+        // A task's plan lives under «Задачи».
+        let active = self.page == page || (page == Page::Tasks && self.page == Page::Plan);
         h_flex()
             .id(SharedString::from(format!("nav:{label}")))
             .h(px(31.))
@@ -1354,6 +1478,10 @@ impl Render for AppView {
             Page::Session(ix) => match self.open_sessions.get(ix) {
                 Some(view) => view.clone().into_any_element(),
                 None => dashboard::render(self, window, cx).into_any_element(),
+            },
+            Page::Plan => match &self.plan_view {
+                Some((_, view)) => view.clone().into_any_element(),
+                None => crate::board::render(self, window, cx).into_any_element(),
             },
         };
         let main = v_flex().size_full().min_w_0().child(content);

@@ -7,19 +7,20 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
 
-use crate::{Board, Home, NewTask, Task, TaskStatus, worktree::Isolation};
+use crate::{Board, Home, NewTask, Task, TaskStatus, plans, worktree::Isolation};
 
 pub const USAGE: &str = "\
 stepan_verify task — доска задач stepan_verify (~/.stepan_verify/tasks)
 
   stepan_verify task list [--ready] [--status STATUS] [--json]
   stepan_verify task show [ID]
-  stepan_verify task create TITLE [--body TEXT] [--cwd DIR] [--label k=v]... [--depends ID]... [--attach PATH]... [--inbox] [--isolation worktree|here] [--claude-model M] [--codex-model M]
+  stepan_verify task create TITLE [--body TEXT] [--cwd DIR] [--label k=v]... [--depends ID]... [--attach PATH]... [--inbox] [--isolation worktree|here] [--claude-model M] [--codex-model M] [--plan]
   stepan_verify task claim [ID | --ready [--label k=v]] [--by NAME] [--lease 1h]
   stepan_verify task renew [ID] [--by NAME] [--lease 1h]
   stepan_verify task log [ID] TEXT [--by NAME]
   stepan_verify task complete [ID] SUMMARY [--by NAME]     → на ревью человеку
   stepan_verify task block [ID] QUESTION [--by NAME]       → нужен ответ человека
+  stepan_verify task plan-ready [ID] [SUMMARY] [--by NAME] → план из state/plans/ID/draft — на ревью человеку
   stepan_verify task release [ID] [--by NAME]              → вернуть в очередь
   stepan_verify task status ID inbox|todo|in_progress|blocked|review|done
 
@@ -134,6 +135,7 @@ pub fn run(home: &Home, raw: &[String]) -> Result<String> {
                     isolation,
                     claude_model: args.value("--claude-model"),
                     codex_model: args.value("--codex-model"),
+                    plan: args.has("--plan"),
                 },
                 &by,
             )?
@@ -161,6 +163,28 @@ pub fn run(home: &Home, raw: &[String]) -> Result<String> {
             let (id, text) = id_and_text()?;
             board.block(&id, &by, &text)?
         }
+        "plan-ready" => {
+            // `[ID] [SUMMARY]`: one positional is the summary when $STEPAN_VERIFY_TASK is set.
+            let (id, summary) = match args.positional.as_slice() {
+                [id, text, ..] => (id.clone(), text.clone()),
+                [one] => match env_task() {
+                    Ok(id) => (id, one.clone()),
+                    Err(_) => (one.clone(), String::new()),
+                },
+                [] => (env_task()?, String::new()),
+            };
+            // Refuse before moving the draft, so a wrong task keeps it.
+            let task = board.get(&id)?;
+            match task.phase() {
+                None => bail!("у задачи {id} нет этапа плана — включи «Сначала план»"),
+                Some(crate::Phase::Implement) => bail!("план задачи {id} уже утверждён"),
+                Some(crate::Phase::Plan) => {}
+            }
+            let n = plans::publish(home, &id, &by)?;
+            let task = board.plan_ready(&id, &by, n, &summary)?;
+            return Ok(format!("{}
+План: итерация #{n} — {}", line(&task, &board.tasks()), plans::report_path(home, &id, n).display()));
+        }
         "release" => board.release(&id_only()?, &by, "")?,
         "status" => {
             let [id, status, ..] = args.positional.as_slice() else { bail!("stepan_verify task status ID STATUS") };
@@ -183,6 +207,9 @@ fn env_task() -> Result<String> {
 
 fn line(t: &Task, all: &[Task]) -> String {
     let mut parts = vec![format!("{}  [{}]  {}", t.id, t.meta.status.label(), t.meta.title)];
+    if let Some(phase) = t.phase() {
+        parts.push(format!("этап: {}", phase.label()));
+    }
     if let Some(p) = t.project_name() {
         parts.push(format!("проект: {p}"));
     }
@@ -251,6 +278,36 @@ mod tests {
         let show = run(&home, &s(&["show", &id])).unwrap();
         assert!(show.contains(&format!("{id}.files/shot.png")) && show.contains(&format!("{id}.files/shot-2.png")), "{show}");
         assert!(run(&home, &s(&["create", "x", "--attach", "/nope/missing.png"])).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plan_ready_publishes_the_draft() {
+        let root = std::env::temp_dir().join(format!("stepan_verify-cli-plan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = Home { root: root.clone() };
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let out = run(&home, &s(&["create", "Карта плана", "--plan"])).unwrap();
+        assert!(out.contains("этап: план"), "{out}");
+        let id = out.split_whitespace().next().unwrap().to_owned();
+        let direct = run(&home, &s(&["create", "Сразу"])).unwrap().split_whitespace().next().unwrap().to_owned();
+
+        // Nothing written yet: an error that says where to write.
+        let err = run(&home, &s(&["plan-ready", &id, "x"])).unwrap_err().to_string();
+        assert!(err.contains("draft"), "{err}");
+        let draft = plans::draft(&home, &id);
+        std::fs::create_dir_all(&draft).unwrap();
+        std::fs::write(draft.join("report.json"), r#"{"title": "t", "code": {"added": [{"id": "a"}]}, "stages": [{"title": "s", "nodes": ["a"]}]}"#).unwrap();
+        // A direct task refuses and leaves the draft alone.
+        assert!(run(&home, &s(&["plan-ready", &direct, "x"])).is_err());
+        assert!(draft.exists());
+
+        run(&home, &s(&["claim", &id, "--by", "claude"])).unwrap();
+        let out = run(&home, &s(&["plan-ready", &id, "два этапа", "--by", "claude"])).unwrap();
+        assert!(out.contains("[Ревью]") && out.contains("итерация #1"), "{out}");
+        let show = run(&home, &s(&["show", &id])).unwrap();
+        assert!(show.contains("claude plan_ready: итерация #1 · два этапа"), "{show}");
+        assert!(plans::report_path(&home, &id, 1).exists());
         let _ = std::fs::remove_dir_all(root);
     }
 

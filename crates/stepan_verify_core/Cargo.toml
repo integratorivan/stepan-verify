@@ -11,4 +11,6 @@ chrono.workspace = true
 dirs.workspace = true
 serde_yaml = "0.9"
 toml = "0.9"
+# Line diff of document versions (already in the tree via the app).
+similar = "2"
 rusqlite = { version = "0.43", features = ["bundled"] }
